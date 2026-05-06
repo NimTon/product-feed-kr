@@ -1,0 +1,18 @@
+# 本地 Chromium（体积大，自备）
+chrome-win/
+
+# Python
+venv/
+__pycache__/
+*.py[cod]
+*.egg-info/
+.eggs/
+dist/
+build/
+
+# IDE
+.idea/
+
+# 导出产物（可选保留目录）
+data/*.xlsx
+data/*.json
