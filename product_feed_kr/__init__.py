@@ -1,3 +1,3 @@
-"""微猫 wecatalog：Playwright 抓取商品列表并导出 xlsx。"""
+"""微猫 wecatalog 采集 → seven17 表单上架（精简包）。"""
 
-__version__ = "0.2.0"
+__version__ = "0.3.0"

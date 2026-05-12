@@ -16,3 +16,15 @@ build/
 # 导出产物（可选保留目录）
 data/*.xlsx
 data/*.json
+data/*.db
+data/*.db-journal
+data/*.db-wal
+data/*.db-shm
+data/*.db.lock
+
+# seven17 HTTP 会话 Cookie（勿提交）
+seven17_cookies.json
+seven17_cookies.txt
+
+# seven17 本地账号与站点参数（复制 seven17.example.json 为 seven17.json）
+config/seven17.json
