@@ -14,9 +14,9 @@
 `WEGO_TITLE_PREFIX`、`WEGO_DESC_TEMPLATE`、
 `SEVEN17_CONVERT_CNY_TO_KRW`（默认 true：每条商品填表前拉汇率，把人民币售价换算为韩元填入 `it_price`）、
 `SEVEN17_CNY_KRW_RATE`（可选固定汇率，填则不走接口）、`SEVEN17_CNY_KRW_FALLBACK`（接口失败时的 1 CNY 兑多少 KRW）、
-`SEVEN17_FILL_IT_EXPLAN`（默认 false：不向后台填写 상품설명 `it_explan`；设为 true 恢复填写）
+`SEVEN17_FILL_IT_EXPLAN`（默认 false：不向后台填写 상품설명/모바일 상품설명；设为 true 恢复填写）
 
-上架前 LLM（需 ``OPENAI_API_KEY`` + ``pip install openai``）：将多条 ``commodity.title`` 按批次发给模型，解析 JSON 写入各条 ``listing_llm``；可选 ``SEVEN17_WRITE_BACK_AFTER_LLM``（默认 true）写回 SQLite。批大小由 ``OPENAI_LISTING_LLM_BATCH_SIZE`` 控制（默认 12）。
+上传模块不再调用 LLM：只读取 SQLite 已有的 ``listing_llm`` 结果（如 ``cny_price`` / ``name_ko`` / ``desc_ko``）。
 
 写库前对 ``.db`` 文件使用 ``filelock`` 独占锁（与抓取并行时互斥）。
 
@@ -56,12 +56,6 @@ from product_feed_kr.seven17_adm import login_admin
 from product_feed_kr.seven17_config import bool_env as _cfg_bool
 from product_feed_kr.seven17_config import getenv as _cfg_get
 from product_feed_kr.seven17_config import getenv_required as _cfg_required
-from product_feed_kr.listing_llm_enrich import (
-    enrich_records_listing_llm_batch,
-    listing_llm_batch_size,
-    listing_llm_cny_usable,
-    listing_llm_enabled,
-)
 from product_feed_kr.wecatalog_tag_mapping import resolve_category_path, resolve_seven17_ca_id
 from product_feed_kr.wego_commodity import DEFAULT_WEGO_DESC_TEMPLATE, parse_wego_product
 from product_feed_kr.pf_log import configure_pf_stderr, pf_kv
@@ -72,8 +66,8 @@ _log = logging.getLogger("product_feed_kr.seven17_upload")
 
 
 def _configure_upload_stderr_logging() -> None:
-    """stderr：`时间 [级别] [短标签] 消息`；与 listing_llm 共用同一格式。"""
-    configure_pf_stderr("product_feed_kr.seven17_upload", "product_feed_kr.listing_llm_enrich")
+    """stderr：`时间 [级别] [短标签] 消息`。"""
+    configure_pf_stderr("product_feed_kr.seven17_upload")
 
 
 def _preview_text(s: str, max_len: int = 500) -> str:
@@ -282,6 +276,13 @@ def commodity_from_wecatalog_record(record: dict[str, Any]) -> dict[str, Any] | 
         return None
     com = res.get("commodity")
     return com if isinstance(com, dict) else None
+
+
+def _llm_cny_usable(llm_data: dict[str, Any] | None) -> bool:
+    """上传阶段仅判断 DB 中 listing_llm.cny_price 是否可用（不触发 LLM 请求）。"""
+    if not isinstance(llm_data, dict):
+        return False
+    return bool(str(llm_data.get("cny_price") or "").strip())
 
 
 def itemform_preview_dict_from_store_record(
@@ -505,6 +506,7 @@ def _fill_itemform(
     price_cny_for_log: str | None = None,
     fx_krw_per_cny: float | None = None,
 ) -> None:
+    # 图片字段最多 it_img1~it_img10：这里统一裁剪，避免后续循环里越界或误传。
     paths: list[Path] = []
     if image_paths:
         paths = [p for p in image_paths if p is not None][:10]
@@ -527,6 +529,7 @@ def _fill_itemform(
                 zh="本条售价：人民币源价按汇率换算为韩元填报价",
             ),
         )
+    # 说明字段是否写入（默认关闭，避免误覆盖历史运营文案）。
     fill_it_explan = _bool_env("SEVEN17_FILL_IT_EXPLAN", False)
 
     _log_itemform_field_preview(
@@ -550,23 +553,29 @@ def _fill_itemform(
                 [
                     ("event", "itemform.note"),
                     ("it_explan", "skip"),
+                    ("it_mobile_explan", "skip"),
                     ("need", "SEVEN17_FILL_IT_EXPLAN=1"),
                 ],
-                zh="未填写商品详情 HTML（it_explan），需环境变量开启",
+                zh="未填写商品说明（PC/移动），需环境变量开启",
             ),
         )
 
+    # 必须等主表单 ready 后再填；否则 select/fill 会出现定位成功但值未落地的问题。
     page.wait_for_selector('form[name="fitemform"]', timeout=60_000)
 
+    # 分类：必须来自 tag 映射后的 seven17 ca_id。
     page.select_option('select[name="ca_id"]', value=ca_id)
 
+    # 标题/售价：直接按最终上架值填充。
     page.fill('input[name="it_name"]', title)
     page.fill('input[name="it_price"]', price)
 
+    # 库存：只写 stock_qty，和说明字段完全独立。
     stock = page.locator('input[name="it_stock_qty"]')
     if stock.count():
         stock.fill(stock_qty)
 
+    # 上架状态（it_use=1）与销售类型（it_sc_type）是业务开关；若站点主题缺失控件则静默跳过。
     use = page.locator('select[name="it_use"]')
     if use.count():
         try:
@@ -582,28 +591,33 @@ def _fill_itemform(
             pass
 
     if fill_it_explan:
-        explan = page.locator('textarea[name="it_explan"]')
-        if explan.count():
-            explan.fill(desc_html, force=True)
-        else:
-            page.evaluate(
-                """(html) => {
-                    const el = document.querySelector('[name="it_explan"]');
-                    if (el) { el.value = html; el.dispatchEvent(new Event('input', { bubbles: true })); }
-                }""",
-                desc_html,
-            )
+        # 先直接写隐藏 textarea 的 value（纯 JS 赋值，不触发键盘输入，避免误打到焦点输入框）。
+        page.evaluate(
+            """(payload) => {
+                const html = payload.html;
+                const ids = payload.ids || [];
+                for (let i = 0; i < ids.length; i++) {
+                    const ta = document.getElementById(ids[i]);
+                    if (!ta) continue;
+                    ta.value = html;
+                    ta.dispatchEvent(new Event('input', { bubbles: true }));
+                    ta.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+            }""",
+            {"html": desc_html, "ids": ["it_explan", "it_mobile_explan"]},
+        )
 
-        # CKEditor 往往晚于表单就绪才创建实例；先等到实例出现再 setData，避免编辑器仍是空的。
+        # seven17 这里是 SmartEditor2（oEditors），不是 CKEditor。
+        # 仅给 it_explan / it_mobile_explan 两个编辑器灌值，并回写到隐藏 textarea。
         try:
             page.wait_for_function(
                 """() => {
-                    const CK = window.CKEDITOR;
-                    if (!CK || !CK.instances) return false;
-                    const keys = Object.keys(CK.instances);
-                    for (let i = 0; i < keys.length; i++) {
-                        const k = keys[i];
-                        if (k === 'it_explan' || k.indexOf('it_explan') >= 0) return true;
+                    const ed = window.oEditors;
+                    if (!ed || !ed.getById) return false;
+                    const ids = ['it_explan', 'it_mobile_explan'];
+                    for (let i = 0; i < ids.length; i++) {
+                        const arr = ed.getById[ids[i]];
+                        if (arr && arr[0] && typeof arr[0].exec === 'function') return true;
                     }
                     return false;
                 }""",
@@ -613,27 +627,56 @@ def _fill_itemform(
             pass
 
         page.evaluate(
-            """(html) => {
-                const CK = window.CKEDITOR;
-                if (CK && CK.instances) {
-                    const keys = Object.keys(CK.instances);
-                    for (let i = 0; i < keys.length; i++) {
-                        const k = keys[i];
-                        if (k !== 'it_explan' && k.indexOf('it_explan') < 0) continue;
-                        const inst = CK.instances[k];
-                        if (inst && inst.setData) inst.setData(html);
+            """(payload) => {
+                const html = payload.html;
+                const ids = payload.ids || [];
+
+                // 先更新隐藏 textarea：即使编辑器实例尚未就绪，提交时也有值。
+                for (let i = 0; i < ids.length; i++) {
+                    const id = ids[i];
+                    const ta = document.getElementById(id);
+                    if (!ta) continue;
+                    ta.value = html;
+                    ta.dispatchEvent(new Event('input', { bubbles: true }));
+                    ta.dispatchEvent(new Event('change', { bubbles: true }));
+                }
+
+                // SmartEditor2 正式写入：仅针对“该 textarea 对应的编辑器 iframe”写入，
+                // 避免通过通用命令把内容注入到当前焦点输入框（如 it_stock_qty）。
+                const ed = window.oEditors;
+                for (let i = 0; i < ids.length; i++) {
+                    const id = ids[i];
+                    const ta = document.getElementById(id);
+                    if (!ta) continue;
+
+                    // 1) 直接写入本 textarea 所在容器下的 SmartEditor2 iframe body（精确目标）。
+                    try {
+                        const holder = ta.parentElement || ta;
+                        const iframe = holder.querySelector('iframe[src*="SmartEditor2Skin.html"]');
+                        const doc = iframe && iframe.contentDocument;
+                        const body = doc && doc.body;
+                        if (body) {
+                            body.innerHTML = html;
+                        }
+                    } catch (e) {
+                        // 忽略 iframe 写入失败，继续走实例回写。
+                    }
+
+                    // 2) 调用 UPDATE_CONTENTS_FIELD 把编辑器内容同步回隐藏 textarea。
+                    if (!ed || !ed.getById) continue;
+                    const arr = ed.getById[id];
+                    if (!arr || !arr[0] || typeof arr[0].exec !== 'function') continue;
+                    try {
+                        arr[0].exec('UPDATE_CONTENTS_FIELD', []);
+                    } catch (e) {
+                        // 忽略，避免单个编辑器失败阻塞整条上架。
                     }
                 }
-                const el = document.querySelector('[name="it_explan"]');
-                if (el) {
-                    el.value = html;
-                    el.dispatchEvent(new Event('input', { bubbles: true }));
-                    el.dispatchEvent(new Event('change', { bubbles: true }));
-                }
             }""",
-            desc_html,
+            {"html": desc_html, "ids": ["it_explan", "it_mobile_explan"]},
         )
 
+    # 主图/附图：本地临时文件回填到 it_img1~it_imgN。
     for i, pth in enumerate(paths, start=1):
         inp = page.locator(f'input[type="file"][name="it_img{i}"]')
         if inp.count():
@@ -667,6 +710,17 @@ def _desc_html_for_store_record(
     )
 
 
+def _desc_html_from_llm_ko(desc_ko: str) -> str:
+    """将 LLM 韩文描述转换为简单 HTML（按换行转 `<br>`）。"""
+    text = str(desc_ko or "").strip()
+    if not text:
+        return ""
+    lines = [html.escape(x.strip()) for x in text.splitlines() if x and x.strip()]
+    if not lines:
+        return ""
+    return "<br>".join(lines)
+
+
 def upload_from_wecatalog_store(
     album_id: str,
     *,
@@ -680,8 +734,8 @@ def upload_from_wecatalog_store(
 
     字段来源：`detail_response.result.commodity` → `parse_wego_product`；
     `ca_id`：仅 map 的 meta.seven17_ca_id。
-    若配置 ``OPENAI_API_KEY``，默认先批量 ``listing_llm`` enrich：有价则写 ``commodity.optimaPrice``，无价则 ``listing_llm.cny_price`` 为 ``null`` 并清空 ``optimaPrice``。
-    **LLM 生效且 ``cny_price`` 为 null** 时跳过。
+    上传阶段不发起 LLM 请求；仅使用 DB 中已有 ``listing_llm``。
+    **LLM 开关生效且 ``cny_price`` 为空** 时跳过。
     """
     mb_id = _env_required("SEVEN17_MB_ID")
     mb_password = _env_required("SEVEN17_MB_PASSWORD")
@@ -746,24 +800,72 @@ def upload_from_wecatalog_store(
 
                 convert_fx = _bool_env("SEVEN17_CONVERT_CNY_TO_KRW", True)
                 write_back_after_llm = _cfg_bool("SEVEN17_WRITE_BACK_AFTER_LLM", True)
-                llm_on = listing_llm_enabled()
+                # 上传模块只读 DB 里的 LLM 结果，不再发起任何 LLM 调用。
+                llm_on = _cfg_bool("OPENAI_ENRICH_LISTING", True)
 
-                if llm_on:
-                    llm_rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
-                    for rec0 in items:
-                        if not isinstance(rec0, dict):
-                            continue
-                        if rec0.get("seven17_uploaded_at"):
-                            continue
-                        com0 = commodity_from_wecatalog_record(rec0)
-                        if not isinstance(com0, dict):
-                            continue
-                        llm_rows.append((rec0, com0))
-                    if llm_rows:
-                        changed_records = enrich_records_listing_llm_batch(llm_rows)
-                        if write_back_after_llm:
-                            for changed in changed_records:
-                                sqlite_update_product_row(conn_db, aid, changed)
+                # 运行前先给出“可上传数量”预估，便于快速判断为何没进入填表。
+                precheck = {
+                    "total": 0,
+                    "uploadable": 0,
+                    "skip_already_uploaded": 0,
+                    "skip_no_detail": 0,
+                    "skip_llm_not_processed": 0,
+                    "skip_llm_price_unusable": 0,
+                    "skip_no_category": 0,
+                    "skip_no_images": 0,
+                }
+                for rec0 in items:
+                    if not isinstance(rec0, dict):
+                        continue
+                    precheck["total"] += 1
+                    if rec0.get("seven17_uploaded_at"):
+                        precheck["skip_already_uploaded"] += 1
+                        continue
+                    com0 = commodity_from_wecatalog_record(rec0)
+                    if not isinstance(com0, dict):
+                        precheck["skip_no_detail"] += 1
+                        continue
+                    llm0 = rec0.get("listing_llm") if isinstance(rec0.get("listing_llm"), dict) else {}
+                    if llm_on and not rec0.get("llm_processed_at"):
+                        precheck["skip_llm_not_processed"] += 1
+                        continue
+                    if llm_on and not _llm_cny_usable(llm0):
+                        precheck["skip_llm_price_unusable"] += 1
+                        continue
+                    gname0 = str(rec0.get("wecatalog_group") or "")
+                    tname0 = str(rec0.get("wecatalog_tag") or "")
+                    ca_id0 = (resolve_seven17_ca_id(gname0, tname0) or "").strip()
+                    if not ca_id0:
+                        precheck["skip_no_category"] += 1
+                        continue
+                    try:
+                        prod0 = parse_wego_product(com0, default_price_if_missing=default_price)
+                    except ValueError:
+                        precheck["skip_no_detail"] += 1
+                        continue
+                    if not prod0["image_urls"]:
+                        precheck["skip_no_images"] += 1
+                        continue
+                    precheck["uploadable"] += 1
+                _log.info(
+                    "%s",
+                    pf_kv(
+                        [
+                            ("event", "upload.precheck"),
+                            ("album_id", aid),
+                            ("total", precheck["total"]),
+                            ("uploadable", precheck["uploadable"]),
+                            ("skip_already_uploaded", precheck["skip_already_uploaded"]),
+                            ("skip_no_detail", precheck["skip_no_detail"]),
+                            ("skip_llm_not_processed", precheck["skip_llm_not_processed"]),
+                            ("skip_llm_price_unusable", precheck["skip_llm_price_unusable"]),
+                            ("skip_no_category", precheck["skip_no_category"]),
+                            ("skip_no_images", precheck["skip_no_images"]),
+                            ("limit", limit if limit is not None else "none"),
+                        ],
+                        zh="上传前预检：可上传数量与主要跳过原因",
+                    ),
+                )
 
                 n = 0
                 for rec in items:
@@ -806,7 +908,7 @@ def upload_from_wecatalog_store(
                                 ),
                             )
                             continue
-                        if not listing_llm_cny_usable(llm_data):
+                        if not _llm_cny_usable(llm_data):
                             stats["skip"] += 1
                             _log.info(
                                 "%s",
@@ -842,14 +944,35 @@ def upload_from_wecatalog_store(
 
                     nk = (llm_data.get("name_ko") or "").strip()
                     nz = (llm_data.get("name_zh") or "").strip()
+                    # 标题优先级：韩文短标题 > 中文短标题 > 原始货源标题。
                     base_title = nk or nz or prod["title"]
                     upload_title = f"{title_prefix}{base_title}" if title_prefix else base_title
-                    desc_html = _desc_html_for_store_record(
-                        tpl,
-                        prod,
-                        rec,
-                        upload_title=upload_title,
-                        default_tpl=DEFAULT_WEGO_DESC_TEMPLATE,
+                    desc_ko = str(llm_data.get("desc_ko") or "").strip()
+                    # 商品说明优先使用 LLM 韩文描述；缺失时回退模板生成说明。
+                    if desc_ko:
+                        desc_html = _desc_html_from_llm_ko(desc_ko)
+                        desc_src = "llm_desc_ko"
+                    else:
+                        desc_html = _desc_html_for_store_record(
+                            tpl,
+                            prod,
+                            rec,
+                            upload_title=upload_title,
+                            default_tpl=DEFAULT_WEGO_DESC_TEMPLATE,
+                        )
+                        desc_src = "template"
+                    # 明确记录说明来源，便于排查“为何本条不是 desc_ko”。
+                    _log.info(
+                        "%s",
+                        pf_kv(
+                            [
+                                ("event", "desc.source"),
+                                ("goods_id", gid[:36]),
+                                ("source", desc_src),
+                                ("desc_len", len(desc_html)),
+                            ],
+                            zh="本条商品说明来源",
+                        ),
                     )
 
                     urls = prod["image_urls"][:max_img]
@@ -906,7 +1029,7 @@ def upload_from_wecatalog_store(
                             )
                             continue
 
-                        # 回写到 SQLite 的增强字段：汇率/韩元价/商品描述
+                        # 回写到 SQLite 的增强字段：汇率、韩元售价、最终说明 HTML（用于后续审计/复跑）。
                         rec["fx_krw_per_cny"] = krw_pc
                         rec["price_krw"] = listing_price if (convert_fx and krw_pc is not None) else None
                         rec["product_desc_html"] = desc_html
@@ -1013,6 +1136,12 @@ def enrich_llm_for_sqlite_records(
     include_uploaded: bool = False,
 ) -> dict[str, Any]:
     """仅对 SQLite 现有记录执行 LLM enrich 并写回，不登录后台、不提交上架。"""
+    from product_feed_kr.listing_llm_enrich import (
+        enrich_records_listing_llm_batch,
+        listing_llm_batch_size,
+        listing_llm_enabled,
+    )
+
     aid = album_id.strip()
     if not aid:
         raise ValueError("album_id 不能为空")
