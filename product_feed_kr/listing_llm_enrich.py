@@ -19,6 +19,93 @@ from product_feed_kr.pf_log import pf_kv
 
 _log = logging.getLogger(__name__)
 
+# 鞋类语境：用于 attr_map_ko 中欧码→韩版毫米标换算（与 name/desc 合并判断）。
+_FOOTWEAR_HINT_RE = re.compile(
+    r"鞋|靴|拖|sneaker|boot|loafer|sandal|heel|flip\s*flop|"
+    r"运动(?:鞋|靴)|休闲鞋|板鞋|跑鞋|球鞋|帆布|高跟|凉鞋|乐福|穆勒|豆豆|马丁|"
+    r"운동화|신발|샌들|부츠|슬리퍼|구두|스니커|워커",
+    re.I,
+)
+
+# 欧码整数 → 韩国通贩常用脚长毫米标（与多数品牌对照表接近；半码见 _EU_HALF_TO_KR_MM）。
+_EU_INT_TO_KR_MM: dict[int, str] = {
+    33: "215",
+    34: "220",
+    35: "225",
+    36: "230",
+    37: "235",
+    38: "240",
+    39: "245",
+    40: "250",
+    41: "255",
+    42: "260",
+    43: "265",
+    44: "270",
+    45: "275",
+    46: "280",
+    47: "285",
+    48: "290",
+}
+
+_EU_HALF_TO_KR_MM: dict[str, str] = {
+    "33.5": "220",
+    "34.5": "225",
+    "35.5": "230",
+    "36.5": "235",
+    "37.5": "240",
+    "38.5": "245",
+    "39.5": "250",
+    "40.5": "255",
+    "41.5": "260",
+    "42.5": "265",
+    "43.5": "270",
+    "44.5": "275",
+    "45.5": "280",
+    "46.5": "285",
+}
+
+
+def _text_suggests_footwear(blob: str) -> bool:
+    if not blob or not isinstance(blob, str):
+        return False
+    return bool(_FOOTWEAR_HINT_RE.search(blob))
+
+
+def _shoe_size_token_to_kr_mm(tok: str) -> str:
+    """鞋类语境下：欧码/「EU42」等 → 韩版毫米字符串；已是 3 位 mm 或字母尺码则不变。"""
+    t0 = str(tok).strip()
+    if not t0:
+        return tok
+    m_eu = re.fullmatch(r"(?i)EU\s*([0-9]{2})(\.[05])?", t0)
+    if m_eu:
+        whole = int(m_eu.group(1))
+        frac = m_eu.group(2)
+        if frac:
+            key = f"{whole}{frac}"
+            return _EU_HALF_TO_KR_MM.get(key, tok)
+        if 33 <= whole <= 48:
+            return _EU_INT_TO_KR_MM.get(whole, tok)
+        return tok
+    # 含字母且非纯 EU 数字：S/M/L/XL、2XL 等保持原样。
+    if re.search(r"[A-Za-z]", t0) and not re.fullmatch(r"(?i)EU\s*[0-9]{2}(?:\.[05])?", t0):
+        return tok
+    t = t0
+    if re.fullmatch(r"[0-9]{3}", t):
+        n = int(t)
+        if 210 <= n <= 320:
+            return t
+        return tok
+    m2 = re.fullmatch(r"([0-9]{2})(\.[05])?", t)
+    if m2:
+        whole = int(m2.group(1))
+        if m2.group(2):
+            key = f"{whole}{m2.group(2)}"
+            return _EU_HALF_TO_KR_MM.get(key, tok)
+        if 33 <= whole <= 48:
+            return _EU_INT_TO_KR_MM.get(whole, tok)
+    return tok
+
+
 _SYSTEM = """你是电商商品信息抽取助手。只输出一个 JSON 对象，不要 Markdown 围栏，不要多余说明。
 总原则（必须遵守）：
 - 只允许基于输入标题文本做“高置信度提取”，不要脑补、不要扩写背景信息。
@@ -27,12 +114,13 @@ _SYSTEM = """你是电商商品信息抽取助手。只输出一个 JSON 对象�
 
 字段要求：
 - cny_price：字符串或 null。能确定人民币售价时填数字字符串（如 "340"）；**完全无法判断时请填 null**（不要猜价）。
-- attr_map：对象，**只抽取尺码**，例如 {"尺码":["M","L"]}。
+- attr_map：对象，**只抽取尺码**，例如 {"尺码":["M","L"]} 或 {"尺码":["S","M","L"]}。
   - **禁止**放入颜色、材质、赠品、品牌等非尺码信息；颜色一律不输出。
-  - 尺码值只保留数字和字母（如 "012码" -> "012", "XL码" -> "XL"）。
+  - 尺码值以字母规格为主（S/M/L/XL…）；标题里「012码」「0123码」表示多档（0=S、1=M、2=L、3=XL…），**优先直接输出展开后的数组**；若仍写数字串，后处理也会按位展开。
   - 标题中无明确尺码或置信度 <90% 时填 {}。
 - attr_map_ko：对象，**只抽取尺码**（key 固定为韩文「사이즈」），value 为尺码值数组，与 attr_map 中尺码一一对应（顺序一致即可）。
   - 例如 {"사이즈":["M","L"]}；**禁止** 색상/컬러 等键。
+  - **鞋类**（标题含鞋/靴/运动鞋 등）：사이즈 값请用韩国通贩常见的 **밀리미터 발길이** 标法（如 230、235、240 … 285）；若标题只有欧码/中国码两位数字，也请先换成毫米再输出。
   - 无尺码时填 {}。
 - name_zh：字符串，必须精简为核心中文商品名（尽量 8~20 字），去掉营销词、emoji、口号、重复品牌/型号堆砌。
 - name_ko：字符串，韩文精简商品名（尽量 8~24 字），同样去掉营销冗余；不确定可留空字符串 ""。
@@ -60,7 +148,8 @@ _SYSTEM_BATCH = """你是电商商品信息抽取助手。输入是一个 JSON �
 - cny_price：字符串或 null。能确定人民币售价时填数字字符串；完全无法判断填 null，不要猜价。
 - attr_map：**仅尺码**。只能出现键「尺码」，value 为尺码字符串数组；无尺码填 {}。**禁止**颜色等其它属性键。
 - attr_map_ko：**仅尺码**。只能出现键「사이즈」，value 与 attr_map 尺码一致；无尺码填 {}。**禁止** 색상 等键。
-- 尺码值必须只含数字/字母（不要“码/码数”等文字后缀）。
+- 鞋类：사이즈 값用毫米脚长（230~290 等）；欧码两位数字由后处理也会换算为毫米。
+- 尺码值以字母规格为主；「012码」类多档可写 ["S","M","L"] 或数字串（后处理按 0=S、1=M… 展开）。不要混入「码」字后缀到 value 里。
 - name_zh：核心中文商品名，尽量 8~20 字，去营销冗余。
 - name_ko：核心韩文商品名，尽量 8~24 字，去营销冗余；不确定可空字符串。
 - desc_zh：从 title 原文提取并轻润色，2~5 句，约 80~220 字，不可新增原文没有的卖点。
@@ -77,8 +166,17 @@ def _strip_json_fence(s: str) -> str:
     return t.strip()
 
 
-def _normalize_llm_payload(data: dict[str, Any]) -> dict[str, Any]:
+def _normalize_llm_payload(data: dict[str, Any], *, listing_hint: str | None = None) -> dict[str, Any]:
     out: dict[str, Any] = {}
+    hint_bits: list[str] = []
+    if listing_hint:
+        hint_bits.append(str(listing_hint).strip())
+    if isinstance(data, dict):
+        for k in ("name_zh", "name_ko", "desc_zh"):
+            v = data.get(k)
+            if isinstance(v, str) and v.strip():
+                hint_bits.append(v.strip()[:500])
+    shoe_ctx = _text_suggests_footwear(" ".join(hint_bits))
     cp = data.get("cny_price")
     if cp is None:
         out["cny_price"] = None
@@ -114,7 +212,12 @@ def _normalize_llm_payload(data: dict[str, Any]) -> dict[str, Any]:
         return out_vals
 
     def _normalize_attr_map(
-        raw: Any, *, key_max: int = 24, val_max: int = 40, ko: bool = False
+        raw: Any,
+        *,
+        key_max: int = 24,
+        val_max: int = 40,
+        ko: bool = False,
+        shoe_kr_mm: bool = False,
     ) -> dict[str, list[str]]:
         out_map: dict[str, list[str]] = {}
         if not isinstance(raw, dict):
@@ -137,11 +240,65 @@ def _normalize_llm_payload(data: dict[str, Any]) -> dict[str, Any]:
             if syn.isascii():
                 alias[syn.lower()] = canonical
 
+        # 货源常见：「012码」= S/M/L 三档，数字按位对应 0=S、1=M、2=L、3=XL…（类推）。
+        _digit_slot_sizes = (
+            "S",
+            "M",
+            "L",
+            "XL",
+            "XXL",
+            "XXXL",
+            "4XL",
+            "5XL",
+            "6XL",
+            "7XL",
+        )
+
+        def _expand_digit_slot_code(ds: str) -> list[str] | None:
+            """若整段为数字且表示「按位多档」则展开为 S/M/L…；否则返回 None 走原样。"""
+            if not ds.isdigit():
+                return None
+            n = len(ds)
+            if n == 1:
+                i = int(ds)
+                if i >= len(_digit_slot_sizes):
+                    return None
+                return [_digit_slot_sizes[i]]
+            if n == 2:
+                v = int(ds)
+                # 常见鞋码/腰围两位号，勿拆成两档字母。
+                if 30 <= v <= 52:
+                    return None
+                # 韩版女装常见「44/55/66/77/88/99」两位号，勿按位拆。
+                if v in (44, 55, 66, 77, 88, 99):
+                    return None
+                return [_digit_slot_sizes[int(c)] for c in ds]
+            if n == 3:
+                v = int(ds)
+                # 韩版鞋长 / 脚长毫米标（常见 220~300），勿拆成三档字母。
+                if 210 <= v <= 320:
+                    return None
+                # 常见身高 cm，勿拆成三档字母。
+                if 100 <= v <= 200:
+                    return None
+                return [_digit_slot_sizes[int(c)] for c in ds]
+            if n == 4 and 1900 <= int(ds) <= 2035:
+                return None
+            out: list[str] = []
+            for c in ds:
+                i = int(c)
+                if i >= len(_digit_slot_sizes):
+                    return None
+                out.append(_digit_slot_sizes[i])
+            return out
+
         def _size_tokens(text: str) -> list[str]:
-            # 尺码只保留字母/数字片段，例如 "012码" -> ["012"], "XL码" -> ["XL"]。
-            toks = re.findall(r"[A-Za-z0-9]+", text)
             out_toks: list[str] = []
-            for t in toks:
+            for t in re.findall(r"[A-Za-z0-9]+", text):
+                exp = _expand_digit_slot_code(t) if t.isdigit() else None
+                if exp:
+                    out_toks.extend(exp)
+                    continue
                 v = t.upper()
                 if v:
                     out_toks.append(v)
@@ -165,14 +322,25 @@ def _normalize_llm_payload(data: dict[str, Any]) -> dict[str, Any]:
                         continue
                     seen.add(tok)
                     uniq.append(tok)
+            if uniq and ko and shoe_kr_mm:
+                conv: list[str] = []
+                seen_mm: set[str] = set()
+                for x in uniq:
+                    y = _shoe_size_token_to_kr_mm(x)
+                    if y not in seen_mm:
+                        seen_mm.add(y)
+                        conv.append(y)
+                uniq = conv
             if uniq:
                 prev = out_map.get(canonical, [])
                 seen_prev = set(prev)
                 out_map[canonical] = prev + [x for x in uniq if x not in seen_prev]
         return out_map
 
-    out["attr_map"] = _normalize_attr_map(data.get("attr_map"), ko=False)
-    out["attr_map_ko"] = _normalize_attr_map(data.get("attr_map_ko"), ko=True, key_max=30, val_max=48)
+    out["attr_map"] = _normalize_attr_map(data.get("attr_map"), ko=False, shoe_kr_mm=False)
+    out["attr_map_ko"] = _normalize_attr_map(
+        data.get("attr_map_ko"), ko=True, key_max=30, val_max=48, shoe_kr_mm=shoe_ctx
+    )
 
     name_zh = data.get("name_zh")
     out["name_zh"] = _norm_text(name_zh, 24)
@@ -212,12 +380,12 @@ def listing_llm_cny_usable(listing_llm: dict[str, Any]) -> bool:
     return bool(str(cp).strip() and str(cp).strip().lower() != "null" and str(cp).strip() != "-1")
 
 
-def parse_listing_llm_response(text: str) -> dict[str, Any]:
+def parse_listing_llm_response(text: str, *, listing_hint: str | None = None) -> dict[str, Any]:
     raw = _strip_json_fence(text)
     data = json.loads(raw)
     if not isinstance(data, dict):
         raise ValueError("LLM 返回根节点须为 JSON 对象")
-    return _normalize_llm_payload(data)
+    return _normalize_llm_payload(data, listing_hint=listing_hint)
 
 
 def listing_llm_enabled() -> bool:
@@ -386,13 +554,14 @@ def enrich_records_listing_llm_batch(
             if not isinstance(items, list):
                 raise ValueError("批量返回缺少 items 数组")
             by_idx: dict[int, dict[str, Any]] = {}
+            titles_by_idx = {idx: title for idx, _r, _c, title in chunk}
             for it in items:
                 if not isinstance(it, dict):
                     continue
                 idx = it.get("idx")
                 if not isinstance(idx, int):
                     continue
-                by_idx[idx] = _normalize_llm_payload(it)
+                by_idx[idx] = _normalize_llm_payload(it, listing_hint=titles_by_idx.get(idx))
 
             for idx, record, commodity, _title in chunk:
                 norm = by_idx.get(idx)
@@ -509,7 +678,7 @@ def enrich_record_listing_llm(
         use_response_format=use_response_format,
     )
 
-    normalized = parse_listing_llm_response(content)
+    normalized = parse_listing_llm_response(content, listing_hint=title)
     normalized["source"] = "openai"
     normalized["model"] = model
     normalized["processed_at"] = _now_utc_iso()
