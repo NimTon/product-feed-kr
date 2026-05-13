@@ -24,6 +24,8 @@
 
 可选配置 ``PRODUCT_FEED_SQLITE``：SQLite 文件路径（默认 ``data/product_feed.db``）。
 
+``WECATALOG_SCRAPE_RESTART_AFTER_ITEMS``（默认 1000）：本 run 新增写入 SQLite 达 N 条后退出码 **75**，供外层 bat 立即重跑以刷新进程与配置；0 关闭。
+
 日志：与上架脚本同一套格式（**`event=`** + 短模块名 **`scrape:`**）；默认 **INFO** stderr；**`--log-file`** UTF-8；**`-v`** DEBUG。**`--headed`** 有界面浏览器。
 """
 
@@ -46,6 +48,11 @@ from product_feed_kr.wecatalog_fetch_tags import (
     _launch_browser,
     build_group_tree,
     tags_api_url,
+)
+from product_feed_kr.seven17_config import (
+    EXIT_RESTART_FRESH_DATA,
+    reload_seven17_config,
+    restart_after_n,
 )
 from product_feed_kr.wecatalog_tag_mapping import resolve_category_path
 from product_feed_kr.pf_log import configure_scrape_logging, pf_kv
@@ -283,7 +290,9 @@ def scrape_store(
         "records_prior": 0,
         "records_new": 0,
         "skipped_existing": 0,
+        "restart_fresh": False,
     }
+    restart_after_new = restart_after_n("WECATALOG_SCRAPE_RESTART_AFTER_ITEMS", 1000)
 
     conn_db = None
     records: list[dict[str, Any]] = []
@@ -494,6 +503,27 @@ def scrape_store(
                 if checkpoint_every > 0 and new_appended > 0 and new_appended % checkpoint_every == 0:
                     write_checkpoint()
 
+                if (
+                    restart_after_new > 0
+                    and new_appended > 0
+                    and new_appended % restart_after_new == 0
+                ):
+                    write_checkpoint()
+                    stats["restart_fresh"] = True
+                    logger.info(
+                        "%s",
+                        pf_kv(
+                            [
+                                ("event", "scrape.restart_after"),
+                                ("records_new", new_appended),
+                                ("restart_after", restart_after_new),
+                                ("exit", EXIT_RESTART_FRESH_DATA),
+                            ],
+                            zh="已达配置的新增条数阈值，结束本进程以便外层重跑刷新数据",
+                        ),
+                    )
+                    return False
+
                 if max_records > 0 and new_appended >= max_records:
                     logger.info(
                         "%s",
@@ -647,6 +677,9 @@ def main() -> int:
             headed=args.headed,
         )
         print(json.dumps({"ok": True, **stats}, ensure_ascii=False))
+        if stats.get("restart_fresh"):
+            reload_seven17_config()
+            return EXIT_RESTART_FRESH_DATA
         return 0
     except Exception as e:
         logger.exception("%s", pf_kv([("event", "scrape.fatal"), ("err", str(e))], zh="抓取主流程未捕获异常，已中止"))
