@@ -90,7 +90,7 @@ python -m product_feed_kr.seven17_upload --test-store-json data/wecatalog_store_
 
 若页面上「只剩分类像填对了」：先看 **가격是否为 0**（货源 `optimaPrice` / `priceArr` 是否为空）；再看 **상품설명** 是否在「웹에디터」里——脚本写的是 PC 설명栏，编辑器加载慢时已改为等待 CKEditor 实例后再 `setData`。
 
-Windows 一键爬取示例：**`sp1.bat`**。
+Windows 一键爬取示例：**`scrape_wecatalog_store.bat`**（或并行三任务 **`run_scrape_llm_upload_parallel.bat`**）。
 
 ## 包结构（保留文件）
 
