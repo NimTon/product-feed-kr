@@ -1,6 +1,6 @@
 @echo off
 chcp 65001 >nul
-setlocal
+setlocal EnableDelayedExpansion
 cd /d "%~dp0"
 
 set "PY=%~dp0venv\Scripts\python.exe"
@@ -20,15 +20,15 @@ echo.
 :upload_loop
 "%PY%" -m product_feed_kr.seven17_upload --write-back %*
 
-set "EC=%ERRORLEVEL%"
-if "%EC%"=="75" (
+set "EC=!ERRORLEVEL!"
+if "!EC!"=="75" (
   echo [upload-real] threshold reached ^(exit 75^), re-running...
   goto upload_loop
 )
 
 echo.
-if not "%EC%"=="0" (
-  echo [upload-real] FAILED exit=%EC%
+if not "!EC!"=="0" (
+  echo [upload-real] FAILED exit=!EC!
 ) else (
   echo [upload-real] OK exit=0
 )

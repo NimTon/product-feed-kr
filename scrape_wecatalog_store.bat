@@ -1,7 +1,8 @@
 @echo off
 rem UTF-8 console for Python logs (file is ASCII-only so cmd parses correctly)
 chcp 65001 >nul
-setlocal
+rem 须延迟展开：set EC=%ERRORLEVEL% 会把 ERRORLEVEL 冲成 0，exit 75 无法循环
+setlocal EnableDelayedExpansion
 cd /d "%~dp0"
 
 set "PY=%~dp0venv\Scripts\python.exe"
@@ -32,15 +33,15 @@ echo.
   --detail-delay 5 ^
   --checkpoint-every 1 %*
 
-set "EC=%ERRORLEVEL%"
-if "%EC%"=="75" (
+set "EC=!ERRORLEVEL!"
+if "!EC!"=="75" (
   echo [scrape] threshold reached ^(exit 75^), re-running...
   goto scrape_loop
 )
 
 echo.
-if not "%EC%"=="0" (
-  echo [scrape] FAILED exit=%EC%. See output and log: %LOG_FILE%
+if not "!EC!"=="0" (
+  echo [scrape] FAILED exit=!EC!. See output and log: %LOG_FILE%
   echo Hint: pip install -r requirements.txt ^(filelock^) and check SQLite path in config.
 ) else (
   echo [scrape] OK exit=0.

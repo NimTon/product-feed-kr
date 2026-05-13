@@ -1,6 +1,7 @@
 @echo off
 chcp 65001 >nul
-setlocal
+rem 须延迟展开：set EC=%ERRORLEVEL% 会把 ERRORLEVEL 冲成 0，导致 exit 75 无法触发循环
+setlocal EnableDelayedExpansion
 cd /d "%~dp0"
 
 set "PY=%~dp0venv\Scripts\python.exe"
@@ -20,15 +21,15 @@ echo.
 :llm_loop
 "%PY%" -m product_feed_kr.seven17_upload --llm-only --include-uploaded %*
 
-set "EC=%ERRORLEVEL%"
-if "%EC%"=="75" (
+set "EC=!ERRORLEVEL!"
+if "!EC!"=="75" (
   echo [llm] threshold reached ^(exit 75^), re-running...
   goto llm_loop
 )
 
 echo.
-if not "%EC%"=="0" (
-  echo [llm] FAILED exit=%EC%
+if not "!EC!"=="0" (
+  echo [llm] FAILED exit=!EC!
   echo Check OPENAI_API_KEY / OPENAI_BASE_URL / OPENAI_MODEL in config or env.
 ) else (
   echo [llm] OK exit=0
