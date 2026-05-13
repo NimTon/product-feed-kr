@@ -14,7 +14,8 @@
 `WEGO_TITLE_PREFIX`、`WEGO_DESC_TEMPLATE`、
 `SEVEN17_CONVERT_CNY_TO_KRW`（默认 true：每条商品填表前拉汇率，把人民币售价换算为韩元填入 `it_price`）、
 `SEVEN17_CNY_KRW_RATE`（可选固定汇率，填则不走接口）、`SEVEN17_CNY_KRW_FALLBACK`（接口失败时的 1 CNY 兑多少 KRW）、
-`SEVEN17_FILL_IT_EXPLAN`（默认 false：不向后台填写 상품설명/모바일 상품설명；设为 true 恢复填写）
+`SEVEN17_FILL_IT_EXPLAN`（默认 false：不向后台填写 상품설명/모바일 상품설명；设为 true 恢复填写）、
+`LISTING_LLM_RESTART_AFTER_ITEMS` / `SEVEN17_UPLOAD_RESTART_AFTER_ITEMS`（默认 1000：本 run 写回 LLM / 上架成功达 N 条后退出码 75，供外层立即重跑；0 关闭）。
 
 上传模块不再调用 LLM：只读取 SQLite 已有的 ``listing_llm`` 结果（如 ``cny_price`` / ``name_ko`` / ``desc_ko``）。
 
@@ -56,6 +57,11 @@ from product_feed_kr.seven17_adm import login_admin
 from product_feed_kr.seven17_config import bool_env as _cfg_bool
 from product_feed_kr.seven17_config import getenv as _cfg_get
 from product_feed_kr.seven17_config import getenv_required as _cfg_required
+from product_feed_kr.seven17_config import (
+    EXIT_RESTART_FRESH_DATA,
+    reload_seven17_config,
+    restart_after_n,
+)
 from product_feed_kr.wecatalog_tag_mapping import resolve_category_path, resolve_seven17_ca_id
 from product_feed_kr.wego_commodity import DEFAULT_WEGO_DESC_TEMPLATE, parse_wego_product
 from product_feed_kr.pf_log import configure_pf_stderr, pf_kv
@@ -885,7 +891,8 @@ def upload_from_wecatalog_store(
         )
 
     itemform_url = f"{base}/adm/shop_admin/itemform.php"
-    stats: dict[str, Any] = {"ok": 0, "fail": 0, "skip": 0, "errors": []}
+    stats: dict[str, Any] = {"ok": 0, "fail": 0, "skip": 0, "errors": [], "restart_fresh": False}
+    restart_after_upload = restart_after_n("SEVEN17_UPLOAD_RESTART_AFTER_ITEMS", 1000)
     dialogs: list[str] = []
 
     try:
@@ -1191,6 +1198,21 @@ def upload_from_wecatalog_store(
                                 dry_payload["fx_source"] = fx_src
                             print(json.dumps(dry_payload, ensure_ascii=False))
                             stats["ok"] += 1
+                            if restart_after_upload > 0 and stats["ok"] >= restart_after_upload:
+                                stats["restart_fresh"] = True
+                                _log.info(
+                                    "%s",
+                                    pf_kv(
+                                        [
+                                            ("event", "upload.restart_after"),
+                                            ("ok_count", stats["ok"]),
+                                            ("restart_after", restart_after_upload),
+                                            ("exit", EXIT_RESTART_FRESH_DATA),
+                                        ],
+                                        zh="已达配置的上架成功条数阈值，结束本进程以便外层重跑",
+                                    ),
+                                )
+                                break
                             continue
 
                         click_itemform_submit(page)
@@ -1215,6 +1237,21 @@ def upload_from_wecatalog_store(
                             if it_id:
                                 row_out["it_id"] = it_id
                             print(json.dumps(row_out, ensure_ascii=False))
+                            if restart_after_upload > 0 and stats["ok"] >= restart_after_upload:
+                                stats["restart_fresh"] = True
+                                _log.info(
+                                    "%s",
+                                    pf_kv(
+                                        [
+                                            ("event", "upload.restart_after"),
+                                            ("ok_count", stats["ok"]),
+                                            ("restart_after", restart_after_upload),
+                                            ("exit", EXIT_RESTART_FRESH_DATA),
+                                        ],
+                                        zh="已达配置的上架成功条数阈值，结束本进程以便外层重跑",
+                                    ),
+                                )
+                                break
                         else:
                             stats["fail"] += 1
                             stats["errors"].append({"goods_id": gid, "error": fail_reason or "未知错误"})
@@ -1290,13 +1327,30 @@ def enrich_llm_for_sqlite_records(
             rows.append((rec, com))
 
         batch_size = listing_llm_batch_size()
+        restart_after_llm = restart_after_n("LISTING_LLM_RESTART_AFTER_ITEMS", 1000)
         updated_total = 0
+        restart_fresh = False
         for i in range(0, len(rows), batch_size):
             chunk = rows[i : i + batch_size]
             changed = enrich_records_listing_llm_batch(chunk, batch_size=batch_size)
             for rec in changed:
                 sqlite_update_product_row(conn, aid, rec)
             updated_total += len(changed)
+            if restart_after_llm > 0 and updated_total >= restart_after_llm:
+                restart_fresh = True
+                _log.info(
+                    "%s",
+                    pf_kv(
+                        [
+                            ("event", "llm.restart_after"),
+                            ("rows_updated", updated_total),
+                            ("restart_after", restart_after_llm),
+                            ("exit", EXIT_RESTART_FRESH_DATA),
+                        ],
+                        zh="已达配置的 LLM 写回条数阈值，结束本进程以便外层重跑",
+                    ),
+                )
+                break
 
         return {
             "ok": True,
@@ -1305,6 +1359,7 @@ def enrich_llm_for_sqlite_records(
             "rows_eligible": len(rows),
             "rows_updated": updated_total,
             "rows_skipped_no_detail": skipped_no_detail,
+            "restart_fresh": restart_fresh,
         }
     finally:
         conn.close()
@@ -1381,6 +1436,9 @@ def main() -> int:
                 include_uploaded=args.include_uploaded,
             )
             print(json.dumps(out, ensure_ascii=False))
+            if out.get("restart_fresh"):
+                reload_seven17_config()
+                return EXIT_RESTART_FRESH_DATA
             return 0 if out.get("ok") else 2
         except Exception as e:
             print(json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False), file=sys.stderr)
@@ -1396,6 +1454,9 @@ def main() -> int:
             keep_open=args.keep_open,
         )
         print(json.dumps({"ok": stats["fail"] == 0, **stats}, ensure_ascii=False))
+        if stats.get("restart_fresh"):
+            reload_seven17_config()
+            return EXIT_RESTART_FRESH_DATA
         return 0 if stats["fail"] == 0 else 2
     except Exception as e:
         print(json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False), file=sys.stderr)
