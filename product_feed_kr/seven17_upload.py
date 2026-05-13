@@ -232,6 +232,8 @@ def _download_image(url: str) -> Path:
                 "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
                 "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
             ),
+            "Accept": "image/avif,image/webp,image/apng,image/*,*/*;q=0.8",
+            "Referer": "https://www.szwego.com/",
         },
         method="GET",
     )
@@ -241,15 +243,40 @@ def _download_image(url: str) -> Path:
         if low.endswith(ext):
             suffix = ext if ext != ".jpeg" else ".jpg"
             break
-    fd, path = tempfile.mkstemp(suffix=suffix)
-    os.close(fd)
-    dest = Path(path)
+    dest: Path | None = None
     try:
         with urllib.request.urlopen(req, timeout=60) as resp:
-            dest.write_bytes(resp.read())
-    except (urllib.error.URLError, OSError):
-        dest.unlink(missing_ok=True)
+            data = resp.read()
+            ctype = str(resp.headers.get("Content-Type") or "").lower()
+            if "image/" in ctype:
+                if "image/png" in ctype:
+                    suffix = ".png"
+                elif "image/webp" in ctype:
+                    suffix = ".webp"
+                elif "image/gif" in ctype:
+                    suffix = ".gif"
+                elif "image/jpeg" in ctype or "image/jpg" in ctype:
+                    suffix = ".jpg"
+            # 防空图/防错误页面：必须有足够字节且签名像图片。
+            if len(data) < 512:
+                raise RuntimeError(f"图片下载体积异常（过小）: bytes={len(data)} url={url}")
+            head = data[:16]
+            is_jpg = head.startswith(b"\xFF\xD8\xFF")
+            is_png = head.startswith(b"\x89PNG\r\n\x1a\n")
+            is_gif = head.startswith(b"GIF87a") or head.startswith(b"GIF89a")
+            is_webp = head[:4] == b"RIFF" and head[8:12] == b"WEBP"
+            if not (is_jpg or is_png or is_gif or is_webp):
+                raise RuntimeError(f"下载内容不是可识别图片: ctype={ctype or '-'} url={url}")
+            fd, path = tempfile.mkstemp(suffix=suffix)
+            os.close(fd)
+            dest = Path(path)
+            dest.write_bytes(data)
+    except (urllib.error.URLError, OSError, RuntimeError):
+        if dest is not None:
+            dest.unlink(missing_ok=True)
         raise
+    if dest is None:
+        raise RuntimeError(f"图片下载失败：未生成本地文件 url={url}")
     return dest
 
 
