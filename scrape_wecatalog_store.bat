@@ -22,8 +22,10 @@ rem SQLite path: PRODUCT_FEED_SQLITE in config (default data\product_feed.db)
 echo [scrape] PY=%PY%
 echo [scrape] STORE_URL=%STORE_URL%
 echo [scrape] LOG_FILE=%LOG_FILE%
+echo [scrape] exit 75 = restart per WECATALOG_SCRAPE_RESTART_AFTER_ITEMS in config
 echo.
 
+:scrape_loop
 "%PY%" -m product_feed_kr.wecatalog_scrape_store ^
   --store-url "%STORE_URL%" ^
   --log-file "%LOG_FILE%" ^
@@ -31,6 +33,11 @@ echo.
   --checkpoint-every 1 %*
 
 set "EC=%ERRORLEVEL%"
+if "%EC%"=="75" (
+  echo [scrape] threshold reached ^(exit 75^), re-running...
+  goto scrape_loop
+)
+
 echo.
 if not "%EC%"=="0" (
   echo [scrape] FAILED exit=%EC%. See output and log: %LOG_FILE%

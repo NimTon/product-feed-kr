@@ -14,11 +14,18 @@ if not exist "%PY%" (
 
 echo [llm] PY=%PY%
 echo [llm] run LLM enrich for SQLite records
+echo [llm] exit 75 = restart per LISTING_LLM_RESTART_AFTER_ITEMS in config
 echo.
 
+:llm_loop
 "%PY%" -m product_feed_kr.seven17_upload --llm-only --include-uploaded %*
 
 set "EC=%ERRORLEVEL%"
+if "%EC%"=="75" (
+  echo [llm] threshold reached ^(exit 75^), re-running...
+  goto llm_loop
+)
+
 echo.
 if not "%EC%"=="0" (
   echo [llm] FAILED exit=%EC%

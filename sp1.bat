@@ -15,7 +15,9 @@ if not exist "%PY%" (
 set "STORE_URL=https://www.wecatalog.cn/weshop/store/_ddYqfVQW6mlRb5szWI5ni6txeRsQ5rZ3_QFVHeg"
 set "LOG_FILE=data\wecatalog_scrape.log"
 rem SQLite: PRODUCT_FEED_SQLITE in config\seven17.json (default data\product_feed.db)
+rem exit 75 = auto re-run per WECATALOG_SCRAPE_RESTART_AFTER_ITEMS
 
+:sp1_loop
 "%PY%" -m product_feed_kr.wecatalog_scrape_store ^
   --store-url "%STORE_URL%" ^
   --log-file "%LOG_FILE%" ^
@@ -23,6 +25,11 @@ rem SQLite: PRODUCT_FEED_SQLITE in config\seven17.json (default data\product_fee
   --checkpoint-every 1 %*
 
 set "EC=%ERRORLEVEL%"
+if "%EC%"=="75" (
+  echo [sp1] threshold reached ^(exit 75^), re-running...
+  goto sp1_loop
+)
+
 echo.
 if not "%EC%"=="0" (
   echo [sp1] FAILED exit=%EC%. See output and log: %LOG_FILE%
