@@ -76,3 +76,19 @@ def bool_env(key: str, default: bool = True) -> bool:
     if raw is None:
         return default
     return raw.strip().lower() not in ("0", "false", "no", "")
+
+
+# 拉取 / LLM 处理 / 上传累计完成 N 条后进程以该退出码结束，供外层脚本立即重启以刷新 DB、配置与会话。
+EXIT_RESTART_FRESH_DATA = 75
+
+
+def restart_after_n(key: str, default: int = 1000) -> int:
+    """读配置或环境变量：本 run 完成多少条后触发「退出 75 以便重跑」。0 表示关闭。"""
+    raw = getenv(key)
+    if raw is None or not str(raw).strip():
+        return default
+    try:
+        v = int(str(raw).strip())
+    except ValueError:
+        return default
+    return max(0, v)

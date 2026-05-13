@@ -1,5 +1,5 @@
 {
-  "_说明": "复制为 seven17.json。PRODUCT_FEED_SQLITE：本地 .db。WECATALOG_ALBUM_ID：微猫相册 ID（可省略命令行 --album-id）。OPENAI_*：listing_llm。OPENAI_LISTING_LLM_BATCH_SIZE：单批送入 LLM 的商品条数。上架：seven17_upload --write-back。",
+  "_说明": "复制为 seven17.json。PRODUCT_FEED_SQLITE：本地 .db。WECATALOG_ALBUM_ID：微猫相册 ID（可省略命令行 --album-id）。OPENAI_*：listing_llm。OPENAI_LISTING_LLM_BATCH_SIZE：单批送入 LLM 的商品条数。上架：seven17_upload --write-back。WECATALOG_SCRAPE_RESTART_AFTER_ITEMS / LISTING_LLM_RESTART_AFTER_ITEMS / SEVEN17_UPLOAD_RESTART_AFTER_ITEMS：拉取、LLM、上传各累计完成多少条后进程退出码 75，外层 bat 可立即重跑以防数据过旧；0 关闭；默认 1000。",
   "PRODUCT_FEED_SQLITE": "data/product_feed.db",
   "WECATALOG_ALBUM_ID": "",
   "OPENAI_BASE_URL": "https://api.openai.com/v1",
@@ -23,5 +23,8 @@
   "SEVEN17_SC_TYPE": "1",
   "SEVEN17_MAX_IMAGES": "10",
   "WEGO_TITLE_PREFIX": "",
-  "WEGO_DESC_TEMPLATE": ""
+  "WEGO_DESC_TEMPLATE": "",
+  "WECATALOG_SCRAPE_RESTART_AFTER_ITEMS": 1000,
+  "LISTING_LLM_RESTART_AFTER_ITEMS": 1000,
+  "SEVEN17_UPLOAD_RESTART_AFTER_ITEMS": 1000
 }
