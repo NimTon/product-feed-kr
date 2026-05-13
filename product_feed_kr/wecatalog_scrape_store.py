@@ -14,7 +14,7 @@
 
 详情：`GET .../commodity/view?targetAlbumId=...&itemId=...`（浏览器会话内 fetch）。
 
-**节流：** `--detail-delay`（默认 5 秒）作用于任意相邻两次微猫 API；详情命中本进程缓存则不发起请求。
+**节流：** `--detail-delay` 作用于任意相邻两次微猫 API（首次请求不休眠）。写单个数如 ``5`` 表示固定 5 秒；写区间如 ``3,8`` 或 ``3:8`` 表示每次在闭区间 **[A,B]** 内均匀随机秒数再休眠。详情命中本进程缓存则不发起请求。
 
 示例::
 
@@ -22,9 +22,15 @@
     --store-url \"https://www.wecatalog.cn/weshop/store/{albumId}\" \\
     --detail-delay 5
 
+  python -m product_feed_kr.wecatalog_scrape_store \\
+    --store-url \"https://www.wecatalog.cn/weshop/store/{albumId}\" \\
+    --detail-delay 3,8
+
 可选配置 ``PRODUCT_FEED_SQLITE``：SQLite 文件路径（默认 ``data/product_feed.db``）。
 
 ``WECATALOG_SCRAPE_RESTART_AFTER_ITEMS``（默认 1000）：本 run 新增写入 SQLite 达 N 条后退出码 **75**，供外层 bat 立即重跑以刷新进程与配置；0 关闭。
+
+``WECATALOG_DETAIL_DELAY``（默认 ``5``）：未传命令行 ``--detail-delay`` 时的节流默认值；格式与 ``--detail-delay`` 相同（如 ``"3,8"`` 或 JSON 数组 ``[3, 8]``）。环境变量优先于 ``seven17.json``。
 
 日志：与上架脚本同一套格式（**`event=`** + 短模块名 **`scrape:`**）；默认 **INFO** stderr；**`--log-file`** UTF-8；**`-v`** DEBUG。**`--headed`** 有界面浏览器。
 """
@@ -34,6 +40,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import random
 import re
 import sys
 import time
@@ -51,6 +58,7 @@ from product_feed_kr.wecatalog_fetch_tags import (
 )
 from product_feed_kr.seven17_config import (
     EXIT_RESTART_FRESH_DATA,
+    getenv,
     reload_seven17_config,
     restart_after_n,
 )
@@ -61,25 +69,65 @@ from product_feed_kr.pf_log import configure_scrape_logging, pf_kv
 logger = logging.getLogger("product_feed_kr.wecatalog_scrape_store")
 
 
+def parse_detail_delay_range(raw: str) -> tuple[float, float]:
+    """解析节流间隔：``5`` → (5,5)；``3,8`` / ``3:8`` / ``3~8`` → (3,8) 闭区间随机；JSON 数组 ``[3, 8]``（如 seven17.json 里写数组经 ``getenv`` 转成字符串后）同上。非负；若 A>B 则自动交换。"""
+    t = str(raw).strip()
+    if not t:
+        return (5.0, 5.0)
+    if t.startswith("["):
+        try:
+            arr = json.loads(t)
+        except json.JSONDecodeError:
+            arr = None
+        if isinstance(arr, list) and arr:
+            lo = max(0.0, float(arr[0]))
+            if len(arr) >= 2:
+                hi = max(0.0, float(arr[1]))
+                if lo > hi:
+                    lo, hi = hi, lo
+                return (lo, hi)
+            return (lo, lo)
+    for sep in (",", ":", "~"):
+        if sep in t:
+            a, b = t.split(sep, 1)
+            lo = max(0.0, float(a.strip()))
+            hi = max(0.0, float(b.strip()))
+            if lo > hi:
+                lo, hi = hi, lo
+            return (lo, hi)
+    v = max(0.0, float(t))
+    return (v, v)
+
+
 class InterRequestGap:
-    """相邻两次微猫 API（浏览器内 fetch/evaluate）之间休眠 delay_sec；首次 before() 不休眠。"""
+    """相邻两次微猫 API（浏览器内 fetch/evaluate）之间休眠；首次 before() 不休眠。delay 为 [lo,hi] 闭区间时每次随机 uniform。"""
 
-    __slots__ = ("delay_sec", "_n")
+    __slots__ = ("_lo", "_hi", "_n")
 
-    def __init__(self, delay_sec: float) -> None:
-        self.delay_sec = delay_sec
+    def __init__(self, delay_lo: float, delay_hi: float) -> None:
+        self._lo = max(0.0, float(delay_lo))
+        self._hi = max(self._lo, float(delay_hi))
         self._n = 0
 
     def before(self, label: str) -> None:
-        if self._n > 0 and self.delay_sec > 0:
-            logger.info(
-                "%s",
-                pf_kv(
-                    [("event", "scrape.throttle"), ("delay_sec", self.delay_sec), ("next", label)],
-                    zh=f"请求节流：休眠 {self.delay_sec}s 后发起「{label}」",
-                ),
-            )
-            time.sleep(self.delay_sec)
+        if self._n > 0:
+            if self._hi <= 0.0:
+                pass
+            else:
+                sec = random.uniform(self._lo, self._hi) if self._hi > self._lo else self._lo
+                logger.info(
+                    "%s",
+                    pf_kv(
+                        [
+                            ("event", "scrape.throttle"),
+                            ("delay_sec", round(sec, 3)),
+                            ("delay_range", [self._lo, self._hi]),
+                            ("next", label),
+                        ],
+                        zh=f"请求节流：休眠 {sec:.3g}s 后发起「{label}」",
+                    ),
+                )
+                time.sleep(sec)
         self._n += 1
 
 
@@ -249,7 +297,7 @@ def scrape_store(
     store_url: str,
     *,
     trans_lang: str = "zh",
-    detail_delay_sec: float = 5.0,
+    detail_delay_range: tuple[float, float] = (5.0, 5.0),
     max_list_pages: int = 500,
     skip_detail: bool = False,
     checkpoint_every: int = 0,
@@ -267,6 +315,15 @@ def scrape_store(
     album_id = parse_album_id(store_url)
     seed = store_url if store_url.startswith("http") else f"https://www.wecatalog.cn/weshop/store/{album_id}"
 
+    delay_lo, delay_hi = (
+        float(detail_delay_range[0]),
+        float(detail_delay_range[1]),
+    )
+    if delay_lo > delay_hi:
+        delay_lo, delay_hi = delay_hi, delay_lo
+    delay_lo = max(0.0, delay_lo)
+    delay_hi = max(delay_lo, delay_hi)
+
     logger.info(
         "%s",
         pf_kv(
@@ -275,6 +332,7 @@ def scrape_store(
                 ("album_id", album_id),
                 ("seed", seed),
                 ("sqlite", str(sqlite_db_path())),
+                ("throttle_delay_sec_range", [delay_lo, delay_hi]),
             ],
             zh="开始抓取微猫店铺：打开种子页并准备写 SQLite",
         ),
@@ -291,6 +349,7 @@ def scrape_store(
         "records_new": 0,
         "skipped_existing": 0,
         "restart_fresh": False,
+        "throttle_delay_sec_range": [delay_lo, delay_hi],
     }
     restart_after_new = restart_after_n("WECATALOG_SCRAPE_RESTART_AFTER_ITEMS", 1000)
 
@@ -328,7 +387,7 @@ def scrape_store(
             page.goto(seed, wait_until="domcontentloaded", timeout=120_000)
             page.wait_for_timeout(2_000)
 
-            gap = InterRequestGap(detail_delay_sec)
+            gap = InterRequestGap(delay_lo, delay_hi)
             api_tags = tags_api_url(album_id=album_id, trans_lang=trans_lang)
             gap.before("commodity/tags 分类树")
             tags_raw = page.evaluate(FETCH_TAGS_JS, api_tags)
@@ -364,7 +423,7 @@ def scrape_store(
                     album_id,
                     store_url=seed,
                     trans_lang=trans_lang,
-                    detail_delay_sec=detail_delay_sec,
+                    detail_delay_sec=delay_lo,
                     skip_detail=skip_detail,
                     meta_extra=meta_extra,
                     records=records,
@@ -622,6 +681,7 @@ def scrape_store(
 
 
 def main() -> int:
+    delay_default = (getenv("WECATALOG_DETAIL_DELAY", "5") or "5").strip()
     ap = argparse.ArgumentParser(description="wecatalog 店铺分类遍历 + 详情 → 本地 SQLite")
     ap.add_argument(
         "--store-url",
@@ -631,9 +691,10 @@ def main() -> int:
     ap.add_argument("--trans-lang", default="zh", help="commodity/tags 的 transLang")
     ap.add_argument(
         "--detail-delay",
-        type=float,
-        default=5.0,
-        help="相邻微猫 API 间隔秒数（tags / 列表分页 / 详情），默认 5；详情缓存命中不发起请求故不占间隔",
+        type=str,
+        default=delay_default,
+        metavar="SEC|A,B",
+        help="相邻微猫 API 间隔：固定秒数如 5；或闭区间随机如 3,8 / 3:8（每次在 [A,B] 内随机休眠）。未传本参数时默认读环境变量或 seven17.json 的 WECATALOG_DETAIL_DELAY。详情缓存命中不发起请求故不占间隔",
     )
     ap.add_argument("--max-list-pages", type=int, default=500, help="列表分页上限（每页约 32 条）")
     ap.add_argument("--skip-detail", action="store_true", help="只拉列表匹配分类，不请求 commodity/view")
@@ -663,13 +724,18 @@ def main() -> int:
     )
     args = ap.parse_args()
 
+    try:
+        d_lo, d_hi = parse_detail_delay_range(args.detail_delay)
+    except ValueError as e:
+        ap.error(f"无效 --detail-delay {args.detail_delay!r}: {e}")
+
     configure_scrape_logging(args.log_file, verbose=args.verbose)
 
     try:
         stats = scrape_store(
             args.store_url.strip(),
             trans_lang=args.trans_lang.strip() or "zh",
-            detail_delay_sec=max(0.0, args.detail_delay),
+            detail_delay_range=(d_lo, d_hi),
             max_list_pages=max(1, args.max_list_pages),
             skip_detail=args.skip_detail,
             checkpoint_every=max(0, args.checkpoint_every),

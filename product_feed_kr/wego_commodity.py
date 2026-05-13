@@ -49,6 +49,20 @@ def parse_price_str(raw: str | None, default: str) -> str:
     return digits
 
 
+def commodity_image_urls(obj: dict[str, Any]) -> list[str]:
+    """从 commodity 风格 dict 抽取主图/附图 URL 列表（不要求有价格）。"""
+    urls_raw = obj.get("imgsSrc") or obj.get("imgs") or []
+    if not isinstance(urls_raw, list):
+        urls_raw = []
+    image_urls: list[str] = []
+    for u in urls_raw:
+        if isinstance(u, str):
+            u = u.strip().split("|")[0].strip()
+            if u.startswith(("http://", "https://")):
+                image_urls.append(u)
+    return image_urls
+
+
 def parse_wego_product(
     obj: dict[str, Any],
     *,
@@ -89,15 +103,7 @@ def parse_wego_product(
     if price_str == "0" and srp not in ("0", "0.0"):
         price_str = srp
 
-    urls_raw = obj.get("imgsSrc") or obj.get("imgs") or []
-    if not isinstance(urls_raw, list):
-        urls_raw = []
-    image_urls: list[str] = []
-    for u in urls_raw:
-        if isinstance(u, str):
-            u = u.strip().split("|")[0].strip()
-            if u.startswith(("http://", "https://")):
-                image_urls.append(u)
+    image_urls = commodity_image_urls(obj)
 
     goods_id = str(obj.get("goods_id") or obj.get("selfGoodsId") or "").strip() or "-"
     goods_num = str(obj.get("goodsNum") or "").strip() or "—"
