@@ -45,7 +45,10 @@ def fetch_krw_per_cny(*, timeout: float = 20.0) -> float:
 
 
 def cny_listing_amount_to_krw_won_str(amount_cny: str, krw_per_cny: float) -> str:
-    """将货源侧人民币售价字符串转为韩元整数（원），写入 shop it_price。"""
+    """将货源侧人民币售价字符串转为韩元整数（원），写入 shop it_price。
+
+    换算后按 **千韩元** 四舍五入，使金额末三位为 ``000``（与韩国电商常见标价习惯一致）。
+    """
     s = str(amount_cny).strip().replace(",", "")
     if not s or s == "0":
         return "0"
@@ -56,4 +59,10 @@ def cny_listing_amount_to_krw_won_str(amount_cny: str, krw_per_cny: float) -> st
     if cny <= 0:
         return "0"
     won = int(round(cny * krw_per_cny))
-    return str(max(0, won))
+    if won <= 0:
+        return "0"
+    # 千韩元四舍五入（正数）：末三位固定为 000；非零且不足半千时至少 1000。
+    thousand = (won + 500) // 1000 * 1000
+    if thousand == 0:
+        thousand = 1000
+    return str(thousand)
