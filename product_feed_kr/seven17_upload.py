@@ -312,6 +312,43 @@ def _llm_cny_usable(llm_data: dict[str, Any] | None) -> bool:
     return bool(str(llm_data.get("cny_price") or "").strip())
 
 
+def _ko_option_pairs_from_attr_map(attr_map_ko: dict[str, Any] | None) -> list[tuple[str, str]]:
+    """从 attr_map_ko 提取商品选项（韩文键），返回 [(옵션명, '값1,값2,...')]，最多 3 组。"""
+    if not isinstance(attr_map_ko, dict):
+        return []
+    out: list[tuple[str, str]] = []
+    for k, raw_vals in attr_map_ko.items():
+        subject = str(k or "").strip()
+        if not subject:
+            continue
+        # 要求韩文：옵션名里至少有一个韩文字母。
+        if not any("\uac00" <= ch <= "\ud7a3" for ch in subject):
+            continue
+        vals: list[str] = []
+        if isinstance(raw_vals, list):
+            for v in raw_vals:
+                sv = str(v or "").strip()
+                if sv:
+                    vals.append(sv)
+        elif raw_vals is not None:
+            sv = str(raw_vals).strip()
+            if sv:
+                vals.append(sv)
+        uniq: list[str] = []
+        seen: set[str] = set()
+        for v in vals:
+            if v in seen:
+                continue
+            seen.add(v)
+            uniq.append(v)
+        if not uniq:
+            continue
+        out.append((subject, ",".join(uniq)))
+        if len(out) >= 3:
+            break
+    return out
+
+
 def itemform_preview_dict_from_store_record(
     record: dict[str, Any],
     *,
@@ -528,6 +565,7 @@ def _fill_itemform(
     image_path: Path | None = None,
     image_paths: list[Path] | None = None,
     sc_type: str,
+    option_attr_map_ko: dict[str, Any] | None = None,
     ca_path_ko: str = "—",
     ca_path_zh: str = "—",
     price_cny_for_log: str | None = None,
@@ -616,6 +654,49 @@ def _fill_itemform(
             sc.select_option(value=sc_type)
         except Exception:
             pass
+
+    # 商品选择选项：仅使用 LLM 的韩文 attr_map_ko；没有韩文选项则跳过。
+    option_pairs = _ko_option_pairs_from_attr_map(option_attr_map_ko)
+    if option_pairs:
+        for idx, (subject, items_csv) in enumerate(option_pairs, start=1):
+            page.fill(f'input[name="opt{idx}_subject"]', subject)
+            page.fill(f'input[name="opt{idx}"]', items_csv)
+        # 清空剩余的输入框，避免旧页面残留值干扰。
+        for idx in range(len(option_pairs) + 1, 4):
+            page.fill(f'input[name="opt{idx}_subject"]', "")
+            page.fill(f'input[name="opt{idx}"]', "")
+        btn_opt_create = page.locator('#option_table_create')
+        if btn_opt_create.count():
+            try:
+                btn_opt_create.first.click(timeout=30_000)
+                page.wait_for_timeout(800)
+            except Exception:
+                pass
+        _log.info(
+            "%s",
+            pf_kv(
+                [
+                    ("event", "itemform.option"),
+                    ("goods_id", gid),
+                    ("source", "attr_map_ko"),
+                    ("opt_count", len(option_pairs)),
+                    ("opt_subjects", ",".join(x[0] for x in option_pairs)),
+                ],
+                zh="已填写商品选择选项（韩文）",
+            ),
+        )
+    else:
+        _log.info(
+            "%s",
+            pf_kv(
+                [
+                    ("event", "itemform.option"),
+                    ("goods_id", gid),
+                    ("reason", "no_korean_attr_map"),
+                ],
+                zh="跳过商品选择选项：无可用韩文选项",
+            ),
+        )
 
     if fill_it_explan:
         # 先直接写隐藏 textarea 的 value（纯 JS 赋值，不触发键盘输入，避免误打到焦点输入框）。
@@ -1080,6 +1161,9 @@ def upload_from_wecatalog_store(
                             image_path=None,
                             image_paths=tmp_files,
                             sc_type=sc_type,
+                            option_attr_map_ko=llm_data.get("attr_map_ko")
+                            if isinstance(llm_data.get("attr_map_ko"), dict)
+                            else None,
                             price_cny_for_log=pcny_log,
                             fx_krw_per_cny=fx_log_rate,
                         )

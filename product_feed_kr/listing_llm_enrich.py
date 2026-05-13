@@ -27,18 +27,17 @@ _SYSTEM = """你是电商商品信息抽取助手。只输出一个 JSON 对象�
 
 字段要求：
 - cny_price：字符串或 null。能确定人民币售价时填数字字符串（如 "340"）；**完全无法判断时请填 null**（不要猜价）。
-- attr_map：对象（仅保留“下单必选项”），例如 {"尺码":["X","XL"],"颜色":["黑","白"]}。
-  - 只允许：颜色、尺码（及其同义表达）。
+- attr_map：对象，**只抽取尺码**，例如 {"尺码":["M","L"]}。
+  - **禁止**放入颜色、材质、赠品、品牌等非尺码信息；颜色一律不输出。
   - 尺码值只保留数字和字母（如 "012码" -> "012", "XL码" -> "XL"）。
-  - 品牌/风格/款式/图案/赠品等“非下单必选”信息不要放入 attr_map。
-  - 无可抽取项时填 {}。
-- attr_map_ko：对象（key 为韩文属性名，value 为韩文字符串数组），与 attr_map 尽量一一对应；
-  - 例如 {"사이즈":["X","XL"],"색상":["화이트"]}，同样仅保留下单必选项。
-  - 无可抽取项时填 {}。
+  - 标题中无明确尺码或置信度 <90% 时填 {}。
+- attr_map_ko：对象，**只抽取尺码**（key 固定为韩文「사이즈」），value 为尺码值数组，与 attr_map 中尺码一一对应（顺序一致即可）。
+  - 例如 {"사이즈":["M","L"]}；**禁止** 색상/컬러 等键。
+  - 无尺码时填 {}。
 - name_zh：字符串，必须精简为核心中文商品名（尽量 8~20 字），去掉营销词、emoji、口号、重复品牌/型号堆砌。
 - name_ko：字符串，韩文精简商品名（尽量 8~24 字），同样去掉营销冗余；不确定可留空字符串 ""。
 - desc_zh：字符串，来自标题原文的中文描述提取与轻润色（建议 2~5 句，约 80~220 字）。
-  - 尽量保留原文里的核心信息：款式/设计/搭配/赠品/颜色/尺码等。
+  - 尽量保留原文里的核心信息：款式/设计/搭配/赠品等；**不要在描述里单独罗列颜色选项**（颜色已由业务决定不抽取）。
   - 不确定或原文缺失的信息不要补写。
 - desc_ko：字符串，基于 desc_zh 的韩文等价表达（建议 2~5 句，约 90~260 字），仅翻译与轻润色，不新增信息。
 """
@@ -59,8 +58,8 @@ _SYSTEM_BATCH = """你是电商商品信息抽取助手。输入是一个 JSON �
 - 置信度 <90% 的字段不要填（按类型返回空值）。
 - items 必须是数组，且每个 idx 必须对应输入的 idx。
 - cny_price：字符串或 null。能确定人民币售价时填数字字符串；完全无法判断填 null，不要猜价。
-- attr_map：对象，key 为属性名、value 为字符串数组；仅保留下单必选项（颜色、尺码）；没有填 {}。
-- attr_map_ko：对象，key 为韩文属性名、value 为韩文字符串数组；仅保留下单必选项并与 attr_map 对齐；没有填 {}。
+- attr_map：**仅尺码**。只能出现键「尺码」，value 为尺码字符串数组；无尺码填 {}。**禁止**颜色等其它属性键。
+- attr_map_ko：**仅尺码**。只能出现键「사이즈」，value 与 attr_map 尺码一致；无尺码填 {}。**禁止** 색상 等键。
 - 尺码值必须只含数字/字母（不要“码/码数”等文字后缀）。
 - name_zh：核心中文商品名，尽量 8~20 字，去营销冗余。
 - name_ko：核心韩文商品名，尽量 8~24 字，去营销冗余；不确定可空字符串。
@@ -114,27 +113,29 @@ def _normalize_llm_payload(data: dict[str, Any]) -> dict[str, Any]:
                 out_vals.append(x)
         return out_vals
 
-    def _normalize_attr_map(raw: Any, *, key_max: int = 24, val_max: int = 40) -> dict[str, list[str]]:
+    def _normalize_attr_map(
+        raw: Any, *, key_max: int = 24, val_max: int = 40, ko: bool = False
+    ) -> dict[str, list[str]]:
         out_map: dict[str, list[str]] = {}
         if not isinstance(raw, dict):
             return out_map
-        # 仅保留下单必选项：颜色、尺码（及同义词）。
-        alias = {
-            "颜色": "颜色",
-            "色": "颜色",
-            "配色": "颜色",
-            "色系": "颜色",
-            "색상": "색상",
-            "컬러": "색상",
-            "칼라": "색상",
-            "尺码": "尺码",
-            "码数": "尺码",
-            "码": "尺码",
-            "尺寸": "尺码",
-            "size": "尺码",
-            "사이즈": "사이즈",
-            "치수": "사이즈",
-        }
+        canonical = "사이즈" if ko else "尺码"
+        # 仅尺码：非下列 key（含常见同义）一律丢弃（含颜色等）。
+        size_synonyms = (
+            "尺码",
+            "码数",
+            "码",
+            "尺寸",
+            "size",
+            "사이즈",
+            "치수",
+            "규격",
+        )
+        alias: dict[str, str] = {}
+        for syn in size_synonyms:
+            alias[syn] = canonical
+            if syn.isascii():
+                alias[syn.lower()] = canonical
 
         def _size_tokens(text: str) -> list[str]:
             # 尺码只保留字母/数字片段，例如 "012码" -> ["012"], "XL码" -> ["XL"]。
@@ -150,7 +151,7 @@ def _normalize_llm_payload(data: dict[str, Any]) -> dict[str, Any]:
             name = _norm_text(k, key_max)
             if not name:
                 continue
-            key_norm = alias.get(name.lower(), alias.get(name, ""))
+            key_norm = alias.get(name) or alias.get(name.lower(), "")
             if not key_norm:
                 continue
             arr = _as_text_list(vals)
@@ -159,26 +160,19 @@ def _normalize_llm_payload(data: dict[str, Any]) -> dict[str, Any]:
             uniq: list[str] = []
             seen: set[str] = set()
             for v in arr:
-                if key_norm in ("尺码", "사이즈"):
-                    for tok in _size_tokens(v):
-                        if tok in seen:
-                            continue
-                        seen.add(tok)
-                        uniq.append(tok)
-                else:
-                    vv = _norm_text(v, val_max)
-                    if not vv or vv in seen:
+                for tok in _size_tokens(v):
+                    if tok in seen:
                         continue
-                    seen.add(vv)
-                    uniq.append(vv)
+                    seen.add(tok)
+                    uniq.append(tok)
             if uniq:
-                prev = out_map.get(key_norm, [])
+                prev = out_map.get(canonical, [])
                 seen_prev = set(prev)
-                out_map[key_norm] = prev + [x for x in uniq if x not in seen_prev]
+                out_map[canonical] = prev + [x for x in uniq if x not in seen_prev]
         return out_map
 
-    out["attr_map"] = _normalize_attr_map(data.get("attr_map"))
-    out["attr_map_ko"] = _normalize_attr_map(data.get("attr_map_ko"), key_max=30, val_max=48)
+    out["attr_map"] = _normalize_attr_map(data.get("attr_map"), ko=False)
+    out["attr_map_ko"] = _normalize_attr_map(data.get("attr_map_ko"), ko=True, key_max=30, val_max=48)
 
     name_zh = data.get("name_zh")
     out["name_zh"] = _norm_text(name_zh, 24)
