@@ -1,14 +1,18 @@
-"""上架前：根据货源 ``commodity.title`` 调用 OpenAI 兼容接口，抽取结构化字段写入 ``record['listing_llm']``，
+"""上架前：根据货源 ``commodity.title``（可选附带缩略图）调用 OpenAI 兼容接口，抽取结构化字段写入 ``record['listing_llm']``，
 并把识别到的人民币价写入 ``commodity.optimaPrice``；未识别时 ``listing_llm.cny_price`` 为 JSON ``null``（Python ``None``），
 ``optimaPrice`` 置空字符串，上架脚本按 ``null`` 跳过。
 """
 
 from __future__ import annotations
 
+import base64
+import io
 import json
 import logging
 import re
 import time
+import urllib.error
+import urllib.request
 from datetime import datetime, timezone
 from typing import Any
 from urllib.parse import urlparse
@@ -108,24 +112,23 @@ def _shoe_size_token_to_kr_mm(tok: str) -> str:
 
 _SYSTEM = """你是电商商品信息抽取助手。只输出一个 JSON 对象，不要 Markdown 围栏，不要多余说明。
 总原则（必须遵守）：
-- 只允许基于输入标题文本做“高置信度提取”，不要脑补、不要扩写背景信息。
+- 只允许基于输入做“高置信度提取”，不要脑补、不要扩写背景信息。
 - 置信度门槛：只有你对某条信息把握 >=90% 才可输出；低于 90% 则留空（"" / {} / null）。
 - 描述只做“轻润色”：允许去 emoji、去重复口号、调顺语序；不允许新增原文没有的卖点。
 
 字段要求：
 - cny_price：字符串或 null。能确定人民币售价时填数字字符串（如 "340"）；**完全无法判断时请填 null**（不要猜价）。
-- attr_map：对象，**只抽取尺码**，例如 {"尺码":["M","L"]} 或 {"尺码":["S","M","L"]}。
-  - **禁止**放入颜色、材质、赠品、品牌等非尺码信息；颜色一律不输出。
-  - 尺码值以字母规格为主（S/M/L/XL…）；标题里「012码」「0123码」表示多档（0=S、1=M、2=L、3=XL…），**优先直接输出展开后的数组**；若仍写数字串，后处理也会按位展开。
-  - 标题中无明确尺码或置信度 <90% 时填 {}。
-- attr_map_ko：对象，**只抽取尺码**（key 固定为韩文「사이즈」），value 为尺码值数组，与 attr_map 中尺码一一对应（顺序一致即可）。
-  - 例如 {"사이즈":["M","L"]}；**禁止** 색상/컬러 等键。
-  - **鞋类**（标题含鞋/靴/运动鞋 등）：사이즈 값请用韩国通贩常见的 **밀리미터 발길이** 标法（如 230、235、240 … 285）；若标题只有欧码/中国码两位数字，也请先换成毫米再输出。
-  - 无尺码时填 {}。
+- attr_map：对象，**下单必选项**，仅含 **颜色**、**尺码** 两类 key（中文名）：`颜色`、`尺码`。
+  - `颜色`：value 为颜色字符串数组（如 ["灰","黑"]）；标题或图中无法佐证的色不要写。
+  - `尺码`：value 为尺码字符串数组；尺码值以字母规格为主（S/M/L/XL…）；「012码」「0123码」表示多档（0=S、1=M、2=L、3=XL…），优先直接输出展开后的数组。
+  - 无可抽取项时对应 key 可省略或填 []；两者皆无时 attr_map 为 {}。
+- attr_map_ko：对象，与 attr_map 对齐，key 仅用韩文 **`색상`**、**`사이즈`**，value 为韩文或通用尺码符号数组（색상 값尽量用韩文色名）。
+  - **鞋类**（标题含鞋/靴/运动鞋 등）：`사이즈` 请用韩国通贩 **毫米脚长**（230、235…）；欧码两位数字可先写欧码，后处理会换算毫米。
+  - 无对应项时填 {} 或省略 key。
 - name_zh：字符串，必须精简为核心中文商品名（尽量 8~20 字），去掉营销词、emoji、口号、重复品牌/型号堆砌。
 - name_ko：字符串，韩文精简商品名（尽量 8~24 字），同样去掉营销冗余；不确定可留空字符串 ""。
 - desc_zh：字符串，来自标题原文的中文描述提取与轻润色（建议 2~5 句，约 80~220 字）。
-  - 尽量保留原文里的核心信息：款式/设计/搭配/赠品等；**不要在描述里单独罗列颜色选项**（颜色已由业务决定不抽取）。
+  - 尽量保留原文里的核心信息：款式/设计/搭配/赠品等；颜色若已在 attr_map 中列出，描述里不必重复罗列色表。
   - 不确定或原文缺失的信息不要补写。
 - desc_ko：字符串，基于 desc_zh 的韩文等价表达（建议 2~5 句，约 90~260 字），仅翻译与轻润色，不新增信息。
 """
@@ -137,23 +140,25 @@ _USER_TMPL = """请根据以下相册/微商商品标题抽取信息：
 ---
 """
 
+_VISION_COLOR_SUPPLEMENT = """
+【已附带商品缩略图】须同时依据**图片中清晰可见的主体颜色/配色**校正颜色选项：
+- attr_map「颜色」与 attr_map_ko「색상」：只保留在图中**能明确辨认或强佐证**的颜色；标题列出但图中未见、无法确认的色**不要输出**。
+- 若图与标题在颜色上冲突，以**图为准**（仍须 >=90% 把握才写）。
+- 尺码、价格、名称与描述规则仍按上文；鞋类毫米规则不变。
+"""
+
 _SYSTEM_BATCH = """你是电商商品信息抽取助手。输入是一个 JSON 数组，每项含 idx、goods_id、title。
 请输出一个 JSON 对象，格式固定为：
-{"items":[{"idx":1,"cny_price":"340","attr_map":{"尺码":["M","L"]},"attr_map_ko":{"사이즈":["M","L"]},"name_zh":"...","name_ko":"...","desc_zh":"...","desc_ko":"..."}]}
+{"items":[{"idx":1,"cny_price":"340","attr_map":{"颜色":["黑"],"尺码":["M","L"]},"attr_map_ko":{"색상":["블랙"],"사이즈":["M","L"]},"name_zh":"...","name_ko":"...","desc_zh":"...","desc_ko":"..."}]}
 
 要求：
 - 只允许基于输入 title 做提取；不要脑补。
 - 置信度 <90% 的字段不要填（按类型返回空值）。
 - items 必须是数组，且每个 idx 必须对应输入的 idx。
 - cny_price：字符串或 null。能确定人民币售价时填数字字符串；完全无法判断填 null，不要猜价。
-- attr_map：**仅尺码**。只能出现键「尺码」，value 为尺码字符串数组；无尺码填 {}。**禁止**颜色等其它属性键。
-- attr_map_ko：**仅尺码**。只能出现键「사이즈」，value 与 attr_map 尺码一致；无尺码填 {}。**禁止** 색상 等键。
-- 鞋类：사이즈 값用毫米脚长（230~290 等）；欧码两位数字由后处理也会换算为毫米。
-- 尺码值以字母规格为主；「012码」类多档可写 ["S","M","L"] 或数字串（后处理按 0=S、1=M… 展开）。不要混入「码」字后缀到 value 里。
-- name_zh：核心中文商品名，尽量 8~20 字，去营销冗余。
-- name_ko：核心韩文商品名，尽量 8~24 字，去营销冗余；不确定可空字符串。
-- desc_zh：从 title 原文提取并轻润色，2~5 句，约 80~220 字，不可新增原文没有的卖点。
-- desc_ko：与 desc_zh 信息严格对齐的韩文表达，2~5 句，约 90~260 字。
+- attr_map：仅 **颜色**、**尺码** 两个中文 key；无则 {} 或省略键。尺码值不要带「码」字后缀；「012码」类可写 ["S","M","L"] 或数字串（后处理按位展开）。
+- attr_map_ko：仅 **색상**、**사이즈**；与 attr_map 颜色/尺码一一对应（顺序一致）。鞋类 `사이즈` 用毫米脚长。
+- name_zh / name_ko / desc_zh / desc_ko 同单条模式。
 - 只输出 JSON，不要 Markdown、不要额外解释。
 """
 
@@ -222,23 +227,54 @@ def _normalize_llm_payload(data: dict[str, Any], *, listing_hint: str | None = N
         out_map: dict[str, list[str]] = {}
         if not isinstance(raw, dict):
             return out_map
-        canonical = "사이즈" if ko else "尺码"
-        # 仅尺码：非下列 key（含常见同义）一律丢弃（含颜色等）。
-        size_synonyms = (
-            "尺码",
-            "码数",
-            "码",
-            "尺寸",
-            "size",
-            "사이즈",
-            "치수",
-            "규격",
-        )
+        canonical_size = "사이즈" if ko else "尺码"
+        canonical_color = "색상" if ko else "颜色"
+        if ko:
+            size_alias = {
+                "사이즈": canonical_size,
+                "치수": canonical_size,
+                "규격": canonical_size,
+                "尺码": canonical_size,
+                "码数": canonical_size,
+                "码": canonical_size,
+                "尺寸": canonical_size,
+                "size": canonical_size,
+            }
+            color_alias = {
+                "색상": canonical_color,
+                "컬러": canonical_color,
+                "칼라": canonical_color,
+                "颜色": canonical_color,
+                "色": canonical_color,
+                "配色": canonical_color,
+                "色系": canonical_color,
+            }
+        else:
+            size_alias = {
+                "尺码": canonical_size,
+                "码数": canonical_size,
+                "码": canonical_size,
+                "尺寸": canonical_size,
+                "size": canonical_size,
+                "사이즈": canonical_size,
+                "치수": canonical_size,
+                "규격": canonical_size,
+            }
+            color_alias = {
+                "颜色": canonical_color,
+                "色": canonical_color,
+                "配色": canonical_color,
+                "色系": canonical_color,
+                "색상": canonical_color,
+                "컬러": canonical_color,
+                "칼라": canonical_color,
+            }
         alias: dict[str, str] = {}
-        for syn in size_synonyms:
-            alias[syn] = canonical
-            if syn.isascii():
-                alias[syn.lower()] = canonical
+        for d in (size_alias, color_alias):
+            for syn, can in d.items():
+                alias[syn] = can
+                if syn.isascii():
+                    alias[syn.lower()] = can
 
         # 货源常见：「012码」= S/M/L 三档，数字按位对应 0=S、1=M、2=L、3=XL…（类推）。
         _digit_slot_sizes = (
@@ -266,19 +302,15 @@ def _normalize_llm_payload(data: dict[str, Any], *, listing_hint: str | None = N
                 return [_digit_slot_sizes[i]]
             if n == 2:
                 v = int(ds)
-                # 常见鞋码/腰围两位号，勿拆成两档字母。
                 if 30 <= v <= 52:
                     return None
-                # 韩版女装常见「44/55/66/77/88/99」两位号，勿按位拆。
                 if v in (44, 55, 66, 77, 88, 99):
                     return None
                 return [_digit_slot_sizes[int(c)] for c in ds]
             if n == 3:
                 v = int(ds)
-                # 韩版鞋长 / 脚长毫米标（常见 220~300），勿拆成三档字母。
                 if 210 <= v <= 320:
                     return None
-                # 常见身高 cm，勿拆成三档字母。
                 if 100 <= v <= 200:
                     return None
                 return [_digit_slot_sizes[int(c)] for c in ds]
@@ -316,25 +348,35 @@ def _normalize_llm_payload(data: dict[str, Any], *, listing_hint: str | None = N
                 continue
             uniq: list[str] = []
             seen: set[str] = set()
-            for v in arr:
-                for tok in _size_tokens(v):
-                    if tok in seen:
+            if key_norm == canonical_size:
+                for v in arr:
+                    for tok in _size_tokens(v):
+                        if tok in seen:
+                            continue
+                        seen.add(tok)
+                        uniq.append(tok)
+                if uniq and ko and shoe_kr_mm:
+                    conv: list[str] = []
+                    seen_mm: set[str] = set()
+                    for x in uniq:
+                        y = _shoe_size_token_to_kr_mm(x)
+                        if y not in seen_mm:
+                            seen_mm.add(y)
+                            conv.append(y)
+                    uniq = conv
+            elif key_norm == canonical_color:
+                for v in arr:
+                    vv = _norm_text(v, val_max)
+                    if not vv or vv in seen:
                         continue
-                    seen.add(tok)
-                    uniq.append(tok)
-            if uniq and ko and shoe_kr_mm:
-                conv: list[str] = []
-                seen_mm: set[str] = set()
-                for x in uniq:
-                    y = _shoe_size_token_to_kr_mm(x)
-                    if y not in seen_mm:
-                        seen_mm.add(y)
-                        conv.append(y)
-                uniq = conv
+                    seen.add(vv)
+                    uniq.append(vv)
+            else:
+                continue
             if uniq:
-                prev = out_map.get(canonical, [])
+                prev = out_map.get(key_norm, [])
                 seen_prev = set(prev)
-                out_map[canonical] = prev + [x for x in uniq if x not in seen_prev]
+                out_map[key_norm] = prev + [x for x in uniq if x not in seen_prev]
         return out_map
 
     out["attr_map"] = _normalize_attr_map(data.get("attr_map"), ko=False, shoe_kr_mm=False)
@@ -407,6 +449,64 @@ def listing_llm_batch_size() -> int:
     return max(1, min(n, 50))
 
 
+def listing_llm_color_vision_enabled() -> bool:
+    """为 true 时 LLM 单条请求附带商品缩略图，用于校正 attr_map 颜色（关闭 JSON 批量接口）。"""
+    return _cfg_bool("OPENAI_LISTING_COLOR_VISION", False)
+
+
+def listing_llm_color_vision_max_images() -> int:
+    try:
+        n = int(str(_cfg_get("OPENAI_LISTING_COLOR_VISION_MAX_IMAGES") or "4").strip())
+    except ValueError:
+        n = 4
+    return max(1, min(n, 10))
+
+
+def listing_llm_color_vision_max_px() -> int:
+    try:
+        n = int(str(_cfg_get("OPENAI_LISTING_COLOR_VISION_MAX_PX") or "256").strip())
+    except ValueError:
+        n = 256
+    return max(64, min(n, 1024))
+
+
+def _download_resize_jpeg_data_urls(urls: list[str], *, max_images: int, max_px: int) -> list[str]:
+    """将远程图缩小为 JPEG，返回 data:image/jpeg;base64,... 供多模态 API。"""
+    try:
+        from PIL import Image
+    except ImportError as e:
+        raise RuntimeError("颜色修正需 Pillow：pip install Pillow") from e
+    out: list[str] = []
+    for url in urls[:max_images]:
+        u = str(url).strip()
+        if not u.startswith(("http://", "https://")):
+            continue
+        try:
+            req = urllib.request.Request(
+                u,
+                headers={
+                    "User-Agent": (
+                        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+                    )
+                },
+            )
+            with urllib.request.urlopen(req, timeout=25) as resp:
+                raw = resp.read()
+            if len(raw) > 8_000_000:
+                continue
+            im = Image.open(io.BytesIO(raw)).convert("RGB")
+            im.thumbnail((max_px, max_px), Image.Resampling.LANCZOS)
+            buf = io.BytesIO()
+            im.save(buf, format="JPEG", quality=82, optimize=True)
+            b64 = base64.standard_b64encode(buf.getvalue()).decode("ascii")
+            out.append(f"data:image/jpeg;base64,{b64}")
+        except (OSError, ValueError, TypeError, urllib.error.URLError, urllib.error.HTTPError) as e:
+            _log.debug("listing_llm vision image skip: %s", str(e)[:200])
+            continue
+    return out
+
+
 def _resolve_timeout(timeout: float | None) -> float:
     if timeout is not None:
         return timeout
@@ -434,7 +534,7 @@ def _chat_once_json(
     client,
     *,
     model: str,
-    messages: list[dict[str, str]],
+    messages: list[dict[str, Any]],
     use_response_format: bool = True,
 ) -> tuple[str, int]:
     t0 = time.monotonic()
@@ -510,6 +610,23 @@ def enrich_records_listing_llm_batch(
         need_call.append((i, record, commodity, title))
 
     if not need_call:
+        return changed
+
+    if listing_llm_color_vision_enabled():
+        _log.info(
+            "%s",
+            pf_kv(
+                [
+                    ("event", "llm.batch.bypass"),
+                    ("reason", "OPENAI_LISTING_COLOR_VISION"),
+                    ("n", len(need_call)),
+                ],
+                zh="已开启颜色缩略图修正，改为逐条调用（不走 JSON 批量）",
+            ),
+        )
+        for _idx, record, commodity, _title in need_call:
+            if enrich_record_listing_llm(record, commodity, timeout=timeout):
+                changed.append(record)
         return changed
 
     client, model, host = _openai_client(timeout)
@@ -652,25 +769,71 @@ def enrich_record_listing_llm(
 
     client, model, host = _openai_client(timeout)
     use_response_format = "dashscope.aliyuncs.com" not in host.lower()
-    user_msg = _USER_TMPL.format(title=title)
-    messages = [
-        {"role": "system", "content": _SYSTEM},
-        {"role": "user", "content": user_msg},
-    ]
     gid_short = str(record.get("goods_id") or "")[:36]
-    _log.info(
-        "%s",
-        pf_kv(
-            [
-                ("event", "llm.request"),
-                ("model", model),
-                ("host", host),
-                ("title_len", len(title)),
-                ("goods_id", gid_short),
-            ],
-            zh="正在调用 OpenAI 丰富上架字段（标题价尺码等）",
-        ),
-    )
+    want_vision = listing_llm_color_vision_enabled()
+    data_urls: list[str] = []
+    if want_vision:
+        from product_feed_kr.wego_commodity import commodity_image_urls
+
+        urls = commodity_image_urls(commodity)
+        data_urls = _download_resize_jpeg_data_urls(
+            urls,
+            max_images=listing_llm_color_vision_max_images(),
+            max_px=listing_llm_color_vision_max_px(),
+        )
+        if not data_urls:
+            _log.warning(
+                "%s",
+                pf_kv(
+                    [
+                        ("event", "llm.vision_no_images"),
+                        ("goods_id", gid_short),
+                        ("url_candidates", len(urls)),
+                    ],
+                    zh="颜色修正已开启但未得到有效缩略图，退回纯文本请求",
+                ),
+            )
+            want_vision = False
+
+    if want_vision and data_urls:
+        system_text = _SYSTEM + _VISION_COLOR_SUPPLEMENT
+        user_msg = _USER_TMPL.format(title=title)
+        user_parts: list[dict[str, Any]] = [
+            {
+                "type": "text",
+                "text": user_msg.rstrip() + "\n\n（附：商品参考缩略图，已缩小分辨率。）",
+            },
+        ]
+        for durl in data_urls:
+            user_parts.append({"type": "image_url", "image_url": {"url": durl}})
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": system_text},
+            {"role": "user", "content": user_parts},
+        ]
+        log_kv = [
+            ("event", "llm.request"),
+            ("model", model),
+            ("host", host),
+            ("title_len", len(title)),
+            ("goods_id", gid_short),
+            ("vision", 1),
+            ("vision_images", len(data_urls)),
+        ]
+        log_zh = "正在调用 OpenAI 丰富上架字段（含颜色缩略图）"
+    else:
+        messages = [
+            {"role": "system", "content": _SYSTEM},
+            {"role": "user", "content": _USER_TMPL.format(title=title)},
+        ]
+        log_kv = [
+            ("event", "llm.request"),
+            ("model", model),
+            ("host", host),
+            ("title_len", len(title)),
+            ("goods_id", gid_short),
+        ]
+        log_zh = "正在调用 OpenAI 丰富上架字段（标题价颜色尺码等）"
+    _log.info("%s", pf_kv(log_kv, zh=log_zh))
     content, elapsed_ms = _chat_once_json(
         client,
         model=model,

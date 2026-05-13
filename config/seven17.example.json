@@ -1,5 +1,5 @@
 {
-  "_说明": "复制为 seven17.json。PRODUCT_FEED_SQLITE：本地 .db。WECATALOG_ALBUM_ID：微猫相册 ID（可省略命令行 --album-id）。OPENAI_*：listing_llm。OPENAI_LISTING_LLM_BATCH_SIZE：单批送入 LLM 的商品条数。上架：seven17_upload --write-back。WECATALOG_SCRAPE_RESTART_AFTER_ITEMS / LISTING_LLM_RESTART_AFTER_ITEMS / SEVEN17_UPLOAD_RESTART_AFTER_ITEMS：拉取、LLM、上传各累计完成多少条后进程退出码 75，外层 bat 可立即重跑以防数据过旧；0 关闭；默认 1000。",
+  "_说明": "复制为 seven17.json。PRODUCT_FEED_SQLITE：本地 .db。WECATALOG_ALBUM_ID：微猫相册 ID（可省略命令行 --album-id）。OPENAI_*：listing_llm。OPENAI_LISTING_COLOR_VISION：为 true 时 LLM 请求附带商品缩略图，便于 attr_map/attr_map_ko 中颜色与实物一致（关闭批量 JSON，逐条调用）。OPENAI_LISTING_LLM_BATCH_SIZE：单批送入 LLM 的商品条数。上架：seven17_upload --write-back。WECATALOG_SCRAPE_RESTART_AFTER_ITEMS / LISTING_LLM_RESTART_AFTER_ITEMS / SEVEN17_UPLOAD_RESTART_AFTER_ITEMS：拉取、LLM、上传各累计完成多少条后进程退出码 75，外层 bat 可立即重跑以防数据过旧；0 关闭；默认 1000。",
   "PRODUCT_FEED_SQLITE": "data/product_feed.db",
   "WECATALOG_ALBUM_ID": "",
   "OPENAI_BASE_URL": "https://api.openai.com/v1",
@@ -9,6 +9,9 @@
   "OPENAI_LISTING_LLM_BATCH_SIZE": "12",
   "OPENAI_ENRICH_LISTING": true,
   "OPENAI_LISTING_LLM_FORCE": false,
+  "OPENAI_LISTING_COLOR_VISION": false,
+  "OPENAI_LISTING_COLOR_VISION_MAX_IMAGES": "4",
+  "OPENAI_LISTING_COLOR_VISION_MAX_PX": "256",
   "SEVEN17_FILL_IT_EXPLAN": true,
   "SEVEN17_WRITE_BACK_AFTER_LLM": true,
   "SEVEN17_MB_ID": "",
