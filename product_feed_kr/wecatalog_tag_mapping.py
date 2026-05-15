@@ -9,8 +9,9 @@
 - `{"seven17_ca_id": "85"}`：seven17 后台商品表单 **기본분류** 下拉对应的 **`ca_id`（字符串）**，
   **`seven17_upload` 按 (分组, 标签) 选用**；未写则该商品无法上架（不会读其它配置的默认分类）。
 
-批量维护：编辑 `wecatalog_tag_category_map_builder.py` 中 RAW_ROWS 后执行
-`python -m product_feed_kr.wecatalog_tag_category_map_builder` 重新生成 JSON。
+批量维护：编辑 `config/wecatalog_tag_category_map.txt` 后执行
+`python -m product_feed_kr.wecatalog_tag_category_map_builder` 或 `build_wecatalog_tag_category_map.bat`
+重新生成 `wecatalog_tag_category_map.json`。
 """
 
 from __future__ import annotations

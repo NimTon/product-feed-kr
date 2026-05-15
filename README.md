@@ -19,8 +19,9 @@ python -m playwright install chromium
 python -m product_feed_kr
 python -m product_feed_kr.wecatalog_scrape_store --store-url "..." --out data/wecatalog_store_products.json --existing-json data/wecatalog_store_products.json
 
-# 映射表生成（编辑 builder 内 RAW_ROWS 后）
+# 映射表生成（编辑 config/wecatalog_tag_category_map.txt 后）
 python -m product_feed_kr.wecatalog_tag_category_map_builder
+# 或双击 build_wecatalog_tag_category_map.bat
 
 # 上架（默认读取 data/wecatalog_store_products.json）
 python -m product_feed_kr.seven17_upload --limit 5

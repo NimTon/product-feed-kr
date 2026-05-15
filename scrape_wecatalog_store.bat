@@ -1,7 +1,7 @@
 @echo off
-rem UTF-8 console for Python logs (file is ASCII-only so cmd parses correctly)
+rem UTF-8 console for Python logs; keep this file ASCII-only for CMD on Chinese Windows
 chcp 65001 >nul
-rem 须延迟展开：set EC=%ERRORLEVEL% 会把 ERRORLEVEL 冲成 0，exit 75 无法循环
+rem Delayed expansion: capture !ERRORLEVEL! before echo overwrites ERRORLEVEL
 setlocal EnableDelayedExpansion
 cd /d "%~dp0"
 
@@ -23,7 +23,7 @@ rem SQLite path: PRODUCT_FEED_SQLITE in config (default data\product_feed.db)
 echo [scrape] PY=%PY%
 echo [scrape] STORE_URL=%STORE_URL%
 echo [scrape] LOG_FILE=%LOG_FILE%
-echo [scrape] exit 75 = restart per WECATALOG_SCRAPE_RESTART_AFTER_ITEMS in config
+echo [scrape] loops after every run ^(any exit code^); close window or Ctrl+C to stop
 echo.
 
 :scrape_loop
@@ -34,18 +34,7 @@ echo.
   --checkpoint-every 1 %*
 
 set "EC=!ERRORLEVEL!"
-if "!EC!"=="75" (
-  echo [scrape] threshold reached ^(exit 75^), re-running...
-  goto scrape_loop
-)
-
 echo.
-if not "!EC!"=="0" (
-  echo [scrape] FAILED exit=!EC!. See output and log: %LOG_FILE%
-  echo Hint: pip install -r requirements.txt ^(filelock^) and check SQLite path in config.
-) else (
-  echo [scrape] OK exit=0.
-)
-echo Press any key to close...
-pause >nul
-endlocal & exit /b %EC%
+echo [scrape] last exit=!EC!, starting next round... ^(log: %LOG_FILE%^)
+echo.
+goto scrape_loop
