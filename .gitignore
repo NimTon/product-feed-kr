@@ -21,6 +21,7 @@ data/*.db-journal
 data/*.db-wal
 data/*.db-shm
 data/*.db.lock
+data/runlocks/
 
 # seven17 HTTP 会话 Cookie（勿提交）
 seven17_cookies.json

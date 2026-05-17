@@ -106,6 +106,14 @@ def pf_trunc(s: Any, max_len: int = 160) -> str:
     return t[: max_len - 1] + "…"
 
 
+_ITEM_SEP_WIDTH = 72
+
+
+def log_item_separator(logger: logging.Logger) -> None:
+    """每条商品 LLM / 上架处理前打印一行 ``=`` 分隔，便于在终端区分每次操作。"""
+    logger.info("%s", "=" * _ITEM_SEP_WIDTH)
+
+
 def pf_kv(pairs: list[tuple[str, Any]], *, val_max: int = 220, zh: str | None = None) -> str:
     """空格分隔 `k=v`，便于复制与 grep；跳过 None。
 

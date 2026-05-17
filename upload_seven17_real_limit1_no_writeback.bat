@@ -22,6 +22,6 @@ echo.
 
 set "EC=!ERRORLEVEL!"
 echo.
-echo [upload-real-limit1] last exit=!EC!, starting next round...
+echo [upload-real-limit1] last exit=!EC!, starting next run...
 echo.
 goto upload_l1_loop

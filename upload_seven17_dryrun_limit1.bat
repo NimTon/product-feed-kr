@@ -22,6 +22,6 @@ echo.
 
 set "EC=!ERRORLEVEL!"
 echo.
-echo [upload-dry] last exit=!EC!, starting next round...
+echo [upload-dry] last exit=!EC!, starting next run...
 echo.
 goto upload_dry_loop

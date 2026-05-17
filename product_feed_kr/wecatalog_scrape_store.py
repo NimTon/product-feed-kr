@@ -64,6 +64,7 @@ from product_feed_kr.seven17_config import (
 )
 from product_feed_kr.wecatalog_tag_mapping import resolve_category_path
 from product_feed_kr.pf_log import configure_scrape_logging, pf_kv
+from product_feed_kr.process_singleton import single_instance_lock
 
 # 与 `configure_scrape_logging` 默认 logger_name 一致；`-m` 运行时 __name__ 为 __main__，勿用 getLogger(__name__)。
 logger = logging.getLogger("product_feed_kr.wecatalog_scrape_store")
@@ -732,16 +733,17 @@ def main() -> int:
     configure_scrape_logging(args.log_file, verbose=args.verbose)
 
     try:
-        stats = scrape_store(
-            args.store_url.strip(),
-            trans_lang=args.trans_lang.strip() or "zh",
-            detail_delay_range=(d_lo, d_hi),
-            max_list_pages=max(1, args.max_list_pages),
-            skip_detail=args.skip_detail,
-            checkpoint_every=max(0, args.checkpoint_every),
-            max_records=max(0, args.max_records),
-            headed=args.headed,
-        )
+        with single_instance_lock("wecatalog_scrape_store"):
+            stats = scrape_store(
+                args.store_url.strip(),
+                trans_lang=args.trans_lang.strip() or "zh",
+                detail_delay_range=(d_lo, d_hi),
+                max_list_pages=max(1, args.max_list_pages),
+                skip_detail=args.skip_detail,
+                checkpoint_every=max(0, args.checkpoint_every),
+                max_records=max(0, args.max_records),
+                headed=args.headed,
+            )
         print(json.dumps({"ok": True, **stats}, ensure_ascii=False))
         if stats.get("restart_fresh"):
             reload_seven17_config()

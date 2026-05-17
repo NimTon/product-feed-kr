@@ -15,9 +15,12 @@
 `SEVEN17_CONVERT_CNY_TO_KRW`（默认 true：每条商品填表前拉汇率，把人民币售价换算为韩元填入 `it_price`）、
 `SEVEN17_CNY_KRW_RATE`（可选固定汇率，填则不走接口）、`SEVEN17_CNY_KRW_FALLBACK`（接口失败时的 1 CNY 兑多少 KRW）、
 `SEVEN17_FILL_IT_EXPLAN`（默认 false：不向后台填写 상품설명/모바일 상품설명；设为 true 恢复填写）、
-`LISTING_LLM_RESTART_AFTER_ITEMS` / `SEVEN17_UPLOAD_RESTART_AFTER_ITEMS`（默认 1000：本 run 写回 LLM / 上架成功达 N 条后退出码 75，供外层立即重跑；0 关闭）。
+`LISTING_LLM_RESTART_AFTER_ITEMS` / `SEVEN17_UPLOAD_RESTART_AFTER_ITEMS`（默认 1000：本 run 写回 LLM / 上架成功达 N 条后退出码 75，供外层立即重跑；0 关闭）、
+`SEVEN17_UPLOAD_THREADS`（默认 1：上架工作线程数，每线程独立 Playwright 登录）。
 
 上传模块不再调用 LLM：只读取 SQLite 已有的 ``listing_llm`` 结果（如 ``cny_price`` / ``name_ko`` / ``desc_ko``）。
+
+``--llm-only``：``OPENAI_API_KEY`` 为 JSON 数组且长度 >1 时同进程多线程（每个 key 一个线程）；多线程下每完成 **一次 LLM 响应** 即重新读库取 **第一条** 待处理记录。真实上架：``SEVEN17_UPLOAD_THREADS`` >1 时同进程多线程（每线程独立浏览器），每处理完一条后重新读库取下一条可上架记录。仍只开一个 bat/llm/upload 窗口；重复运行由进程锁拒绝（退出码 11）。
 
 写库前对 ``.db`` 文件使用 ``filelock`` 独占锁（与抓取并行时互斥）。
 
@@ -41,12 +44,14 @@ import json
 import logging
 import os
 import sys
+import threading
 import tempfile
 import urllib.error
 import urllib.request
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Literal
 from urllib.parse import parse_qs, urlparse
 
 from playwright.sync_api import sync_playwright
@@ -64,7 +69,8 @@ from product_feed_kr.seven17_config import (
 )
 from product_feed_kr.wecatalog_tag_mapping import resolve_category_path, resolve_seven17_ca_id
 from product_feed_kr.wego_commodity import DEFAULT_WEGO_DESC_TEMPLATE, parse_wego_product
-from product_feed_kr.pf_log import configure_pf_stderr, pf_kv
+from product_feed_kr.pf_log import configure_pf_stderr, log_item_separator, pf_kv
+from product_feed_kr.process_singleton import single_instance_lock
 
 # 必须用稳定 logger 名：以 `python -m product_feed_kr.seven17_upload` 运行时 __name__ 为 __main__，
 # getLogger(__name__) 会落到 __main__，configure_pf_stderr 挂在 product_feed_kr.seven17_upload 上则永远打不出。
@@ -835,6 +841,620 @@ def _desc_html_from_llm_ko(desc_ko: str) -> str:
     return "<br>".join(lines)
 
 
+def _upload_row_key(rec: dict[str, Any]) -> tuple[str, int]:
+    gid = str(rec.get("goods_id") or "")
+    try:
+        tag_id = int(rec.get("tag_id") or 0)
+    except (TypeError, ValueError):
+        tag_id = 0
+    return (gid, tag_id)
+
+
+def _upload_skip_reason(
+    rec: dict[str, Any],
+    *,
+    skip_uploaded: bool,
+    llm_on: bool,
+    default_price: str,
+) -> str | None:
+    """不可上架时返回原因码；可上架返回 None。"""
+    if skip_uploaded and rec.get("seven17_uploaded_at"):
+        return "already_uploaded"
+    com = commodity_from_wecatalog_record(rec)
+    if not isinstance(com, dict):
+        return "no_detail"
+    llm_data = rec.get("listing_llm") if isinstance(rec.get("listing_llm"), dict) else {}
+    if llm_on and not rec.get("llm_processed_at"):
+        return "llm_not_processed"
+    if llm_on and not _llm_cny_usable(llm_data):
+        return "llm_price_unusable"
+    gname = str(rec.get("wecatalog_group") or "")
+    tname = str(rec.get("wecatalog_tag") or "")
+    if not (resolve_seven17_ca_id(gname, tname) or "").strip():
+        return "no_category"
+    try:
+        prod = parse_wego_product(com, default_price_if_missing=default_price)
+    except ValueError:
+        return "no_detail"
+    if not prod["image_urls"]:
+        return "no_images"
+    return None
+
+
+def _count_uploadable_pending(
+    conn: Any,
+    album_id: str,
+    *,
+    skip_uploaded: bool,
+    llm_on: bool,
+    default_price: str,
+) -> int:
+    """统计当前库内满足上架条件的商品条数。"""
+    from product_feed_kr.store_sqlite import sqlite_load_products_for_upload
+
+    items = sqlite_load_products_for_upload(conn, album_id, skip_uploaded=skip_uploaded)
+    n = 0
+    for rec in items:
+        if not isinstance(rec, dict):
+            continue
+        if (
+            _upload_skip_reason(
+                rec,
+                skip_uploaded=skip_uploaded,
+                llm_on=llm_on,
+                default_price=default_price,
+            )
+            is None
+        ):
+            n += 1
+    return n
+
+
+def _log_upload_pending(
+    conn: Any,
+    ctx: UploadRunContext,
+    *,
+    thread_label: str = "",
+    threads: int | None = None,
+    last_goods_id: str | None = None,
+    last_outcome: str | None = None,
+) -> None:
+    pending_upload = _count_uploadable_pending(
+        conn,
+        ctx.album_id,
+        skip_uploaded=ctx.skip_uploaded,
+        llm_on=ctx.llm_on,
+        default_price=ctx.default_price,
+    )
+    kv: list[tuple[str, Any]] = [
+        ("event", "upload.pending"),
+        ("album_id", ctx.album_id),
+        ("pending_upload", pending_upload),
+        ("limit", ctx.limit if ctx.limit is not None else "none"),
+    ]
+    if threads is not None:
+        kv.append(("threads", threads))
+    if thread_label:
+        kv.append(("thread", thread_label))
+    if last_goods_id:
+        kv.append(("last_goods_id", last_goods_id[:36]))
+    if last_outcome:
+        kv.append(("last_outcome", last_outcome))
+    _log.info("%s", pf_kv(kv, zh="待上传商品数"))
+
+
+def upload_thread_count() -> int:
+    """``SEVEN17_UPLOAD_THREADS``：上架工作线程数（默认 1）；每线程独立浏览器登录。"""
+    raw = _cfg_get("SEVEN17_UPLOAD_THREADS")
+    if raw is None or not str(raw).strip():
+        return 1
+    try:
+        n = int(str(raw).strip())
+    except ValueError:
+        return 1
+    return max(1, min(n, 16))
+
+
+def _claim_next_uploadable(
+    conn: Any,
+    album_id: str,
+    *,
+    skip_uploaded: bool,
+    session_skipped: set[tuple[str, int]],
+    llm_on: bool,
+    default_price: str,
+    claim_lock: threading.Lock | None = None,
+    in_flight: set[tuple[str, int]] | None = None,
+) -> dict[str, Any] | None:
+    """每次从 SQLite 重新加载，返回第一条可上架且本 run 未占用/未跳过的记录。"""
+    from product_feed_kr.store_sqlite import sqlite_load_products_for_upload
+
+    def _scan() -> dict[str, Any] | None:
+        items = sqlite_load_products_for_upload(conn, album_id, skip_uploaded=skip_uploaded)
+        for rec in items:
+            if not isinstance(rec, dict):
+                continue
+            key = _upload_row_key(rec)
+            if key in session_skipped:
+                continue
+            if in_flight is not None and key in in_flight:
+                continue
+            reason = _upload_skip_reason(
+                rec,
+                skip_uploaded=skip_uploaded,
+                llm_on=llm_on,
+                default_price=default_price,
+            )
+            if reason is not None:
+                session_skipped.add(key)
+                continue
+            if in_flight is not None:
+                in_flight.add(key)
+            return rec
+        return None
+
+    if claim_lock is not None:
+        with claim_lock:
+            return _scan()
+    return _scan()
+
+
+@dataclass(frozen=True)
+class UploadRunContext:
+    album_id: str
+    skip_uploaded: bool
+    dry_run: bool
+    write_back: bool
+    limit: int | None
+    itemform_url: str
+    stock_qty: str
+    default_price: str
+    sc_type: str
+    max_img: int
+    title_prefix: str
+    tpl: str
+    convert_fx: bool
+    write_back_after_llm: bool
+    llm_on: bool
+    restart_after_upload: int
+
+
+def _release_upload_claim(
+    row_key: tuple[str, int],
+    session_skipped: set[tuple[str, int]],
+    *,
+    mark_session_skip: bool,
+    claim_lock: threading.Lock | None,
+    in_flight: set[tuple[str, int]] | None,
+) -> None:
+    def _do() -> None:
+        if mark_session_skip:
+            session_skipped.add(row_key)
+        if in_flight is not None:
+            in_flight.discard(row_key)
+
+    if claim_lock is not None:
+        with claim_lock:
+            _do()
+    else:
+        _do()
+
+
+def _upload_loop_should_stop(ctx: UploadRunContext, stats: dict[str, Any]) -> bool:
+    if ctx.limit is not None and (stats["ok"] + stats["fail"] + stats["skip"]) >= ctx.limit:
+        return True
+    if ctx.restart_after_upload > 0 and stats["ok"] >= ctx.restart_after_upload:
+        return True
+    return False
+
+
+def _process_upload_record(
+    rec: dict[str, Any],
+    page: Any,
+    conn: Any,
+    ctx: UploadRunContext,
+    dialogs: list[str],
+    *,
+    thread_label: str = "",
+) -> tuple[Literal["ok", "fail", "skip"], dict[str, Any] | None]:
+    """处理单条上架（填表/提交）；返回结果与可选 errors 条目。"""
+    from product_feed_kr.store_sqlite import sqlite_mark_uploaded, sqlite_update_product_row
+
+    aid = ctx.album_id
+    gid = str(rec.get("goods_id") or "").strip() or "-"
+    th_kv = [("thread", thread_label)] if thread_label else []
+
+    com = commodity_from_wecatalog_record(rec)
+    if com is None:
+        return "fail", {"goods_id": gid, "error": "无 detail_response.result.commodity"}
+
+    llm_data = rec.get("listing_llm") if isinstance(rec.get("listing_llm"), dict) else {}
+    try:
+        prod = parse_wego_product(com, default_price_if_missing=ctx.default_price)
+    except ValueError as e:
+        return "fail", {"goods_id": gid, "error": str(e)}
+
+    gname = str(rec.get("wecatalog_group") or "")
+    tname = str(rec.get("wecatalog_tag") or "")
+    ca_id = (resolve_seven17_ca_id(gname, tname) or "").strip()
+    if not ca_id:
+        return (
+            "fail",
+            {
+                "goods_id": gid,
+                "error": "未设置 seven17 分类：请在 wecatalog_tag_category_map.json 该 (分组,标签) 的 meta 中加 seven17_ca_id",
+            },
+        )
+
+    nk = (llm_data.get("name_ko") or "").strip()
+    nz = (llm_data.get("name_zh") or "").strip()
+    base_title = nk or nz or prod["title"]
+    upload_title = f"{ctx.title_prefix}{base_title}" if ctx.title_prefix else base_title
+    desc_ko = str(llm_data.get("desc_ko") or "").strip()
+    if desc_ko:
+        desc_html = _desc_html_from_llm_ko(desc_ko)
+        desc_src = "llm_desc_ko"
+    else:
+        desc_html = _desc_html_for_store_record(
+            ctx.tpl,
+            prod,
+            rec,
+            upload_title=upload_title,
+            default_tpl=DEFAULT_WEGO_DESC_TEMPLATE,
+        )
+        desc_src = "template"
+    _log.info(
+        "%s",
+        pf_kv(
+            [
+                *th_kv,
+                ("event", "desc.source"),
+                ("goods_id", gid[:36]),
+                ("source", desc_src),
+                ("desc_len", len(desc_html)),
+            ],
+            zh="本条商品说明来源",
+        ),
+    )
+
+    urls = prod["image_urls"][: ctx.max_img]
+    if not urls:
+        return "fail", {"goods_id": gid, "error": "无主图/图片 URL（imgsSrc/imgs）"}
+
+    tmp_files: list[Path] = []
+    try:
+        for u in urls:
+            tmp_files.append(_download_image(u))
+    except (urllib.error.URLError, OSError) as e:
+        for pth in tmp_files:
+            pth.unlink(missing_ok=True)
+        return "fail", {"goods_id": gid, "error": f"图片下载失败: {e}"}
+
+    dialogs.clear()
+    try:
+        krw_pc: float | None = None
+        fx_src: str | None = None
+        if ctx.convert_fx:
+            krw_pc, fx_src = _resolve_krw_per_cny()
+
+        if ctx.llm_on:
+            cny_src = str(llm_data.get("cny_price") or "").strip()
+        else:
+            cny_src = prod["price"]
+        if ctx.convert_fx and krw_pc is not None:
+            listing_price = cny_listing_amount_to_krw_won_str(cny_src, krw_pc)
+            pcny_log: str | None = cny_src
+            fx_log_rate: float | None = krw_pc
+        else:
+            listing_price = cny_src
+            pcny_log = None
+            fx_log_rate = None
+
+        if not str(listing_price).strip():
+            return "skip", None
+
+        rec["fx_krw_per_cny"] = krw_pc
+        rec["price_krw"] = listing_price if (ctx.convert_fx and krw_pc is not None) else None
+        rec["product_desc_html"] = desc_html
+        if ctx.write_back_after_llm:
+            sqlite_update_product_row(conn, aid, rec)
+
+        ca_ko, ca_zh = _ca_id_log_paths(gname, tname)
+        page.goto(ctx.itemform_url, wait_until="domcontentloaded", timeout=120_000)
+        _fill_itemform(
+            page,
+            goods_id=gid,
+            wecatalog_group=gname,
+            wecatalog_tag=tname,
+            ca_id=ca_id,
+            ca_path_ko=ca_ko,
+            ca_path_zh=ca_zh,
+            title=upload_title,
+            price=listing_price,
+            stock_qty=ctx.stock_qty,
+            desc_html=desc_html,
+            image_path=None,
+            image_paths=tmp_files,
+            sc_type=ctx.sc_type,
+            option_attr_map_ko=llm_data.get("attr_map_ko")
+            if isinstance(llm_data.get("attr_map_ko"), dict)
+            else None,
+            price_cny_for_log=pcny_log,
+            fx_krw_per_cny=fx_log_rate,
+        )
+
+        if ctx.dry_run:
+            dry_payload: dict[str, Any] = {
+                "dry_run": True,
+                "goods_id": gid,
+                "title": upload_title,
+                "price_cny": cny_src,
+                "it_price_krw": listing_price,
+            }
+            if llm_data:
+                dry_payload["listing_llm"] = {
+                    "cny_price": llm_data.get("cny_price"),
+                    "attr_map": llm_data.get("attr_map"),
+                    "attr_map_ko": llm_data.get("attr_map_ko"),
+                    "name_zh": llm_data.get("name_zh"),
+                    "name_ko": llm_data.get("name_ko"),
+                    "desc_zh": llm_data.get("desc_zh"),
+                    "desc_ko": llm_data.get("desc_ko"),
+                }
+            if ctx.convert_fx and krw_pc is not None:
+                dry_payload["fx_krw_per_cny"] = krw_pc
+                dry_payload["fx_source"] = fx_src
+            print(json.dumps(dry_payload, ensure_ascii=False))
+            return "ok", None
+
+        click_itemform_submit(page)
+        page.wait_for_load_state("load", timeout=120_000)
+
+        ok_submit, it_id, fail_reason = _classify_after_submit(page, dialogs)
+        if ok_submit:
+            if ctx.write_back:
+                rec["uploaded_to_platform"] = True
+                rec["seven17_uploaded_at"] = datetime.now(timezone.utc).isoformat()
+                sqlite_mark_uploaded(conn, aid, rec)
+            row_out: dict[str, Any] = {
+                "ok": True,
+                "goods_id": gid,
+                "title": upload_title,
+                "it_price": listing_price,
+            }
+            if ctx.convert_fx and krw_pc is not None:
+                row_out["price_cny"] = cny_src
+                row_out["fx_krw_per_cny"] = krw_pc
+            if it_id:
+                row_out["it_id"] = it_id
+            print(json.dumps(row_out, ensure_ascii=False))
+            return "ok", None
+
+        return "fail", {"goods_id": gid, "error": fail_reason or "未知错误"}
+    except Exception as e:
+        return "fail", {"goods_id": gid, "error": str(e)}
+    finally:
+        for pth in tmp_files:
+            pth.unlink(missing_ok=True)
+
+
+def _upload_claim_loop(
+    page: Any,
+    conn: Any,
+    ctx: UploadRunContext,
+    dialogs: list[str],
+    stats: dict[str, Any],
+    *,
+    session_skipped: set[tuple[str, int]],
+    claim_lock: threading.Lock | None = None,
+    in_flight: set[tuple[str, int]] | None = None,
+    thread_label: str = "",
+    aggregate_stats: dict[str, Any] | None = None,
+    aggregate_lock: threading.Lock | None = None,
+) -> None:
+    """每次上架完成后重新读库取下一条。"""
+    while True:
+        if aggregate_stats is not None and aggregate_lock is not None:
+            with aggregate_lock:
+                if _upload_loop_should_stop(ctx, aggregate_stats):
+                    if (
+                        ctx.restart_after_upload > 0
+                        and aggregate_stats["ok"] >= ctx.restart_after_upload
+                    ):
+                        aggregate_stats["restart_fresh"] = True
+                        _log.info(
+                            "%s",
+                            pf_kv(
+                                [
+                                    ("event", "upload.restart_after"),
+                                    ("ok_count", aggregate_stats["ok"]),
+                                    ("restart_after", ctx.restart_after_upload),
+                                    *([("thread", thread_label)] if thread_label else []),
+                                ],
+                                zh="已达配置的上架成功条数阈值，结束本进程",
+                            ),
+                        )
+                    break
+        elif _upload_loop_should_stop(ctx, stats):
+            if ctx.restart_after_upload > 0 and stats["ok"] >= ctx.restart_after_upload:
+                stats["restart_fresh"] = True
+                _log.info(
+                    "%s",
+                    pf_kv(
+                        [
+                            ("event", "upload.restart_after"),
+                            ("ok_count", stats["ok"]),
+                            ("restart_after", ctx.restart_after_upload),
+                            *([("thread", thread_label)] if thread_label else []),
+                        ],
+                        zh="已达配置的上架成功条数阈值，结束本进程",
+                    ),
+                )
+            break
+
+        rec = _claim_next_uploadable(
+            conn,
+            ctx.album_id,
+            skip_uploaded=ctx.skip_uploaded,
+            session_skipped=session_skipped,
+            llm_on=ctx.llm_on,
+            default_price=ctx.default_price,
+            claim_lock=claim_lock,
+            in_flight=in_flight,
+        )
+        if rec is None:
+            break
+
+        log_item_separator(_log)
+        row_key = _upload_row_key(rec)
+        outcome, err_entry = _process_upload_record(
+            rec,
+            page,
+            conn,
+            ctx,
+            dialogs,
+            thread_label=thread_label,
+        )
+        target = aggregate_stats if aggregate_stats is not None else stats
+        lock = aggregate_lock
+        if lock is not None:
+            with lock:
+                if outcome == "ok":
+                    target["ok"] += 1
+                elif outcome == "skip":
+                    target["skip"] += 1
+                else:
+                    target["fail"] += 1
+                    if err_entry:
+                        target["errors"].append(err_entry)
+        else:
+            if outcome == "ok":
+                target["ok"] += 1
+            elif outcome == "skip":
+                target["skip"] += 1
+            else:
+                target["fail"] += 1
+                if err_entry:
+                    target["errors"].append(err_entry)
+        _release_upload_claim(
+            row_key,
+            session_skipped,
+            mark_session_skip=(outcome != "ok" or ctx.dry_run),
+            claim_lock=claim_lock,
+            in_flight=in_flight,
+        )
+        gid_done = str(rec.get("goods_id") or "").strip() or "-"
+        _log_upload_pending(
+            conn,
+            ctx,
+            thread_label=thread_label,
+            last_goods_id=gid_done,
+            last_outcome=outcome,
+        )
+
+
+def _run_upload_multithread_claim_loop(
+    ctx: UploadRunContext,
+    *,
+    thread_count: int,
+    mb_id: str,
+    mb_password: str,
+    base: str,
+    headless: bool,
+    exe: Path,
+) -> dict[str, Any]:
+    from product_feed_kr.store_sqlite import connect_sqlite, ensure_sqlite_schema
+
+    stats: dict[str, Any] = {"ok": 0, "fail": 0, "skip": 0, "errors": [], "restart_fresh": False}
+    claim_lock = threading.Lock()
+    in_flight: set[tuple[str, int]] = set()
+    session_skipped: set[tuple[str, int]] = set()
+    stats_lock = threading.Lock()
+
+    _log.info(
+        "%s",
+        pf_kv(
+            [
+                ("event", "upload.threads.start"),
+                ("threads", thread_count),
+                ("mode", "claim_next"),
+            ],
+            zh="多线程上架：每线程独立浏览器，每次提交后重新读库",
+        ),
+    )
+
+    def _worker(worker_id: int) -> None:
+        label = f"upload-{worker_id}"
+        dialogs: list[str] = []
+        try:
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=headless, executable_path=str(exe))
+                try:
+                    page = browser.new_page()
+                    page.on("dialog", shop_admin_dialog_handler(dialogs))
+                    login_admin(
+                        page,
+                        base=base,
+                        mb_id=mb_id,
+                        mb_password=mb_password,
+                        redirect_full_url=ctx.itemform_url,
+                    )
+                    if "login.php" in page.url:
+                        raise RuntimeError(f"[{label}] 登录失败：仍停留在登录页")
+                    conn = connect_sqlite()
+                    ensure_sqlite_schema(conn)
+                    try:
+                        _upload_claim_loop(
+                            page,
+                            conn,
+                            ctx,
+                            dialogs,
+                            stats={},
+                            session_skipped=session_skipped,
+                            claim_lock=claim_lock,
+                            in_flight=in_flight,
+                            thread_label=label,
+                            aggregate_stats=stats,
+                            aggregate_lock=stats_lock,
+                        )
+                    finally:
+                        conn.close()
+                finally:
+                    browser.close()
+        except Exception as e:
+            _log.warning(
+                "%s",
+                pf_kv(
+                    [("event", "upload.thread.error"), ("thread", label), ("err", str(e))],
+                    zh="上架工作线程异常退出",
+                ),
+            )
+
+    threads = [
+        threading.Thread(target=_worker, args=(i,), name=f"seven17-upload-{i}", daemon=True)
+        for i in range(thread_count)
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    _log.info(
+        "%s",
+        pf_kv(
+            [
+                ("event", "upload.threads.done"),
+                ("threads", thread_count),
+                ("ok", stats["ok"]),
+                ("fail", stats["fail"]),
+                ("skip", stats["skip"]),
+            ],
+            zh="多线程上架本 run 结束",
+        ),
+    )
+    return stats
+
+
 def upload_from_wecatalog_store(
     album_id: str,
     *,
@@ -844,7 +1464,7 @@ def upload_from_wecatalog_store(
     write_back: bool = False,
     keep_open: bool = False,
 ) -> dict[str, Any]:
-    """从 SQLite 读取 ``album_id`` 下商品行，逐条填写 `itemform` 并提交。
+    """从 SQLite 逐条上架：每处理完一条（成功/失败/跳过）后重新读库，取下一条可上架记录。
 
     字段来源：`detail_response.result.commodity` → `parse_wego_product`；
     `ca_id`：仅 map 的 meta.seven17_ca_id。
@@ -860,17 +1480,10 @@ def upload_from_wecatalog_store(
 
     _configure_upload_stderr_logging()
 
-    from product_feed_kr.store_sqlite import (
-        connect_sqlite,
-        ensure_sqlite_schema,
-        sqlite_load_products_for_upload,
-        sqlite_mark_uploaded,
-        sqlite_update_product_row,
-    )
+    from product_feed_kr.store_sqlite import connect_sqlite, ensure_sqlite_schema
 
     conn_db = connect_sqlite()
     ensure_sqlite_schema(conn_db)
-    items = sqlite_load_products_for_upload(conn_db, aid, skip_uploaded=skip_uploaded)
 
     base = (_cfg_get("SEVEN17_BASE_URL", "https://www.seven17.kr") or "https://www.seven17.kr").rstrip("/")
     headless = _bool_env("SEVEN17_HEADLESS", True)
@@ -883,6 +1496,7 @@ def upload_from_wecatalog_store(
     max_img = max(1, min(max_img, 10))
     title_prefix = (_cfg_get("WEGO_TITLE_PREFIX") or "").strip()
     tpl = (_cfg_get("WEGO_DESC_TEMPLATE") or "").strip()
+    upload_threads = upload_thread_count()
 
     exe = chromium_executable()
     if not exe:
@@ -893,379 +1507,93 @@ def upload_from_wecatalog_store(
     itemform_url = f"{base}/adm/shop_admin/itemform.php"
     stats: dict[str, Any] = {"ok": 0, "fail": 0, "skip": 0, "errors": [], "restart_fresh": False}
     restart_after_upload = restart_after_n("SEVEN17_UPLOAD_RESTART_AFTER_ITEMS", 1000)
-    dialogs: list[str] = []
+    convert_fx = _bool_env("SEVEN17_CONVERT_CNY_TO_KRW", True)
+    write_back_after_llm = _cfg_bool("SEVEN17_WRITE_BACK_AFTER_LLM", True)
+    llm_on = _cfg_bool("OPENAI_ENRICH_LISTING", True)
+
+    upload_ctx = UploadRunContext(
+        album_id=aid,
+        skip_uploaded=skip_uploaded,
+        dry_run=dry_run,
+        write_back=write_back,
+        limit=limit,
+        itemform_url=itemform_url,
+        stock_qty=stock_qty,
+        default_price=default_price,
+        sc_type=sc_type,
+        max_img=max_img,
+        title_prefix=title_prefix,
+        tpl=tpl,
+        convert_fx=convert_fx,
+        write_back_after_llm=write_back_after_llm,
+        llm_on=llm_on,
+        restart_after_upload=restart_after_upload,
+    )
 
     try:
-        with sync_playwright() as p:
-            browser = p.chromium.launch(headless=headless, executable_path=str(exe))
-            try:
-                page = browser.new_page()
-                page.on("dialog", shop_admin_dialog_handler(dialogs))
+        _log_upload_pending(conn_db, upload_ctx, threads=upload_threads)
 
-                login_admin(
-                    page,
-                    base=base,
-                    mb_id=mb_id,
-                    mb_password=mb_password,
-                    redirect_full_url=itemform_url,
-                )
-
-                if "login.php" in page.url:
-                    raise RuntimeError("登录失败：仍停留在登录页（账号密码、验证码或权限）。")
-
-                convert_fx = _bool_env("SEVEN17_CONVERT_CNY_TO_KRW", True)
-                write_back_after_llm = _cfg_bool("SEVEN17_WRITE_BACK_AFTER_LLM", True)
-                # 上传模块只读 DB 里的 LLM 结果，不再发起任何 LLM 调用。
-                llm_on = _cfg_bool("OPENAI_ENRICH_LISTING", True)
-
-                # 运行前先给出“可上传数量”预估，便于快速判断为何没进入填表。
-                precheck = {
-                    "total": 0,
-                    "uploadable": 0,
-                    "skip_already_uploaded": 0,
-                    "skip_no_detail": 0,
-                    "skip_llm_not_processed": 0,
-                    "skip_llm_price_unusable": 0,
-                    "skip_no_category": 0,
-                    "skip_no_images": 0,
-                }
-                for rec0 in items:
-                    if not isinstance(rec0, dict):
-                        continue
-                    precheck["total"] += 1
-                    if rec0.get("seven17_uploaded_at"):
-                        precheck["skip_already_uploaded"] += 1
-                        continue
-                    com0 = commodity_from_wecatalog_record(rec0)
-                    if not isinstance(com0, dict):
-                        precheck["skip_no_detail"] += 1
-                        continue
-                    llm0 = rec0.get("listing_llm") if isinstance(rec0.get("listing_llm"), dict) else {}
-                    if llm_on and not rec0.get("llm_processed_at"):
-                        precheck["skip_llm_not_processed"] += 1
-                        continue
-                    if llm_on and not _llm_cny_usable(llm0):
-                        precheck["skip_llm_price_unusable"] += 1
-                        continue
-                    gname0 = str(rec0.get("wecatalog_group") or "")
-                    tname0 = str(rec0.get("wecatalog_tag") or "")
-                    ca_id0 = (resolve_seven17_ca_id(gname0, tname0) or "").strip()
-                    if not ca_id0:
-                        precheck["skip_no_category"] += 1
-                        continue
-                    try:
-                        prod0 = parse_wego_product(com0, default_price_if_missing=default_price)
-                    except ValueError:
-                        precheck["skip_no_detail"] += 1
-                        continue
-                    if not prod0["image_urls"]:
-                        precheck["skip_no_images"] += 1
-                        continue
-                    precheck["uploadable"] += 1
-                _log.info(
+        if upload_threads > 1:
+            if keep_open:
+                _log.warning(
                     "%s",
                     pf_kv(
-                        [
-                            ("event", "upload.precheck"),
-                            ("album_id", aid),
-                            ("total", precheck["total"]),
-                            ("uploadable", precheck["uploadable"]),
-                            ("skip_already_uploaded", precheck["skip_already_uploaded"]),
-                            ("skip_no_detail", precheck["skip_no_detail"]),
-                            ("skip_llm_not_processed", precheck["skip_llm_not_processed"]),
-                            ("skip_llm_price_unusable", precheck["skip_llm_price_unusable"]),
-                            ("skip_no_category", precheck["skip_no_category"]),
-                            ("skip_no_images", precheck["skip_no_images"]),
-                            ("limit", limit if limit is not None else "none"),
-                        ],
-                        zh="上传前预检：可上传数量与主要跳过原因",
+                        [("event", "upload.keep_open_ignored"), ("threads", upload_threads)],
+                        zh="多线程上架时忽略 keep_open",
                     ),
                 )
+            stats = _run_upload_multithread_claim_loop(
+                upload_ctx,
+                thread_count=upload_threads,
+                mb_id=mb_id,
+                mb_password=mb_password,
+                base=base,
+                headless=headless,
+                exe=exe,
+            )
+        else:
+            dialogs: list[str] = []
+            session_skipped: set[tuple[str, int]] = set()
+            _log.info(
+                "%s",
+                pf_kv(
+                    [
+                        ("event", "upload.mode"),
+                        ("mode", "claim_next"),
+                        ("threads", 1),
+                    ],
+                    zh="上架：每处理一条后重新读库取下一条",
+                ),
+            )
+            with sync_playwright() as p:
+                browser = p.chromium.launch(headless=headless, executable_path=str(exe))
+                try:
+                    page = browser.new_page()
+                    page.on("dialog", shop_admin_dialog_handler(dialogs))
 
-                n = 0
-                for rec in items:
-                    if not isinstance(rec, dict):
-                        continue
-                    if rec.get("seven17_uploaded_at"):
-                        stats["skip"] += 1
-                        _log.info(
-                            "%s",
-                            pf_kv(
-                                [("event", "upload.skip"), ("reason", "already_uploaded"), ("goods_id", str(rec.get("goods_id") or "")[:36])],
-                                zh="跳过上架：该条已存在平台上传时间",
-                            ),
-                        )
-                        continue
-                    if limit is not None and n >= limit:
-                        break
-
-                    gid = str(rec.get("goods_id") or "").strip() or "-"
-
-                    com = commodity_from_wecatalog_record(rec)
-                    if com is None:
-                        stats["fail"] += 1
-                        stats["errors"].append({"goods_id": gid, "error": "无 detail_response.result.commodity"})
-                        continue
-
-                    llm_data = rec.get("listing_llm") if isinstance(rec.get("listing_llm"), dict) else {}
-                    if llm_on:
-                        if not rec.get("llm_processed_at"):
-                            stats["skip"] += 1
-                            _log.info(
-                                "%s",
-                                pf_kv(
-                                    [
-                                        ("event", "llm.skip_upload"),
-                                        ("reason", "llm_not_processed"),
-                                        ("goods_id", gid[:36]),
-                                    ],
-                                    zh="跳过上架：该条未完成 LLM 处理",
-                                ),
-                            )
-                            continue
-                        if not _llm_cny_usable(llm_data):
-                            stats["skip"] += 1
-                            _log.info(
-                                "%s",
-                                pf_kv(
-                                    [
-                                        ("event", "llm.skip_upload"),
-                                        ("reason", "cny_price_null"),
-                                        ("goods_id", gid[:36]),
-                                    ],
-                                    zh="跳过上架：LLM 未给出可用人民币价",
-                                ),
-                            )
-                            continue
-                    try:
-                        prod = parse_wego_product(com, default_price_if_missing=default_price)
-                    except ValueError as e:
-                        stats["fail"] += 1
-                        stats["errors"].append({"goods_id": gid, "error": str(e)})
-                        continue
-
-                    gname = str(rec.get("wecatalog_group") or "")
-                    tname = str(rec.get("wecatalog_tag") or "")
-                    ca_id = (resolve_seven17_ca_id(gname, tname) or "").strip()
-                    if not ca_id:
-                        stats["fail"] += 1
-                        stats["errors"].append(
-                            {
-                                "goods_id": gid,
-                                "error": "未设置 seven17 分类：请在 wecatalog_tag_category_map.json 该 (分组,标签) 的 meta 中加 seven17_ca_id",
-                            },
-                        )
-                        continue
-
-                    nk = (llm_data.get("name_ko") or "").strip()
-                    nz = (llm_data.get("name_zh") or "").strip()
-                    # 标题优先级：韩文短标题 > 中文短标题 > 原始货源标题。
-                    base_title = nk or nz or prod["title"]
-                    upload_title = f"{title_prefix}{base_title}" if title_prefix else base_title
-                    desc_ko = str(llm_data.get("desc_ko") or "").strip()
-                    # 商品说明优先使用 LLM 韩文描述；缺失时回退模板生成说明。
-                    if desc_ko:
-                        desc_html = _desc_html_from_llm_ko(desc_ko)
-                        desc_src = "llm_desc_ko"
-                    else:
-                        desc_html = _desc_html_for_store_record(
-                            tpl,
-                            prod,
-                            rec,
-                            upload_title=upload_title,
-                            default_tpl=DEFAULT_WEGO_DESC_TEMPLATE,
-                        )
-                        desc_src = "template"
-                    # 明确记录说明来源，便于排查“为何本条不是 desc_ko”。
-                    _log.info(
-                        "%s",
-                        pf_kv(
-                            [
-                                ("event", "desc.source"),
-                                ("goods_id", gid[:36]),
-                                ("source", desc_src),
-                                ("desc_len", len(desc_html)),
-                            ],
-                            zh="本条商品说明来源",
-                        ),
+                    login_admin(
+                        page,
+                        base=base,
+                        mb_id=mb_id,
+                        mb_password=mb_password,
+                        redirect_full_url=itemform_url,
                     )
 
-                    urls = prod["image_urls"][:max_img]
-                    if not urls:
-                        stats["fail"] += 1
-                        stats["errors"].append({"goods_id": gid, "error": "无主图/图片 URL（imgsSrc/imgs）"})
-                        continue
+                    if "login.php" in page.url:
+                        raise RuntimeError("登录失败：仍停留在登录页（账号密码、验证码或权限）。")
 
-                    tmp_files: list[Path] = []
-                    try:
-                        for u in urls:
-                            tmp_files.append(_download_image(u))
-                    except (urllib.error.URLError, OSError) as e:
-                        stats["fail"] += 1
-                        stats["errors"].append({"goods_id": gid, "error": f"图片下载失败: {e}"})
-                        for pth in tmp_files:
-                            pth.unlink(missing_ok=True)
-                        continue
-
-                    # --limit 只统计真正进入上架流程的条目；前面的 skip/fail 不占名额。
-                    n += 1
-                    dialogs.clear()
-                    try:
-                        krw_pc: float | None = None
-                        fx_src: str | None = None
-                        if convert_fx:
-                            krw_pc, fx_src = _resolve_krw_per_cny()
-
-                        if llm_on:
-                            cny_src = str(llm_data.get("cny_price") or "").strip()
-                        else:
-                            cny_src = prod["price"]
-                        if convert_fx and krw_pc is not None:
-                            listing_price = cny_listing_amount_to_krw_won_str(cny_src, krw_pc)
-                            pcny_log: str | None = cny_src
-                            fx_log_rate: float | None = krw_pc
-                        else:
-                            listing_price = cny_src
-                            pcny_log = None
-                            fx_log_rate = None
-
-                        if not str(listing_price).strip():
-                            stats["skip"] += 1
-                            _log.info(
-                                "%s",
-                                pf_kv(
-                                    [
-                                        ("event", "upload.skip"),
-                                        ("reason", "empty_price"),
-                                        ("goods_id", gid[:36]),
-                                    ],
-                                    zh="跳过上架：最终上架价格为空",
-                                ),
-                            )
-                            continue
-
-                        # 回写到 SQLite 的增强字段：汇率、韩元售价、最终说明 HTML（用于后续审计/复跑）。
-                        rec["fx_krw_per_cny"] = krw_pc
-                        rec["price_krw"] = listing_price if (convert_fx and krw_pc is not None) else None
-                        rec["product_desc_html"] = desc_html
-                        if write_back_after_llm:
-                            sqlite_update_product_row(conn_db, aid, rec)
-
-                        ca_ko, ca_zh = _ca_id_log_paths(gname, tname)
-                        page.goto(itemform_url, wait_until="domcontentloaded", timeout=120_000)
-                        _fill_itemform(
-                            page,
-                            goods_id=gid,
-                            wecatalog_group=gname,
-                            wecatalog_tag=tname,
-                            ca_id=ca_id,
-                            ca_path_ko=ca_ko,
-                            ca_path_zh=ca_zh,
-                            title=upload_title,
-                            price=listing_price,
-                            stock_qty=stock_qty,
-                            desc_html=desc_html,
-                            image_path=None,
-                            image_paths=tmp_files,
-                            sc_type=sc_type,
-                            option_attr_map_ko=llm_data.get("attr_map_ko")
-                            if isinstance(llm_data.get("attr_map_ko"), dict)
-                            else None,
-                            price_cny_for_log=pcny_log,
-                            fx_krw_per_cny=fx_log_rate,
-                        )
-
-                        if dry_run:
-                            dry_payload: dict[str, Any] = {
-                                "dry_run": True,
-                                "goods_id": gid,
-                                "title": upload_title,
-                                "price_cny": cny_src,
-                                "it_price_krw": listing_price,
-                            }
-                            if llm_data:
-                                dry_payload["listing_llm"] = {
-                                    "cny_price": llm_data.get("cny_price"),
-                                    "attr_map": llm_data.get("attr_map"),
-                                    "attr_map_ko": llm_data.get("attr_map_ko"),
-                                    "name_zh": llm_data.get("name_zh"),
-                                    "name_ko": llm_data.get("name_ko"),
-                                    "desc_zh": llm_data.get("desc_zh"),
-                                    "desc_ko": llm_data.get("desc_ko"),
-                                }
-                            if convert_fx and krw_pc is not None:
-                                dry_payload["fx_krw_per_cny"] = krw_pc
-                                dry_payload["fx_source"] = fx_src
-                            print(json.dumps(dry_payload, ensure_ascii=False))
-                            stats["ok"] += 1
-                            if restart_after_upload > 0 and stats["ok"] >= restart_after_upload:
-                                stats["restart_fresh"] = True
-                                _log.info(
-                                    "%s",
-                                    pf_kv(
-                                        [
-                                            ("event", "upload.restart_after"),
-                                            ("ok_count", stats["ok"]),
-                                            ("restart_after", restart_after_upload),
-                                            ("exit", EXIT_RESTART_FRESH_DATA),
-                                        ],
-                                        zh="已达配置的上架成功条数阈值，结束本进程以便外层重跑",
-                                    ),
-                                )
-                                break
-                            continue
-
-                        click_itemform_submit(page)
-                        page.wait_for_load_state("load", timeout=120_000)
-
-                        ok_submit, it_id, fail_reason = _classify_after_submit(page, dialogs)
-                        if ok_submit:
-                            stats["ok"] += 1
-                            if write_back:
-                                rec["uploaded_to_platform"] = True
-                                rec["seven17_uploaded_at"] = datetime.now(timezone.utc).isoformat()
-                                sqlite_mark_uploaded(conn_db, aid, rec)
-                            row_out: dict[str, Any] = {
-                                "ok": True,
-                                "goods_id": gid,
-                                "title": upload_title,
-                                "it_price": listing_price,
-                            }
-                            if convert_fx and krw_pc is not None:
-                                row_out["price_cny"] = cny_src
-                                row_out["fx_krw_per_cny"] = krw_pc
-                            if it_id:
-                                row_out["it_id"] = it_id
-                            print(json.dumps(row_out, ensure_ascii=False))
-                            if restart_after_upload > 0 and stats["ok"] >= restart_after_upload:
-                                stats["restart_fresh"] = True
-                                _log.info(
-                                    "%s",
-                                    pf_kv(
-                                        [
-                                            ("event", "upload.restart_after"),
-                                            ("ok_count", stats["ok"]),
-                                            ("restart_after", restart_after_upload),
-                                            ("exit", EXIT_RESTART_FRESH_DATA),
-                                        ],
-                                        zh="已达配置的上架成功条数阈值，结束本进程以便外层重跑",
-                                    ),
-                                )
-                                break
-                        else:
-                            stats["fail"] += 1
-                            stats["errors"].append({"goods_id": gid, "error": fail_reason or "未知错误"})
-                    except Exception as e:
-                        stats["fail"] += 1
-                        stats["errors"].append({"goods_id": gid, "error": str(e)})
-                    finally:
-                        for pth in tmp_files:
-                            pth.unlink(missing_ok=True)
-
-            finally:
-                if keep_open:
-                    _wait_keep_open_browser()
-                browser.close()
+                    _upload_claim_loop(
+                        page,
+                        conn_db,
+                        upload_ctx,
+                        dialogs,
+                        stats,
+                        session_skipped=session_skipped,
+                    )
+                finally:
+                    if keep_open:
+                        _wait_keep_open_browser()
+                    browser.close()
 
     finally:
         if conn_db is not None:
@@ -1277,6 +1605,212 @@ def upload_from_wecatalog_store(
     return stats
 
 
+def _record_needs_llm_api(rec: dict[str, Any]) -> bool:
+    """是否仍需调用 LLM API（已写回 llm_processed_at 且未强制刷新则跳过）。"""
+    from product_feed_kr.listing_llm_enrich import listing_llm_force_refresh
+
+    if listing_llm_force_refresh():
+        return True
+    existing = rec.get("listing_llm")
+    if isinstance(existing, dict) and rec.get("llm_processed_at"):
+        return False
+    return True
+
+
+def _load_llm_work_rows(
+    conn: Any,
+    album_id: str,
+    *,
+    include_uploaded: bool,
+    pending_only: bool,
+    limit: int | None,
+) -> tuple[list[tuple[dict[str, Any], dict[str, Any]]], int, int]:
+    """从 SQLite 加载待 LLM 的 (record, commodity)；返回 (rows, 库内总条数, 无详情跳过数)。"""
+    from product_feed_kr.store_sqlite import sqlite_load_products_for_upload
+
+    items = sqlite_load_products_for_upload(conn, album_id, skip_uploaded=not include_uploaded)
+    rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
+    skipped_no_detail = 0
+    for rec in items:
+        if not isinstance(rec, dict):
+            continue
+        com = commodity_from_wecatalog_record(rec)
+        if not isinstance(com, dict):
+            skipped_no_detail += 1
+            continue
+        if pending_only and not _record_needs_llm_api(rec):
+            continue
+        rows.append((rec, com))
+        if isinstance(limit, int) and limit > 0 and len(rows) >= limit:
+            break
+    return rows, len(items), skipped_no_detail
+
+
+def _llm_row_key(rec: dict[str, Any]) -> tuple[str, int]:
+    gid = str(rec.get("goods_id") or "")
+    try:
+        tag_id = int(rec.get("tag_id") or 0)
+    except (TypeError, ValueError):
+        tag_id = 0
+    return (gid, tag_id)
+
+
+def _claim_next_llm_work_item(
+    conn: Any,
+    album_id: str,
+    *,
+    include_uploaded: bool,
+    claim_lock: threading.Lock,
+    in_flight: set[tuple[str, int]],
+) -> tuple[dict[str, Any], dict[str, Any]] | None:
+    """在锁内读库，返回第一条待 LLM 且未被本 run 其它线程占用的记录。"""
+    from product_feed_kr.store_sqlite import sqlite_load_products_for_upload
+
+    with claim_lock:
+        items = sqlite_load_products_for_upload(conn, album_id, skip_uploaded=not include_uploaded)
+        for rec in items:
+            if not isinstance(rec, dict):
+                continue
+            key = _llm_row_key(rec)
+            if key in in_flight:
+                continue
+            if not _record_needs_llm_api(rec):
+                continue
+            com = commodity_from_wecatalog_record(rec)
+            if not isinstance(com, dict):
+                continue
+            in_flight.add(key)
+            return rec, com
+    return None
+
+
+def _run_llm_multithread_claim_loop(
+    album_id: str,
+    *,
+    include_uploaded: bool,
+    limit: int | None,
+    restart_after: int,
+) -> tuple[int, bool]:
+    """每个 API key 一线程；每次 LLM 完成后重新读库取下一条待处理记录。"""
+    from product_feed_kr.listing_llm_enrich import enrich_record_listing_llm, listing_llm_api_profiles
+    from product_feed_kr.store_sqlite import connect_sqlite, sqlite_update_product_row
+
+    profiles = listing_llm_api_profiles()
+    if len(profiles) <= 1:
+        raise ValueError("multithread claim loop 需要 OPENAI_API_KEY 为至少 2 个 key 的数组")
+
+    aid = album_id.strip()
+    claim_lock = threading.Lock()
+    in_flight: set[tuple[str, int]] = set()
+    updated_lock = threading.Lock()
+    updated_total = 0
+    restart_fresh = False
+    stop_event = threading.Event()
+
+    _log.info(
+        "%s",
+        pf_kv(
+            [
+                ("event", "llm.threads.start"),
+                ("mode", "claim_next"),
+                ("threads", len(profiles)),
+                ("labels", ",".join(p["label"] for p in profiles)),
+            ],
+            zh="多线程 LLM：每次 API 响应后重新读库取下一条",
+        ),
+    )
+
+    def _worker(profile: Any) -> None:
+        nonlocal updated_total, restart_fresh
+        conn = connect_sqlite()
+        try:
+            while not stop_event.is_set():
+                with updated_lock:
+                    if isinstance(limit, int) and limit > 0 and updated_total >= limit:
+                        stop_event.set()
+                        break
+                item = _claim_next_llm_work_item(
+                    conn,
+                    aid,
+                    include_uploaded=include_uploaded,
+                    claim_lock=claim_lock,
+                    in_flight=in_flight,
+                )
+                if item is None:
+                    break
+                rec, com = item
+                key = _llm_row_key(rec)
+                gid_short = str(rec.get("goods_id") or "")[:36]
+                wrote = False
+                try:
+                    if enrich_record_listing_llm(rec, com, api_profile=profile):
+                        sqlite_update_product_row(conn, aid, rec)
+                        wrote = True
+                        with updated_lock:
+                            updated_total += 1
+                            if restart_after > 0 and updated_total >= restart_after:
+                                restart_fresh = True
+                                stop_event.set()
+                                _log.info(
+                                    "%s",
+                                    pf_kv(
+                                        [
+                                            ("event", "llm.restart_after"),
+                                            ("rows_updated", updated_total),
+                                            ("restart_after", restart_after),
+                                            ("thread", profile["label"]),
+                                        ],
+                                        zh="已达 LLM 写回条数阈值，结束各线程",
+                                    ),
+                                )
+                except Exception as e:
+                    _log.warning(
+                        "%s",
+                        pf_kv(
+                            [
+                                ("event", "llm.item.error"),
+                                ("goods_id", gid_short),
+                                ("thread", profile["label"]),
+                                ("err", str(e)),
+                            ],
+                            zh="单条 LLM 失败，本 run 不再重试该条",
+                        ),
+                    )
+                finally:
+                    if wrote:
+                        with claim_lock:
+                            in_flight.discard(key)
+        finally:
+            conn.close()
+
+    threads = [
+        threading.Thread(
+            target=_worker,
+            args=(profile,),
+            name=f"llm-{profile['label']}",
+            daemon=True,
+        )
+        for profile in profiles
+    ]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    _log.info(
+        "%s",
+        pf_kv(
+            [
+                ("event", "llm.threads.done"),
+                ("rows_updated", updated_total),
+                ("restart_fresh", restart_fresh),
+            ],
+            zh="多线程 LLM 本 run 结束",
+        ),
+    )
+    return updated_total, restart_fresh
+
+
 def enrich_llm_for_sqlite_records(
     album_id: str,
     *,
@@ -1286,6 +1820,7 @@ def enrich_llm_for_sqlite_records(
     """仅对 SQLite 现有记录执行 LLM enrich 并写回，不登录后台、不提交上架。"""
     from product_feed_kr.listing_llm_enrich import (
         enrich_records_listing_llm_batch,
+        listing_llm_api_profiles,
         listing_llm_batch_size,
         listing_llm_enabled,
     )
@@ -1304,59 +1839,92 @@ def enrich_llm_for_sqlite_records(
     from product_feed_kr.store_sqlite import (
         connect_sqlite,
         ensure_sqlite_schema,
-        sqlite_load_products_for_upload,
         sqlite_update_product_row,
     )
 
     conn = connect_sqlite()
     try:
         ensure_sqlite_schema(conn)
-        items = sqlite_load_products_for_upload(conn, aid, skip_uploaded=not include_uploaded)
-        if isinstance(limit, int) and limit > 0:
-            items = items[:limit]
-
-        rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
-        skipped_no_detail = 0
-        for rec in items:
-            if not isinstance(rec, dict):
-                continue
-            com = commodity_from_wecatalog_record(rec)
-            if not isinstance(com, dict):
-                skipped_no_detail += 1
-                continue
-            rows.append((rec, com))
-
         batch_size = listing_llm_batch_size()
         restart_after_llm = restart_after_n("LISTING_LLM_RESTART_AFTER_ITEMS", 1000)
+        api_profiles = listing_llm_api_profiles()
         updated_total = 0
         restart_fresh = False
-        for i in range(0, len(rows), batch_size):
-            chunk = rows[i : i + batch_size]
-            changed = enrich_records_listing_llm_batch(chunk, batch_size=batch_size)
-            for rec in changed:
-                sqlite_update_product_row(conn, aid, rec)
-            updated_total += len(changed)
-            if restart_after_llm > 0 and updated_total >= restart_after_llm:
-                restart_fresh = True
+        rows_total = 0
+        rows_eligible = 0
+        skipped_no_detail = 0
+
+        if len(api_profiles) > 1:
+            _, rows_total, skipped_no_detail = _load_llm_work_rows(
+                conn,
+                aid,
+                include_uploaded=include_uploaded,
+                pending_only=False,
+                limit=None,
+            )
+            pending_rows, _, _ = _load_llm_work_rows(
+                conn,
+                aid,
+                include_uploaded=include_uploaded,
+                pending_only=True,
+                limit=None,
+            )
+            rows_eligible = len(pending_rows)
+            if not pending_rows:
                 _log.info(
                     "%s",
-                    pf_kv(
-                        [
-                            ("event", "llm.restart_after"),
-                            ("rows_updated", updated_total),
-                            ("restart_after", restart_after_llm),
-                            ("exit", EXIT_RESTART_FRESH_DATA),
-                        ],
-                        zh="已达配置的 LLM 写回条数阈值，结束本进程以便外层重跑",
-                    ),
+                    pf_kv([("event", "llm.empty")], zh="无待 LLM 处理的记录"),
                 )
-                break
+            else:
+                updated_total, restart_fresh = _run_llm_multithread_claim_loop(
+                    aid,
+                    include_uploaded=include_uploaded,
+                    limit=limit,
+                    restart_after=restart_after_llm,
+                )
+        else:
+            rows, rows_total, skipped_no_detail = _load_llm_work_rows(
+                conn,
+                aid,
+                include_uploaded=include_uploaded,
+                pending_only=False,
+                limit=limit if isinstance(limit, int) and limit > 0 else None,
+            )
+            rows_eligible = len(rows)
+            updated_total = 0
+            restart_fresh = False
+            profile = api_profiles[0] if api_profiles else None
+            for i in range(0, len(rows), batch_size):
+                chunk = rows[i : i + batch_size]
+                changed = enrich_records_listing_llm_batch(
+                    chunk,
+                    batch_size=batch_size,
+                    api_profile=profile,
+                )
+                for rec in changed:
+                    sqlite_update_product_row(conn, aid, rec)
+                updated_total += len(changed)
+                if restart_after_llm > 0 and updated_total >= restart_after_llm:
+                    restart_fresh = True
+                    _log.info(
+                        "%s",
+                        pf_kv(
+                            [
+                                ("event", "llm.restart_after"),
+                                ("rows_updated", updated_total),
+                                ("restart_after", restart_after_llm),
+                                ("exit", EXIT_RESTART_FRESH_DATA),
+                            ],
+                            zh="已达配置的 LLM 写回条数阈值，结束本进程以便外层重跑",
+                        ),
+                    )
+                    break
 
         return {
             "ok": True,
             "album_id": aid,
-            "rows_total": len(items),
-            "rows_eligible": len(rows),
+            "rows_total": rows_total,
+            "rows_eligible": rows_eligible,
             "rows_updated": updated_total,
             "rows_skipped_no_detail": skipped_no_detail,
             "restart_fresh": restart_fresh,
@@ -1430,11 +1998,12 @@ def main() -> int:
             return 1
     if args.llm_only:
         try:
-            out = enrich_llm_for_sqlite_records(
-                aid,
-                limit=args.limit,
-                include_uploaded=args.include_uploaded,
-            )
+            with single_instance_lock("seven17_llm_enrich"):
+                out = enrich_llm_for_sqlite_records(
+                    aid,
+                    limit=args.limit,
+                    include_uploaded=args.include_uploaded,
+                )
             print(json.dumps(out, ensure_ascii=False))
             if out.get("restart_fresh"):
                 reload_seven17_config()
@@ -1445,14 +2014,15 @@ def main() -> int:
             return 1
 
     try:
-        stats = upload_from_wecatalog_store(
-            aid,
-            limit=args.limit,
-            dry_run=args.dry_run,
-            skip_uploaded=not args.include_uploaded,
-            write_back=args.write_back,
-            keep_open=args.keep_open,
-        )
+        with single_instance_lock("seven17_upload_session"):
+            stats = upload_from_wecatalog_store(
+                aid,
+                limit=args.limit,
+                dry_run=args.dry_run,
+                skip_uploaded=not args.include_uploaded,
+                write_back=args.write_back,
+                keep_open=args.keep_open,
+            )
         print(json.dumps({"ok": stats["fail"] == 0, **stats}, ensure_ascii=False))
         if stats.get("restart_fresh"):
             reload_seven17_config()

@@ -9,19 +9,29 @@ import base64
 import io
 import json
 import logging
+import os
 import re
 import time
 import urllib.error
 import urllib.request
 from datetime import datetime, timezone
-from typing import Any
+from typing import Any, TypedDict
 from urllib.parse import urlparse
 
 from product_feed_kr.seven17_config import bool_env as _cfg_bool
 from product_feed_kr.seven17_config import getenv as _cfg_get
-from product_feed_kr.pf_log import pf_kv
+from product_feed_kr.seven17_config import load_seven17_config
+from product_feed_kr.pf_log import log_item_separator, pf_kv
 
 _log = logging.getLogger(__name__)
+
+
+class ListingLlmApiProfile(TypedDict):
+    label: str
+    api_key: str
+    base_url: str | None
+    model: str
+
 
 # 鞋类语境：用于 attr_map_ko 中欧码→韩版毫米标换算（与 name/desc 合并判断）。
 _FOOTWEAR_HINT_RE = re.compile(
@@ -431,7 +441,7 @@ def parse_listing_llm_response(text: str, *, listing_hint: str | None = None) ->
 
 
 def listing_llm_enabled() -> bool:
-    if not (_cfg_get("OPENAI_API_KEY") or "").strip():
+    if not listing_llm_api_profiles():
         return False
     return _cfg_bool("OPENAI_ENRICH_LISTING", True)
 
@@ -447,6 +457,80 @@ def listing_llm_batch_size() -> int:
     except ValueError:
         n = 12
     return max(1, min(n, 50))
+
+
+def _cfg_raw(key: str) -> Any:
+    """读配置原始值（保留 JSON 数组/对象）；环境变量为 JSON 字符串时解析。"""
+    ev = os.environ.get(key)
+    if ev is not None and str(ev).strip():
+        t = str(ev).strip()
+        if t.startswith("[") or t.startswith("{"):
+            try:
+                return json.loads(t)
+            except json.JSONDecodeError:
+                return t
+        return t
+    cfg = load_seven17_config()
+    return cfg.get(key)
+
+
+def _default_openai_profile_fields() -> tuple[str | None, str]:
+    base = (_cfg_get("OPENAI_BASE_URL") or "").strip() or None
+    model = (_cfg_get("OPENAI_MODEL") or "").strip() or "gpt-4o-mini"
+    return base, model
+
+
+def _openai_api_keys_from_config() -> list[str]:
+    """``OPENAI_API_KEY``：字符串为单 key；JSON 数组则每项一个 key（每项对应一个 LLM 工作线程）。"""
+    raw = _cfg_raw("OPENAI_API_KEY")
+    keys: list[str] = []
+    if isinstance(raw, list):
+        for item in raw:
+            k = str(item).strip()
+            if k:
+                keys.append(k)
+        return keys
+    if not isinstance(raw, str):
+        return keys
+    t = raw.strip()
+    if not t:
+        return keys
+    if t.startswith("["):
+        try:
+            parsed = json.loads(t)
+            if isinstance(parsed, list):
+                for item in parsed:
+                    k = str(item).strip()
+                    if k:
+                        keys.append(k)
+                return keys
+        except json.JSONDecodeError:
+            pass
+    keys.append(t)
+    return keys
+
+
+def listing_llm_api_profiles() -> list[ListingLlmApiProfile]:
+    """
+    从 ``OPENAI_API_KEY`` 解析：单个字符串 → 1 线程；JSON 数组 → 数组长度个线程（共用 ``OPENAI_BASE_URL`` / ``OPENAI_MODEL``）。
+    """
+    default_base, default_model = _default_openai_profile_fields()
+    keys = _openai_api_keys_from_config()
+    profiles: list[ListingLlmApiProfile] = []
+    for i, key in enumerate(keys):
+        profiles.append(
+            ListingLlmApiProfile(
+                label=f"thread-{i}" if len(keys) > 1 else "default",
+                api_key=key,
+                base_url=default_base,
+                model=default_model,
+            )
+        )
+    return profiles
+
+
+def listing_llm_thread_count() -> int:
+    return max(1, len(listing_llm_api_profiles()))
 
 
 def listing_llm_color_vision_enabled() -> bool:
@@ -516,10 +600,21 @@ def _resolve_timeout(timeout: float | None) -> float:
         return 60.0
 
 
-def _openai_client(timeout: float | None):
-    api_key = (_cfg_get("OPENAI_API_KEY") or "").strip()
-    base_url = (_cfg_get("OPENAI_BASE_URL") or "").strip() or None
-    model = (_cfg_get("OPENAI_MODEL") or "").strip() or "gpt-4o-mini"
+def _openai_client(
+    timeout: float | None,
+    *,
+    api_profile: ListingLlmApiProfile | None = None,
+):
+    if api_profile is not None:
+        api_key = api_profile["api_key"].strip()
+        base_url = api_profile.get("base_url")
+        model = api_profile.get("model") or "gpt-4o-mini"
+    else:
+        api_key = (_cfg_get("OPENAI_API_KEY") or "").strip()
+        base_url = (_cfg_get("OPENAI_BASE_URL") or "").strip() or None
+        model = (_cfg_get("OPENAI_MODEL") or "").strip() or "gpt-4o-mini"
+    if not api_key:
+        raise RuntimeError("OPENAI_API_KEY 为空")
     try:
         from openai import OpenAI
     except ImportError as e:
@@ -575,6 +670,7 @@ def enrich_records_listing_llm_batch(
     *,
     timeout: float | None = None,
     batch_size: int | None = None,
+    api_profile: ListingLlmApiProfile | None = None,
 ) -> list[dict[str, Any]]:
     """批量 enrich 多条 (record, commodity)，返回发生变更、建议写回存储层的 record 列表。"""
     if not rows:
@@ -625,16 +721,17 @@ def enrich_records_listing_llm_batch(
             ),
         )
         for _idx, record, commodity, _title in need_call:
-            if enrich_record_listing_llm(record, commodity, timeout=timeout):
+            if enrich_record_listing_llm(record, commodity, timeout=timeout, api_profile=api_profile):
                 changed.append(record)
         return changed
 
-    client, model, host = _openai_client(timeout)
+    client, model, host = _openai_client(timeout, api_profile=api_profile)
     size = batch_size or listing_llm_batch_size()
     use_response_format = "dashscope.aliyuncs.com" not in host.lower()
 
     for offset in range(0, len(need_call), size):
         chunk = need_call[offset : offset + size]
+        log_item_separator(_log)
         payload = [
             {
                 "idx": idx,
@@ -643,17 +740,17 @@ def enrich_records_listing_llm_batch(
             }
             for idx, record, _commodity, title in chunk
         ]
+        batch_log: list[tuple[str, Any]] = [
+            ("event", "llm.batch.request"),
+            ("model", model),
+            ("host", host),
+            ("batch", len(payload)),
+        ]
+        if api_profile is not None:
+            batch_log.append(("thread", api_profile.get("label", "")))
         _log.info(
             "%s",
-            pf_kv(
-                [
-                    ("event", "llm.batch.request"),
-                    ("model", model),
-                    ("host", host),
-                    ("batch", len(payload)),
-                ],
-                zh="批量调用 OpenAI 解析上架标题",
-            ),
+            pf_kv(batch_log, zh="批量调用 OpenAI 解析上架标题"),
         )
         messages = [
             {"role": "system", "content": _SYSTEM_BATCH},
@@ -684,7 +781,7 @@ def enrich_records_listing_llm_batch(
                 norm = by_idx.get(idx)
                 if norm is None:
                     # 该条缺失时回退单条调用，避免整批失败影响上架。
-                    if enrich_record_listing_llm(record, commodity, timeout=timeout):
+                    if enrich_record_listing_llm(record, commodity, timeout=timeout, api_profile=api_profile):
                         changed.append(record)
                     continue
                 norm["source"] = "openai"
@@ -720,7 +817,7 @@ def enrich_records_listing_llm_batch(
                 ),
             )
             for _idx, record, commodity, _title in chunk:
-                if enrich_record_listing_llm(record, commodity, timeout=timeout):
+                if enrich_record_listing_llm(record, commodity, timeout=timeout, api_profile=api_profile):
                     changed.append(record)
 
     return changed
@@ -731,6 +828,7 @@ def enrich_record_listing_llm(
     commodity: dict[str, Any],
     *,
     timeout: float | None = None,
+    api_profile: ListingLlmApiProfile | None = None,
 ) -> bool:
     """
     将 LLM 结果写入 ``record['listing_llm']``；识别到价则写入 ``commodity['optimaPrice']``，否则 ``cny_price`` 为 ``null`` 并清空 ``optimaPrice``。
@@ -738,6 +836,8 @@ def enrich_record_listing_llm(
     返回 **True** 表示应写回 store-json（内存中 ``raw`` 已改）；无 title 等放弃时为 **False**。
     """
     title = str(commodity.get("title") or "").strip()
+    gid_short = str(record.get("goods_id") or "")[:36]
+    log_item_separator(_log)
     if not title:
         _log.warning(
             "%s",
@@ -767,9 +867,8 @@ def enrich_record_listing_llm(
         )
         return True
 
-    client, model, host = _openai_client(timeout)
+    client, model, host = _openai_client(timeout, api_profile=api_profile)
     use_response_format = "dashscope.aliyuncs.com" not in host.lower()
-    gid_short = str(record.get("goods_id") or "")[:36]
     want_vision = listing_llm_color_vision_enabled()
     data_urls: list[str] = []
     if want_vision:
@@ -810,7 +909,7 @@ def enrich_record_listing_llm(
             {"role": "system", "content": system_text},
             {"role": "user", "content": user_parts},
         ]
-        log_kv = [
+        log_kv: list[tuple[str, Any]] = [
             ("event", "llm.request"),
             ("model", model),
             ("host", host),
@@ -819,6 +918,8 @@ def enrich_record_listing_llm(
             ("vision", 1),
             ("vision_images", len(data_urls)),
         ]
+        if api_profile is not None:
+            log_kv.append(("thread", api_profile.get("label", "")))
         log_zh = "正在调用 OpenAI 丰富上架字段（含颜色缩略图）"
     else:
         messages = [
@@ -832,6 +933,8 @@ def enrich_record_listing_llm(
             ("title_len", len(title)),
             ("goods_id", gid_short),
         ]
+        if api_profile is not None:
+            log_kv.append(("thread", api_profile.get("label", "")))
         log_zh = "正在调用 OpenAI 丰富上架字段（标题价颜色尺码等）"
     _log.info("%s", pf_kv(log_kv, zh=log_zh))
     content, elapsed_ms = _chat_once_json(
@@ -866,3 +969,4 @@ def enrich_record_listing_llm(
         ),
     )
     return True
+

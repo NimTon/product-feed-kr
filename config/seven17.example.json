@@ -1,5 +1,5 @@
 {
-  "_说明": "复制为 seven17.json。PRODUCT_FEED_SQLITE：本地 .db。WECATALOG_ALBUM_ID：微猫相册 ID（可省略命令行 --album-id）。WECATALOG_DETAIL_DELAY：店铺抓取节流默认（未传 --detail-delay 时）；字符串如 \"5\" 固定秒，\"3,8\" 或 \"3:8\" 为闭区间随机；也可写 JSON 数组 [3,8]。环境变量同名优先。OPENAI_*：listing_llm。OPENAI_LISTING_COLOR_VISION：为 true 时 LLM 请求附带商品缩略图，便于 attr_map/attr_map_ko 中颜色与实物一致（关闭批量 JSON，逐条调用）。OPENAI_LISTING_LLM_BATCH_SIZE：单批送入 LLM 的商品条数。上架：seven17_upload --write-back。WECATALOG_SCRAPE_RESTART_AFTER_ITEMS / LISTING_LLM_RESTART_AFTER_ITEMS / SEVEN17_UPLOAD_RESTART_AFTER_ITEMS：拉取、LLM、上传各累计完成多少条后进程退出码 75，外层 bat 可立即重跑以防数据过旧；0 关闭；默认 1000。",
+  "_说明": "复制为 seven17.json。PRODUCT_FEED_SQLITE：本地 .db。WECATALOG_ALBUM_ID：微猫相册 ID（可省略命令行 --album-id）。WECATALOG_DETAIL_DELAY：店铺抓取节流默认（未传 --detail-delay 时）；字符串如 \"5\" 固定秒，\"3,8\" 或 \"3:8\" 为闭区间随机；也可写 JSON 数组 [3,8]。环境变量同名优先。OPENAI_*：listing_llm。OPENAI_API_KEY：单个字符串为单线程；JSON 数组如 [\"sk-a\",\"sk-b\"] 则每个 key 一个 LLM 工作线程（同进程，仍只开一个 llm bat 窗口）。SEVEN17_UPLOAD_THREADS：上架工作线程数（默认 1，最大 16）；>1 时每线程独立浏览器登录，每处理完一条后重新读库领取下一条（仍只开一个 upload bat 窗口）。OPENAI_LISTING_COLOR_VISION：为 true 时 LLM 请求附带商品缩略图。上架：seven17_upload --write-back。WECATALOG_SCRAPE_RESTART_AFTER_ITEMS / LISTING_LLM_RESTART_AFTER_ITEMS / SEVEN17_UPLOAD_RESTART_AFTER_ITEMS：各累计完成 N 条后退出码 75，外层 bat 重跑；0 关闭；默认 1000。",
   "PRODUCT_FEED_SQLITE": "data/product_feed.db",
   "WECATALOG_ALBUM_ID": "",
   "WECATALOG_DETAIL_DELAY": "5",
@@ -30,5 +30,6 @@
   "WEGO_DESC_TEMPLATE": "",
   "WECATALOG_SCRAPE_RESTART_AFTER_ITEMS": 1000,
   "LISTING_LLM_RESTART_AFTER_ITEMS": 1000,
-  "SEVEN17_UPLOAD_RESTART_AFTER_ITEMS": 1000
+  "SEVEN17_UPLOAD_RESTART_AFTER_ITEMS": 1000,
+  "SEVEN17_UPLOAD_THREADS": 1
 }

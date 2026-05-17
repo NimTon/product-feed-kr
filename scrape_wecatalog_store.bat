@@ -19,6 +19,7 @@ if not defined STORE_URL (
 )
 set "LOG_FILE=data\wecatalog_scrape_store.log"
 rem SQLite path: PRODUCT_FEED_SQLITE in config (default data\product_feed.db)
+rem Do not pass --detail-delay here: module reads WECATALOG_DETAIL_DELAY from env or seven17.json (e.g. 3,8 for random range). Override: append args e.g. ... --detail-delay 3,8
 
 echo [scrape] PY=%PY%
 echo [scrape] STORE_URL=%STORE_URL%
@@ -30,10 +31,14 @@ echo.
 "%PY%" -m product_feed_kr.wecatalog_scrape_store ^
   --store-url "%STORE_URL%" ^
   --log-file "%LOG_FILE%" ^
-  --detail-delay 5 ^
   --checkpoint-every 1 %*
 
 set "EC=!ERRORLEVEL!"
+if "!EC!"=="11" (
+  echo [scrape] STOP: another scrape instance is running ^(lock held^). Close the other window.
+  pause
+  endlocal & exit /b 11
+)
 echo.
 echo [scrape] last exit=!EC!, starting next round... ^(log: %LOG_FILE%^)
 echo.
