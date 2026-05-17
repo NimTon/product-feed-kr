@@ -8,7 +8,7 @@
 每条 **`pf_store_item`** 写入 **`detail_response`**（详情接口整包），**不写**列表卡片对象 `list_item`。
 每条另有 **`uploaded_to_platform`**（布尔）：抓取时默认为 **`false`**。
 
-增量：库内已有 **`goods_id`** 本次跳过（不请求详情、不重复插入）。抓取与上架对同一 ``.db`` 使用 **文件锁**（``*.db.lock``）互斥写。
+增量：库内已有 **`goods_id`** 本次跳过（不请求详情、不写库）。**仅在本 run 抓到有效详情后**才 upsert 对应商品行，不把启动时整表载入内存写回（避免覆盖并行 LLM 结果）。抓取与上架对同一 ``.db`` 使用 **文件锁**（``*.db.lock``）互斥写。
 
 列表：`POST .../album/personal/all`，分页用 `result.pagination.pageTimestamp` → 下一页 `timestamp`。
 
@@ -44,7 +44,7 @@ import random
 import re
 import sys
 import time
-from datetime import datetime, timezone
+from product_feed_kr.pf_time import now_cst8_iso
 from pathlib import Path
 from typing import Any
 
@@ -63,8 +63,9 @@ from product_feed_kr.seven17_config import (
     restart_after_n,
 )
 from product_feed_kr.wecatalog_tag_mapping import resolve_category_path
-from product_feed_kr.pf_log import configure_scrape_logging, pf_kv
-from product_feed_kr.process_singleton import single_instance_lock
+from product_feed_kr.pf_cli_loop import run_forever
+from product_feed_kr.pf_log import configure_scrape_logging, pf_kv, pf_store_row_id_kv
+from product_feed_kr.process_singleton import EXIT_SINGLETON_CONFLICT, single_instance_lock
 
 # 与 `configure_scrape_logging` 默认 logger_name 一致；`-m` 运行时 __name__ 为 __main__，勿用 getLogger(__name__)。
 logger = logging.getLogger("product_feed_kr.wecatalog_scrape_store")
@@ -308,8 +309,10 @@ def scrape_store(
     from product_feed_kr.store_sqlite import (
         connect_sqlite,
         ensure_sqlite_schema,
+        scrape_detail_ready,
         sqlite_checkpoint,
-        sqlite_load_existing_products,
+        sqlite_load_existing_goods_ids,
+        sqlite_write_store_meta,
         sqlite_db_path,
     )
 
@@ -360,21 +363,21 @@ def scrape_store(
     try:
         conn_db = connect_sqlite()
         ensure_sqlite_schema(conn_db)
-        records, skip_ids_prior = sqlite_load_existing_products(conn_db, album_id)
+        skip_ids_prior, rows_prior = sqlite_load_existing_goods_ids(conn_db, album_id)
         logger.info(
             "%s",
             pf_kv(
                 [
                     ("event", "scrape.sqlite_load"),
-                    ("records", len(records)),
+                    ("rows_prior", rows_prior),
                     ("skip_ids", len(skip_ids_prior)),
                     ("album_id", album_id),
                 ],
-                zh="已从 SQLite 载入本店已有商品，用于跳过已抓 goods_id",
+                zh="已读库内已有 goods_id（不载入整行，仅用于跳过）",
             ),
         )
 
-        stats["records_prior"] = len(records)
+        stats["records_prior"] = rows_prior
 
         p = sync_playwright().start()
         browser = _launch_browser(p, headless=not headed)
@@ -413,41 +416,60 @@ def scrape_store(
             seen_detail: dict[str, dict[str, Any] | None] = {}
             detail_fetch_index = 0
 
-            def write_checkpoint() -> None:
+            def write_checkpoint(*, meta_only: bool = False) -> None:
                 meta_extra = {
-                    "saved_at": datetime.now(timezone.utc).isoformat(),
+                    "saved_at": now_cst8_iso(),
                     "stats": stats,
                 }
                 assert conn_db is not None
-                sqlite_checkpoint(
-                    conn_db,
-                    album_id,
-                    store_url=seed,
-                    trans_lang=trans_lang,
-                    detail_delay_sec=delay_lo,
-                    skip_detail=skip_detail,
-                    meta_extra=meta_extra,
-                    records=records,
-                )
+                if meta_only:
+                    sqlite_write_store_meta(
+                        conn_db,
+                        album_id,
+                        store_url=seed,
+                        trans_lang=trans_lang,
+                        detail_delay_sec=delay_lo,
+                        skip_detail=skip_detail,
+                        meta_extra=meta_extra,
+                    )
+                    written = 0
+                else:
+                    written = sqlite_checkpoint(
+                        conn_db,
+                        album_id,
+                        store_url=seed,
+                        trans_lang=trans_lang,
+                        detail_delay_sec=delay_lo,
+                        skip_detail=skip_detail,
+                        meta_extra=meta_extra,
+                        records=records,
+                    )
+                ck_kv: list[tuple[str, Any]] = [
+                    ("event", "scrape.checkpoint"),
+                    ("pending_in_memory", len(records)),
+                    ("written_with_detail", written),
+                    ("album_id", album_id),
+                ]
+                ready = [r for r in records if scrape_detail_ready(r)]
+                if ready:
+                    ck_kv.extend(pf_store_row_id_kv(ready[-1], album_id=album_id))
                 logger.info(
                     "%s",
                     pf_kv(
-                        [
-                            ("event", "scrape.checkpoint"),
-                            ("products", len(records)),
-                            ("album_id", album_id),
-                        ],
-                        zh="已写入 SQLite checkpoint（店铺信息+当前商品快照）",
+                        ck_kv,
+                        zh="写库：店铺进度 + 本 run 已抓到详情的商品"
+                        if not meta_only
+                        else "写库：店铺元信息（尚无新详情）",
                     ),
                 )
 
-            # 进入详情循环前先落库一次，避免长时间抓取中途崩溃时库内无快照
-            write_checkpoint()
+            # 进入详情循环前只写店铺元信息，不把旧商品行载入内存写回
+            write_checkpoint(meta_only=True)
             logger.info(
                 "%s",
                 pf_kv(
                     [("event", "scrape.checkpoint.initial"), ("album_id", album_id)],
-                    zh="进入详情循环前已落库首份快照",
+                    zh="进入详情循环前已写店铺元信息",
                 ),
             )
 
@@ -477,58 +499,63 @@ def scrape_store(
                                     ("event", "scrape.skip_existing"),
                                     ("total", stats["skipped_existing"]),
                                 ],
-                                zh="跳过库内已有 goods_id 的计数提示",
+                                zh="跳过库内已有 goods_id（不抓详情、不写库）",
                             ),
                         )
                     return True
 
-                detail_payload: dict[str, Any] | None = None
-                if not skip_detail:
-                    if gid in seen_detail:
-                        detail_payload = seen_detail[gid]
-                        logger.debug(
-                            "%s",
-                            pf_kv(
-                                [("event", "scrape.detail.cache"), ("goods_id", gid[:24])],
-                                zh="详情接口：复用本 run 已拉过的缓存",
-                            ),
-                        )
+                if skip_detail:
+                    return True
+
+                detail_payload: dict[str, Any] | None
+                if gid in seen_detail:
+                    detail_payload = seen_detail[gid]
+                    logger.debug(
+                        "%s",
+                        pf_kv(
+                            [("event", "scrape.detail.cache"), ("goods_id", gid)],
+                            zh="详情接口：复用本 run 已拉过的缓存",
+                        ),
+                    )
+                else:
+                    gap.before(f"commodity/view 详情 #{detail_fetch_index + 1} goods_id={gid}")
+                    detail_fetch_index += 1
+                    logger.debug(
+                        "%s",
+                        pf_kv(
+                            [
+                                ("event", "scrape.detail.request"),
+                                ("n", detail_fetch_index),
+                                ("goods_id", gid),
+                            ],
+                            zh="正在请求单条商品详情 commodity/view",
+                        ),
+                    )
+                    d_raw = page.evaluate(FETCH_DETAIL_JS, {"albumId": album_id, "itemId": gid})
+                    if isinstance(d_raw, dict) and d_raw.get("errcode") in (0, None):
+                        detail_payload = d_raw
+                        stats["detail_ok"] += 1
                     else:
-                        gap.before(f"commodity/view 详情 #{detail_fetch_index + 1} goods_id={gid[:36]}")
-                        detail_fetch_index += 1
-                        logger.debug(
+                        detail_payload = d_raw if isinstance(d_raw, dict) else {"error": str(d_raw)}
+                        stats["detail_err"] += 1
+                        logger.warning(
                             "%s",
                             pf_kv(
                                 [
-                                    ("event", "scrape.detail.request"),
-                                    ("n", detail_fetch_index),
-                                    ("goods_id", gid[:36]),
+                                    ("event", "scrape.detail.err"),
+                                    ("goods_id", gid),
+                                    (
+                                        "errcode",
+                                        d_raw.get("errcode") if isinstance(d_raw, dict) else None,
+                                    ),
                                 ],
-                                zh="正在请求单条商品详情 commodity/view",
+                                zh="单条详情接口失败或 errcode 异常",
                             ),
                         )
-                        d_raw = page.evaluate(FETCH_DETAIL_JS, {"albumId": album_id, "itemId": gid})
-                        if isinstance(d_raw, dict) and d_raw.get("errcode") in (0, None):
-                            detail_payload = d_raw
-                            stats["detail_ok"] += 1
-                        else:
-                            detail_payload = d_raw if isinstance(d_raw, dict) else {"error": str(d_raw)}
-                            stats["detail_err"] += 1
-                            logger.warning(
-                                "%s",
-                                pf_kv(
-                                    [
-                                        ("event", "scrape.detail.err"),
-                                        ("goods_id", gid[:32]),
-                                        (
-                                            "errcode",
-                                            d_raw.get("errcode") if isinstance(d_raw, dict) else None,
-                                        ),
-                                    ],
-                                    zh="单条详情接口失败或 errcode 异常",
-                                ),
-                            )
-                        seen_detail[gid] = detail_payload
+                    seen_detail[gid] = detail_payload
+
+                if not scrape_detail_ready({"detail_response": detail_payload}):
+                    return True
 
                 rec = {
                     "wecatalog_group": gname,
@@ -541,6 +568,7 @@ def scrape_store(
                     "detail_response": detail_payload,
                 }
                 records.append(rec)
+                skip_ids_prior.add(gid)
                 new_appended += 1
                 stats["records"] = len(records)
                 stats["records_new"] = new_appended
@@ -554,7 +582,7 @@ def scrape_store(
                                 ("n", new_appended),
                                 ("group", gname),
                                 ("tag", tname),
-                                ("goods_id", gid[:28]),
+                                ("goods_id", gid),
                             ],
                             zh="新增一条「分组×标签×商品」到内存列表",
                         ),
@@ -715,8 +743,9 @@ def main() -> int:
         "--log-file",
         type=Path,
         default=None,
-        help="额外写入日志文件（UTF-8）；不设则仅 stderr",
+        help="日志文件；常驻模式默认 data/wecatalog_scrape_store.log",
     )
+    ap.add_argument("--once", action="store_true", help="只执行一轮后退出")
     ap.add_argument("-v", "--verbose", action="store_true", help="DEBUG 级别（详情请求、跳过等更细）")
     ap.add_argument(
         "--headed",
@@ -730,10 +759,14 @@ def main() -> int:
     except ValueError as e:
         ap.error(f"无效 --detail-delay {args.detail_delay!r}: {e}")
 
-    configure_scrape_logging(args.log_file, verbose=args.verbose)
+    repeat = not args.once
+    log_file = args.log_file
+    if repeat and log_file is None:
+        log_file = Path(__file__).resolve().parent.parent / "data" / "wecatalog_scrape_store.log"
+    configure_scrape_logging(log_file, verbose=args.verbose)
 
-    try:
-        with single_instance_lock("wecatalog_scrape_store"):
+    def _run_once() -> int:
+        try:
             stats = scrape_store(
                 args.store_url.strip(),
                 trans_lang=args.trans_lang.strip() or "zh",
@@ -744,15 +777,33 @@ def main() -> int:
                 max_records=max(0, args.max_records),
                 headed=args.headed,
             )
-        print(json.dumps({"ok": True, **stats}, ensure_ascii=False))
-        if stats.get("restart_fresh"):
-            reload_seven17_config()
-            return EXIT_RESTART_FRESH_DATA
-        return 0
-    except Exception as e:
-        logger.exception("%s", pf_kv([("event", "scrape.fatal"), ("err", str(e))], zh="抓取主流程未捕获异常，已中止"))
-        print(json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False), file=sys.stderr)
-        return 1
+            print(json.dumps({"ok": True, **stats}, ensure_ascii=False))
+            if stats.get("restart_fresh"):
+                reload_seven17_config()
+                return EXIT_RESTART_FRESH_DATA
+            return 0
+        except Exception as e:
+            logger.exception(
+                "%s",
+                pf_kv([("event", "scrape.fatal"), ("err", str(e))], zh="抓取主流程未捕获异常，已中止"),
+            )
+            print(json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False), file=sys.stderr)
+            return 1
+
+    try:
+        with single_instance_lock("wecatalog_scrape_store"):
+            if repeat:
+                return run_forever(
+                    _run_once,
+                    task_label="wecatalog_scrape_store",
+                    logger=logger,
+                    on_restart_fresh=reload_seven17_config,
+                )
+            return _run_once()
+    except SystemExit as e:
+        if e.code == EXIT_SINGLETON_CONFLICT:
+            return EXIT_SINGLETON_CONFLICT
+        raise
 
 
 if __name__ == "__main__":

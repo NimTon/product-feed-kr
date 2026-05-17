@@ -1,15 +1,45 @@
 {
-  "_说明": "复制为 seven17.json。PRODUCT_FEED_SQLITE：本地 .db。WECATALOG_ALBUM_ID：微猫相册 ID（可省略命令行 --album-id）。WECATALOG_DETAIL_DELAY：店铺抓取节流默认（未传 --detail-delay 时）；字符串如 \"5\" 固定秒，\"3,8\" 或 \"3:8\" 为闭区间随机；也可写 JSON 数组 [3,8]。环境变量同名优先。OPENAI_*：listing_llm。OPENAI_API_KEY：单个字符串为单线程；JSON 数组如 [\"sk-a\",\"sk-b\"] 则每个 key 一个 LLM 工作线程（同进程，仍只开一个 llm bat 窗口）。SEVEN17_UPLOAD_THREADS：上架工作线程数（默认 1，最大 16）；>1 时每线程独立浏览器登录，每处理完一条后重新读库领取下一条（仍只开一个 upload bat 窗口）。OPENAI_LISTING_COLOR_VISION：为 true 时 LLM 请求附带商品缩略图。上架：seven17_upload --write-back。WECATALOG_SCRAPE_RESTART_AFTER_ITEMS / LISTING_LLM_RESTART_AFTER_ITEMS / SEVEN17_UPLOAD_RESTART_AFTER_ITEMS：各累计完成 N 条后退出码 75，外层 bat 重跑；0 关闭；默认 1000。",
+  "_说明": "OPENAI_PROFILES：label 用中文备注即可；必填 base_url、model、api_key/api_keys。未填 key 不建线程。豆包 model 填 ep- 接入点 ID。",
   "PRODUCT_FEED_SQLITE": "data/product_feed.db",
   "WECATALOG_ALBUM_ID": "",
   "WECATALOG_DETAIL_DELAY": "5",
-  "OPENAI_BASE_URL": "https://api.openai.com/v1",
-  "OPENAI_API_KEY": "",
-  "OPENAI_MODEL": "gpt-4o-mini",
+  "OPENAI_PROFILES": [
+    {
+      "label": "阿里云通义千问",
+      "api_keys": [""],
+      "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
+      "model": "qwen-plus"
+    },
+    {
+      "label": "腾讯混元",
+      "api_key": "",
+      "base_url": "https://api.hunyuan.cloud.tencent.com/v1",
+      "model": "hunyuan-turbos-latest"
+    },
+    {
+      "label": "火山引擎豆包",
+      "api_key": "",
+      "base_url": "https://ark.cn-beijing.volces.com/api/v3",
+      "model": "ep-xxxxxxxx-xxxxx"
+    },
+    {
+      "label": "百度文心一言",
+      "api_key": "",
+      "base_url": "https://qianfan.baidubce.com/v2",
+      "model": "ernie-4.0-turbo-8k"
+    },
+    {
+      "label": "华为云盘古",
+      "api_key": "",
+      "base_url": "https://api.modelarts-maas.com/openai/v1",
+      "model": "请填-MaaS-模型ID"
+    }
+  ],
   "OPENAI_TIMEOUT": "120",
   "OPENAI_LISTING_LLM_BATCH_SIZE": "12",
   "OPENAI_ENRICH_LISTING": true,
   "OPENAI_LISTING_LLM_FORCE": false,
+  "LISTING_LLM_MAX_ATTEMPTS": 3,
   "OPENAI_LISTING_COLOR_VISION": false,
   "OPENAI_LISTING_COLOR_VISION_MAX_IMAGES": "4",
   "OPENAI_LISTING_COLOR_VISION_MAX_PX": "256",
@@ -30,6 +60,7 @@
   "WEGO_DESC_TEMPLATE": "",
   "WECATALOG_SCRAPE_RESTART_AFTER_ITEMS": 1000,
   "LISTING_LLM_RESTART_AFTER_ITEMS": 1000,
+  "LISTING_LLM_ROUND_DELAY_SEC": "5",
   "SEVEN17_UPLOAD_RESTART_AFTER_ITEMS": 1000,
   "SEVEN17_UPLOAD_THREADS": 1
 }

@@ -18,9 +18,9 @@
 `LISTING_LLM_RESTART_AFTER_ITEMS` / `SEVEN17_UPLOAD_RESTART_AFTER_ITEMS`（默认 1000：本 run 写回 LLM / 上架成功达 N 条后退出码 75，供外层立即重跑；0 关闭）、
 `SEVEN17_UPLOAD_THREADS`（默认 1：上架工作线程数，每线程独立 Playwright 登录）。
 
-上传模块不再调用 LLM：只读取 SQLite 已有的 ``listing_llm`` 结果（如 ``cny_price`` / ``name_ko`` / ``desc_ko``）。
+上传模块不再调用 LLM：只读取 SQLite 已有的 ``listing_llm`` 结果（如 ``cny_price`` / ``name_ko`` / ``desc_ko``）。LLM 写回请用 ``python -m product_feed_kr.seven17_llm``（``llm_enrich_sqlite.bat``）。
 
-``--llm-only``：``OPENAI_API_KEY`` 为 JSON 数组且长度 >1 时同进程多线程（每个 key 一个线程）；多线程下每完成 **一次 LLM 响应** 即重新读库取 **第一条** 待处理记录。真实上架：``SEVEN17_UPLOAD_THREADS`` >1 时同进程多线程（每线程独立浏览器），每处理完一条后重新读库取下一条可上架记录。仍只开一个 bat/llm/upload 窗口；重复运行由进程锁拒绝（退出码 11）。
+真实上架：``SEVEN17_UPLOAD_THREADS`` >1 时同进程多线程（每线程独立 Playwright），每处理完一条后重新读库取下一条可上架记录。重复运行由进程锁拒绝（退出码 11）。
 
 写库前对 ``.db`` 文件使用 ``filelock`` 独占锁（与抓取并行时互斥）。
 
@@ -28,6 +28,10 @@
 
   python -m product_feed_kr.seven17_upload --limit 1 --dry-run --keep-open
   python -m product_feed_kr.seven17_upload --album-id YOUR_ALBUM_ID --write-back --limit 5
+  python -m product_feed_kr.seven17_upload --write-back
+  python -m product_feed_kr.seven17_upload --write-back --once
+
+默认进程内循环直至 Ctrl+C（单日志文件）；``--once`` 只跑一轮。``--preview-index`` 亦只跑一轮。
 
 默认跳过 ``seven17_uploaded_at`` 非空（已上传平台）的记录。已开 LLM 且未完成 LLM 处理时跳过。
 
@@ -49,7 +53,7 @@ import tempfile
 import urllib.error
 import urllib.request
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from product_feed_kr.pf_time import now_cst8_iso
 from pathlib import Path
 from typing import Any, Literal
 from urllib.parse import parse_qs, urlparse
@@ -69,17 +73,37 @@ from product_feed_kr.seven17_config import (
 )
 from product_feed_kr.wecatalog_tag_mapping import resolve_category_path, resolve_seven17_ca_id
 from product_feed_kr.wego_commodity import DEFAULT_WEGO_DESC_TEMPLATE, parse_wego_product
-from product_feed_kr.pf_log import configure_pf_stderr, log_item_separator, pf_kv
-from product_feed_kr.process_singleton import single_instance_lock
+from product_feed_kr.pf_log import (
+    UPLOAD_LOGGER_NAMES,
+    configure_pf_stderr,
+    configure_upload_logging,
+    log_item_separator,
+    pf_goods_id,
+    pf_kv,
+    pf_store_row_id_kv,
+)
+from product_feed_kr.wecatalog_store_record import commodity_from_wecatalog_record
+from product_feed_kr.pf_cli_loop import default_log_path, run_forever
+from product_feed_kr.process_singleton import EXIT_SINGLETON_CONFLICT, single_instance_lock
 
 # 必须用稳定 logger 名：以 `python -m product_feed_kr.seven17_upload` 运行时 __name__ 为 __main__，
 # getLogger(__name__) 会落到 __main__，configure_pf_stderr 挂在 product_feed_kr.seven17_upload 上则永远打不出。
 _log = logging.getLogger("product_feed_kr.seven17_upload")
+_upload_logging_configured = False
 
 
 def _configure_upload_stderr_logging() -> None:
-    """stderr：`时间 [级别] [短标签] 消息`。"""
-    configure_pf_stderr("product_feed_kr.seven17_upload")
+    """未在 main 中配置过文件日志时，仅挂 stderr（预览等子路径兜底）。"""
+    global _upload_logging_configured
+    if _upload_logging_configured:
+        return
+    configure_pf_stderr(*UPLOAD_LOGGER_NAMES)
+
+
+def _init_upload_logging(*, log_file: Path | None = None, verbose: bool = False) -> None:
+    global _upload_logging_configured
+    configure_upload_logging(log_file=log_file, verbose=verbose)
+    _upload_logging_configured = True
 
 
 def _preview_text(s: str, max_len: int = 500) -> str:
@@ -305,23 +329,35 @@ def _ca_id_log_paths(wecatalog_group: str, wecatalog_tag: str) -> tuple[str, str
     return ko, zh
 
 
-def commodity_from_wecatalog_record(record: dict[str, Any]) -> dict[str, Any] | None:
-    """从单条 `products[]` 取出 `detail_response.result.commodity`。"""
-    dr = record.get("detail_response")
-    if not isinstance(dr, dict):
-        return None
-    res = dr.get("result")
-    if not isinstance(res, dict):
-        return None
-    com = res.get("commodity")
-    return com if isinstance(com, dict) else None
-
-
 def _llm_cny_usable(llm_data: dict[str, Any] | None) -> bool:
     """上传阶段仅判断 DB 中 listing_llm.cny_price 是否可用（不触发 LLM 请求）。"""
     if not isinstance(llm_data, dict):
         return False
     return bool(str(llm_data.get("cny_price") or "").strip())
+
+
+def _upload_title_from_record(
+    rec: dict[str, Any],
+    prod: dict[str, Any],
+    *,
+    llm_on: bool,
+    title_prefix: str,
+) -> str | None:
+    """上架标题：优先 ``name_ko``；LLM 开启时不用 ``name_zh`` 顶替，无韩文则返回 None。"""
+    llm_data = rec.get("listing_llm") if isinstance(rec.get("listing_llm"), dict) else {}
+    if llm_on:
+        from product_feed_kr.listing_llm_enrich import listing_llm_name_ko_usable
+
+        nk = str(llm_data.get("name_ko") or "").strip()
+        if listing_llm_name_ko_usable(llm_data):
+            base = nk
+        else:
+            return None
+    else:
+        base = str(prod.get("title") or "").strip()
+    if not base:
+        return None
+    return f"{title_prefix}{base}" if title_prefix else base
 
 
 def _ko_option_pairs_from_attr_map(attr_map_ko: dict[str, Any] | None) -> list[tuple[str, str]]:
@@ -380,7 +416,16 @@ def itemform_preview_dict_from_store_record(
 
     prod = parse_wego_product(com, default_price_if_missing=default_price)
 
-    upload_title = f"{title_prefix}{prod['title']}" if title_prefix else prod["title"]
+    llm_on = _cfg_bool("OPENAI_ENRICH_LISTING", True)
+    upload_title = _upload_title_from_record(
+        record,
+        prod,
+        llm_on=llm_on,
+        title_prefix=title_prefix,
+    )
+    preview_title_fallback = upload_title is None
+    if upload_title is None:
+        upload_title = f"{title_prefix}{prod['title']}" if title_prefix else prod["title"]
     desc_html = _desc_html_for_store_record(
         desc_template.strip(),
         prod,
@@ -394,6 +439,14 @@ def itemform_preview_dict_from_store_record(
     img_slots: dict[str, str] = {f"it_img{i}": urls[i - 1] for i in range(1, len(urls) + 1)}
 
     warnings: list[str] = []
+    if preview_title_fallback and llm_on:
+        from product_feed_kr.listing_llm_enrich import listing_llm_name_ko_usable
+
+        llm_data = record.get("listing_llm") if isinstance(record.get("listing_llm"), dict) else {}
+        if not listing_llm_name_ko_usable(llm_data):
+            warnings.append(
+                "缺少韩文 name_ko：预览暂用原标题，实际上架会跳过；请运行 llm_enrich_sqlite.bat 补译",
+            )
     if not urls:
         warnings.append("无 imgsSrc/imgs 可用 URL：上架时会因无主图跳过本条")
 
@@ -868,6 +921,11 @@ def _upload_skip_reason(
         return "llm_not_processed"
     if llm_on and not _llm_cny_usable(llm_data):
         return "llm_price_unusable"
+    if llm_on:
+        from product_feed_kr.listing_llm_enrich import listing_llm_name_ko_usable
+
+        if not listing_llm_name_ko_usable(llm_data):
+            return "llm_name_ko_missing"
     gname = str(rec.get("wecatalog_group") or "")
     tname = str(rec.get("wecatalog_tag") or "")
     if not (resolve_seven17_ca_id(gname, tname) or "").strip():
@@ -937,7 +995,7 @@ def _log_upload_pending(
     if thread_label:
         kv.append(("thread", thread_label))
     if last_goods_id:
-        kv.append(("last_goods_id", last_goods_id[:36]))
+        kv.append(("last_goods_id", pf_goods_id({"goods_id": last_goods_id})))
     if last_outcome:
         kv.append(("last_outcome", last_outcome))
     _log.info("%s", pf_kv(kv, zh="待上传商品数"))
@@ -1086,10 +1144,20 @@ def _process_upload_record(
             },
         )
 
-    nk = (llm_data.get("name_ko") or "").strip()
-    nz = (llm_data.get("name_zh") or "").strip()
-    base_title = nk or nz or prod["title"]
-    upload_title = f"{ctx.title_prefix}{base_title}" if ctx.title_prefix else base_title
+    upload_title = _upload_title_from_record(
+        rec,
+        prod,
+        llm_on=ctx.llm_on,
+        title_prefix=ctx.title_prefix,
+    )
+    if upload_title is None:
+        return (
+            "fail",
+            {
+                "goods_id": gid,
+                "error": "缺少韩文商品名 name_ko：请运行 LLM 补译，勿用中文名上架",
+            },
+        )
     desc_ko = str(llm_data.get("desc_ko") or "").strip()
     if desc_ko:
         desc_html = _desc_html_from_llm_ko(desc_ko)
@@ -1109,7 +1177,7 @@ def _process_upload_record(
             [
                 *th_kv,
                 ("event", "desc.source"),
-                ("goods_id", gid[:36]),
+                *pf_store_row_id_kv(rec),
                 ("source", desc_src),
                 ("desc_len", len(desc_html)),
             ],
@@ -1214,7 +1282,7 @@ def _process_upload_record(
         if ok_submit:
             if ctx.write_back:
                 rec["uploaded_to_platform"] = True
-                rec["seven17_uploaded_at"] = datetime.now(timezone.utc).isoformat()
+                rec["seven17_uploaded_at"] = now_cst8_iso()
                 sqlite_mark_uploaded(conn, aid, rec)
             row_out: dict[str, Any] = {
                 "ok": True,
@@ -1605,332 +1673,40 @@ def upload_from_wecatalog_store(
     return stats
 
 
-def _record_needs_llm_api(rec: dict[str, Any]) -> bool:
-    """是否仍需调用 LLM API（已写回 llm_processed_at 且未强制刷新则跳过）。"""
-    from product_feed_kr.listing_llm_enrich import listing_llm_force_refresh
-
-    if listing_llm_force_refresh():
-        return True
-    existing = rec.get("listing_llm")
-    if isinstance(existing, dict) and rec.get("llm_processed_at"):
-        return False
-    return True
+def _loop_log_basename(args: argparse.Namespace) -> str:
+    if args.dry_run:
+        return "seven17_upload_dryrun"
+    return "seven17_upload"
 
 
-def _load_llm_work_rows(
-    conn: Any,
-    album_id: str,
-    *,
-    include_uploaded: bool,
-    pending_only: bool,
-    limit: int | None,
-) -> tuple[list[tuple[dict[str, Any], dict[str, Any]]], int, int]:
-    """从 SQLite 加载待 LLM 的 (record, commodity)；返回 (rows, 库内总条数, 无详情跳过数)。"""
-    from product_feed_kr.store_sqlite import sqlite_load_products_for_upload
-
-    items = sqlite_load_products_for_upload(conn, album_id, skip_uploaded=not include_uploaded)
-    rows: list[tuple[dict[str, Any], dict[str, Any]]] = []
-    skipped_no_detail = 0
-    for rec in items:
-        if not isinstance(rec, dict):
-            continue
-        com = commodity_from_wecatalog_record(rec)
-        if not isinstance(com, dict):
-            skipped_no_detail += 1
-            continue
-        if pending_only and not _record_needs_llm_api(rec):
-            continue
-        rows.append((rec, com))
-        if isinstance(limit, int) and limit > 0 and len(rows) >= limit:
-            break
-    return rows, len(items), skipped_no_detail
-
-
-def _llm_row_key(rec: dict[str, Any]) -> tuple[str, int]:
-    gid = str(rec.get("goods_id") or "")
-    try:
-        tag_id = int(rec.get("tag_id") or 0)
-    except (TypeError, ValueError):
-        tag_id = 0
-    return (gid, tag_id)
-
-
-def _claim_next_llm_work_item(
-    conn: Any,
-    album_id: str,
-    *,
-    include_uploaded: bool,
-    claim_lock: threading.Lock,
-    in_flight: set[tuple[str, int]],
-) -> tuple[dict[str, Any], dict[str, Any]] | None:
-    """在锁内读库，返回第一条待 LLM 且未被本 run 其它线程占用的记录。"""
-    from product_feed_kr.store_sqlite import sqlite_load_products_for_upload
-
-    with claim_lock:
-        items = sqlite_load_products_for_upload(conn, album_id, skip_uploaded=not include_uploaded)
-        for rec in items:
-            if not isinstance(rec, dict):
-                continue
-            key = _llm_row_key(rec)
-            if key in in_flight:
-                continue
-            if not _record_needs_llm_api(rec):
-                continue
-            com = commodity_from_wecatalog_record(rec)
-            if not isinstance(com, dict):
-                continue
-            in_flight.add(key)
-            return rec, com
-    return None
-
-
-def _run_llm_multithread_claim_loop(
-    album_id: str,
-    *,
-    include_uploaded: bool,
-    limit: int | None,
-    restart_after: int,
-) -> tuple[int, bool]:
-    """每个 API key 一线程；每次 LLM 完成后重新读库取下一条待处理记录。"""
-    from product_feed_kr.listing_llm_enrich import enrich_record_listing_llm, listing_llm_api_profiles
-    from product_feed_kr.store_sqlite import connect_sqlite, sqlite_update_product_row
-
-    profiles = listing_llm_api_profiles()
-    if len(profiles) <= 1:
-        raise ValueError("multithread claim loop 需要 OPENAI_API_KEY 为至少 2 个 key 的数组")
-
-    aid = album_id.strip()
-    claim_lock = threading.Lock()
-    in_flight: set[tuple[str, int]] = set()
-    updated_lock = threading.Lock()
-    updated_total = 0
-    restart_fresh = False
-    stop_event = threading.Event()
-
-    _log.info(
-        "%s",
-        pf_kv(
-            [
-                ("event", "llm.threads.start"),
-                ("mode", "claim_next"),
-                ("threads", len(profiles)),
-                ("labels", ",".join(p["label"] for p in profiles)),
-            ],
-            zh="多线程 LLM：每次 API 响应后重新读库取下一条",
-        ),
-    )
-
-    def _worker(profile: Any) -> None:
-        nonlocal updated_total, restart_fresh
-        conn = connect_sqlite()
+def _run_once(args: argparse.Namespace) -> int:
+    """单次上架 run（不含进程锁与 argparse）。"""
+    aid = (args.album_id or _cfg_get("WECATALOG_ALBUM_ID") or "").strip()
+    if args.preview_index is not None:
         try:
-            while not stop_event.is_set():
-                with updated_lock:
-                    if isinstance(limit, int) and limit > 0 and updated_total >= limit:
-                        stop_event.set()
-                        break
-                item = _claim_next_llm_work_item(
-                    conn,
-                    aid,
-                    include_uploaded=include_uploaded,
-                    claim_lock=claim_lock,
-                    in_flight=in_flight,
-                )
-                if item is None:
-                    break
-                rec, com = item
-                key = _llm_row_key(rec)
-                gid_short = str(rec.get("goods_id") or "")[:36]
-                wrote = False
-                try:
-                    if enrich_record_listing_llm(rec, com, api_profile=profile):
-                        sqlite_update_product_row(conn, aid, rec)
-                        wrote = True
-                        with updated_lock:
-                            updated_total += 1
-                            if restart_after > 0 and updated_total >= restart_after:
-                                restart_fresh = True
-                                stop_event.set()
-                                _log.info(
-                                    "%s",
-                                    pf_kv(
-                                        [
-                                            ("event", "llm.restart_after"),
-                                            ("rows_updated", updated_total),
-                                            ("restart_after", restart_after),
-                                            ("thread", profile["label"]),
-                                        ],
-                                        zh="已达 LLM 写回条数阈值，结束各线程",
-                                    ),
-                                )
-                except Exception as e:
-                    _log.warning(
-                        "%s",
-                        pf_kv(
-                            [
-                                ("event", "llm.item.error"),
-                                ("goods_id", gid_short),
-                                ("thread", profile["label"]),
-                                ("err", str(e)),
-                            ],
-                            zh="单条 LLM 失败，本 run 不再重试该条",
-                        ),
-                    )
-                finally:
-                    if wrote:
-                        with claim_lock:
-                            in_flight.discard(key)
-        finally:
-            conn.close()
+            print_store_sqlite_itemform_preview(aid, index=args.preview_index)
+            return 0
+        except Exception as e:
+            print(json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False), file=sys.stderr)
+            return 1
 
-    threads = [
-        threading.Thread(
-            target=_worker,
-            args=(profile,),
-            name=f"llm-{profile['label']}",
-            daemon=True,
-        )
-        for profile in profiles
-    ]
-    for t in threads:
-        t.start()
-    for t in threads:
-        t.join()
-
-    _log.info(
-        "%s",
-        pf_kv(
-            [
-                ("event", "llm.threads.done"),
-                ("rows_updated", updated_total),
-                ("restart_fresh", restart_fresh),
-            ],
-            zh="多线程 LLM 本 run 结束",
-        ),
-    )
-    return updated_total, restart_fresh
-
-
-def enrich_llm_for_sqlite_records(
-    album_id: str,
-    *,
-    limit: int | None = None,
-    include_uploaded: bool = False,
-) -> dict[str, Any]:
-    """仅对 SQLite 现有记录执行 LLM enrich 并写回，不登录后台、不提交上架。"""
-    from product_feed_kr.listing_llm_enrich import (
-        enrich_records_listing_llm_batch,
-        listing_llm_api_profiles,
-        listing_llm_batch_size,
-        listing_llm_enabled,
-    )
-
-    aid = album_id.strip()
-    if not aid:
-        raise ValueError("album_id 不能为空")
-    _configure_upload_stderr_logging()
-
-    if not listing_llm_enabled():
-        return {
-            "ok": False,
-            "error": "LLM 未启用：请设置 OPENAI_API_KEY（并确保 OPENAI_ENRICH_LISTING=true）",
-        }
-
-    from product_feed_kr.store_sqlite import (
-        connect_sqlite,
-        ensure_sqlite_schema,
-        sqlite_update_product_row,
-    )
-
-    conn = connect_sqlite()
     try:
-        ensure_sqlite_schema(conn)
-        batch_size = listing_llm_batch_size()
-        restart_after_llm = restart_after_n("LISTING_LLM_RESTART_AFTER_ITEMS", 1000)
-        api_profiles = listing_llm_api_profiles()
-        updated_total = 0
-        restart_fresh = False
-        rows_total = 0
-        rows_eligible = 0
-        skipped_no_detail = 0
-
-        if len(api_profiles) > 1:
-            _, rows_total, skipped_no_detail = _load_llm_work_rows(
-                conn,
-                aid,
-                include_uploaded=include_uploaded,
-                pending_only=False,
-                limit=None,
-            )
-            pending_rows, _, _ = _load_llm_work_rows(
-                conn,
-                aid,
-                include_uploaded=include_uploaded,
-                pending_only=True,
-                limit=None,
-            )
-            rows_eligible = len(pending_rows)
-            if not pending_rows:
-                _log.info(
-                    "%s",
-                    pf_kv([("event", "llm.empty")], zh="无待 LLM 处理的记录"),
-                )
-            else:
-                updated_total, restart_fresh = _run_llm_multithread_claim_loop(
-                    aid,
-                    include_uploaded=include_uploaded,
-                    limit=limit,
-                    restart_after=restart_after_llm,
-                )
-        else:
-            rows, rows_total, skipped_no_detail = _load_llm_work_rows(
-                conn,
-                aid,
-                include_uploaded=include_uploaded,
-                pending_only=False,
-                limit=limit if isinstance(limit, int) and limit > 0 else None,
-            )
-            rows_eligible = len(rows)
-            updated_total = 0
-            restart_fresh = False
-            profile = api_profiles[0] if api_profiles else None
-            for i in range(0, len(rows), batch_size):
-                chunk = rows[i : i + batch_size]
-                changed = enrich_records_listing_llm_batch(
-                    chunk,
-                    batch_size=batch_size,
-                    api_profile=profile,
-                )
-                for rec in changed:
-                    sqlite_update_product_row(conn, aid, rec)
-                updated_total += len(changed)
-                if restart_after_llm > 0 and updated_total >= restart_after_llm:
-                    restart_fresh = True
-                    _log.info(
-                        "%s",
-                        pf_kv(
-                            [
-                                ("event", "llm.restart_after"),
-                                ("rows_updated", updated_total),
-                                ("restart_after", restart_after_llm),
-                                ("exit", EXIT_RESTART_FRESH_DATA),
-                            ],
-                            zh="已达配置的 LLM 写回条数阈值，结束本进程以便外层重跑",
-                        ),
-                    )
-                    break
-
-        return {
-            "ok": True,
-            "album_id": aid,
-            "rows_total": rows_total,
-            "rows_eligible": rows_eligible,
-            "rows_updated": updated_total,
-            "rows_skipped_no_detail": skipped_no_detail,
-            "restart_fresh": restart_fresh,
-        }
-    finally:
-        conn.close()
+        stats = upload_from_wecatalog_store(
+            aid,
+            limit=args.limit,
+            dry_run=args.dry_run,
+            skip_uploaded=not args.include_uploaded,
+            write_back=args.write_back,
+            keep_open=args.keep_open,
+        )
+        print(json.dumps({"ok": stats["fail"] == 0, **stats}, ensure_ascii=False))
+        if stats.get("restart_fresh"):
+            reload_seven17_config()
+            return EXIT_RESTART_FRESH_DATA
+        return 0 if stats["fail"] == 0 else 2
+    except Exception as e:
+        print(json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False), file=sys.stderr)
+        return 1
 
 
 def main() -> int:
@@ -1951,7 +1727,7 @@ def main() -> int:
     parser.add_argument(
         "--include-uploaded",
         action="store_true",
-        help="仍处理 seven17_uploaded_at 非空（已上传平台）的记录；仅 llm-only 建议使用",
+        help="仍处理 seven17_uploaded_at 非空（已上传平台）的记录",
     )
     parser.add_argument(
         "--write-back",
@@ -1977,61 +1753,68 @@ def main() -> int:
     parser.add_argument(
         "--llm-only",
         action="store_true",
-        help="仅对 SQLite 现有记录执行 LLM enrich 并写回，不登录后台、不提交上架",
+        help=argparse.SUPPRESS,
     )
+    parser.add_argument(
+        "--log-file",
+        type=Path,
+        default=None,
+        help="日志文件（UTF-8）；常驻模式下未指定则 data/logs/{任务}_{时间}.log",
+    )
+    parser.add_argument(
+        "--once",
+        action="store_true",
+        help="只执行一轮后退出（默认循环直至 Ctrl+C）",
+    )
+    parser.add_argument("-v", "--verbose", action="store_true", help="DEBUG 级别")
     args = parser.parse_args()
 
+    if args.llm_only:
+        _log.warning(
+            "%s",
+            pf_kv(
+                [("event", "llm_only.deprecated")],
+                zh="--llm-only 已移除，请改用 python -m product_feed_kr.seven17_llm 或 llm_enrich_sqlite.bat",
+            ),
+        )
+        from product_feed_kr import seven17_llm
+
+        return seven17_llm.main()
+
     _stdout_utf8()
-    _configure_upload_stderr_logging()
+    repeat = not args.once and args.preview_index is None
+    log_file = args.log_file
+    if repeat and log_file is None:
+        log_file = default_log_path(_loop_log_basename(args))
+    _init_upload_logging(log_file=log_file, verbose=args.verbose)
+
     aid = (args.album_id or _cfg_get("WECATALOG_ALBUM_ID") or "").strip()
     if not aid:
         parser.error(
             "缺少相册 ID：请传入 --album-id，或在 config/seven17.json / 环境变量中设置 WECATALOG_ALBUM_ID"
             "（与抓取店铺 URL 中的 albumId 一致）。",
         )
-    if args.preview_index is not None:
-        try:
-            print_store_sqlite_itemform_preview(aid, index=args.preview_index)
-            return 0
-        except Exception as e:
-            print(json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False), file=sys.stderr)
-            return 1
-    if args.llm_only:
-        try:
-            with single_instance_lock("seven17_llm_enrich"):
-                out = enrich_llm_for_sqlite_records(
-                    aid,
-                    limit=args.limit,
-                    include_uploaded=args.include_uploaded,
-                )
-            print(json.dumps(out, ensure_ascii=False))
-            if out.get("restart_fresh"):
-                reload_seven17_config()
-                return EXIT_RESTART_FRESH_DATA
-            return 0 if out.get("ok") else 2
-        except Exception as e:
-            print(json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False), file=sys.stderr)
-            return 1
 
+    lock_name = "seven17_upload_session"
     try:
-        with single_instance_lock("seven17_upload_session"):
-            stats = upload_from_wecatalog_store(
-                aid,
-                limit=args.limit,
-                dry_run=args.dry_run,
-                skip_uploaded=not args.include_uploaded,
-                write_back=args.write_back,
-                keep_open=args.keep_open,
-            )
-        print(json.dumps({"ok": stats["fail"] == 0, **stats}, ensure_ascii=False))
-        if stats.get("restart_fresh"):
-            reload_seven17_config()
-            return EXIT_RESTART_FRESH_DATA
-        return 0 if stats["fail"] == 0 else 2
-    except Exception as e:
-        print(json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False), file=sys.stderr)
-        return 1
+        with single_instance_lock(lock_name):
+            if repeat:
+                return run_forever(
+                    lambda: _run_once(args),
+                    task_label=lock_name,
+                    logger=_log,
+                    on_restart_fresh=reload_seven17_config,
+                    round_delay_sec=0.0,
+                )
+            return _run_once(args)
+    except SystemExit as e:
+        if e.code == EXIT_SINGLETON_CONFLICT:
+            return EXIT_SINGLETON_CONFLICT
+        raise
 
+
+# 兼容旧 import：from product_feed_kr.seven17_upload import enrich_llm_for_sqlite_records
+from product_feed_kr.seven17_llm import enrich_llm_for_sqlite_records  # noqa: E402,F401
 
 if __name__ == "__main__":
     raise SystemExit(main())

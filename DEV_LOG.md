@@ -58,9 +58,7 @@
 
 本仓库已有 **`product_feed_kr/seven17_config.py`**：**环境变量优先**，其次 **`config/seven17.json`**（勿提交真实密钥）。建议在示例里增加与 VLM 同语义的键（见仓库根目录 **`config/seven17.example.json`**）：
 
-- **`OPENAI_BASE_URL`**（或沿用对方命名 **`VLM_BASE_URL`**，只要在代码里 `getenv` 一致即可）：兼容接口根地址，例如 `https://api.openai.com/v1` 或国内兼容网关给出的 `/v1` 前缀 URL。
-- **`OPENAI_API_KEY`**：API Key。**更推荐只写在环境变量或本机 `seven17.json`，不要提交 Git。**
-- **`OPENAI_MODEL`**：模型名，如 `gpt-4o-mini`、`qwen-turbo`（视网关而定）。
+- **`OPENAI_PROFILES`**：JSON 数组，每项 `{ label?, base_url, model?, api_key }` 或 `{ api_keys: [...] }`（同 base_url 多 key 多线程）。勿提交真实密钥。
 
 可选：在项目根使用 **`.env`** + `python-dotenv`，与 `delivery-slip-vlm` 一致；本仓库若未全局 `load_dotenv`，需在入口脚本里调用一次，或在 shell / systemd 里 `export`。
 
@@ -69,9 +67,7 @@
 ```python
 from openai import OpenAI
 
-api_key = ...   # getenv("OPENAI_API_KEY")
-base_url = ...  # getenv("OPENAI_BASE_URL") 或 None 表示官方默认
-client = OpenAI(api_key=api_key, base_url=base_url)
+# 见 listing_llm_enrich.listing_llm_api_profiles() → OpenAI(api_key=..., base_url=...)
 resp = client.chat.completions.create(
     model="gpt-4o-mini",
     messages=[

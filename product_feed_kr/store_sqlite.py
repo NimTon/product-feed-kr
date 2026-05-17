@@ -16,11 +16,97 @@ from typing import Any
 
 from filelock import FileLock
 
+from product_feed_kr.pf_log import pf_db_row_id_kv, pf_kv
+from product_feed_kr.pf_time import SQLITE_NOW_CST8
 from product_feed_kr.seven17_config import getenv as _cfg_get
 
-logger = logging.getLogger(__name__)
+_log = logging.getLogger("product_feed_kr.store_sqlite")
 
 _SCHEMA_PATH = Path(__file__).resolve().parent.parent / "sql" / "schema_pf_sqlite.sql"
+
+# 与 schema_pf_sqlite.sql 一致；整型/时间列靠前
+_CREATE_PF_STORE_INFO = """
+CREATE TABLE pf_store_info (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  skip_detail INTEGER NOT NULL DEFAULT 0,
+  detail_delay_sec REAL NOT NULL DEFAULT 5,
+  last_saved_at TEXT,
+  updated_at TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
+  album_id TEXT NOT NULL UNIQUE,
+  store_url TEXT NOT NULL,
+  trans_lang TEXT NOT NULL DEFAULT 'zh',
+  stats_json TEXT
+)
+"""
+
+_CREATE_PF_STORE_ITEM = """
+CREATE TABLE pf_store_item (
+  id INTEGER PRIMARY KEY AUTOINCREMENT,
+  tag_id INTEGER NOT NULL DEFAULT 0,
+  llm_attempt_count INTEGER NOT NULL DEFAULT 0,
+  uploaded_to_platform INTEGER NOT NULL DEFAULT 0,
+  created_at TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
+  updated_at TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
+  llm_processed_at TEXT,
+  seven17_uploaded_at TEXT,
+  album_id TEXT NOT NULL,
+  goods_id TEXT NOT NULL,
+  wecatalog_group TEXT NOT NULL DEFAULT '',
+  wecatalog_tag TEXT NOT NULL DEFAULT '',
+  shop_category_path_json TEXT,
+  goods_url TEXT NOT NULL,
+  commodity_title TEXT NOT NULL DEFAULT '',
+  commodity_price_raw TEXT,
+  commodity_goods_num TEXT,
+  commodity_image_urls_json TEXT,
+  commodity_tag_names_json TEXT,
+  fx_krw_per_cny REAL,
+  price_krw TEXT,
+  attr_map_json TEXT,
+  attr_map_ko_json TEXT,
+  llm_name_zh TEXT,
+  llm_name_ko TEXT,
+  llm_desc_zh TEXT,
+  llm_desc_ko TEXT,
+  product_desc_html TEXT,
+  detail_response_json TEXT,
+  listing_llm_json TEXT,
+  UNIQUE (album_id, goods_id, tag_id)
+)
+"""
+
+_PF_STORE_ITEM_COLS: tuple[str, ...] = (
+    "id",
+    "tag_id",
+    "llm_attempt_count",
+    "uploaded_to_platform",
+    "created_at",
+    "updated_at",
+    "llm_processed_at",
+    "seven17_uploaded_at",
+    "album_id",
+    "goods_id",
+    "wecatalog_group",
+    "wecatalog_tag",
+    "shop_category_path_json",
+    "goods_url",
+    "commodity_title",
+    "commodity_price_raw",
+    "commodity_goods_num",
+    "commodity_image_urls_json",
+    "commodity_tag_names_json",
+    "fx_krw_per_cny",
+    "price_krw",
+    "attr_map_json",
+    "attr_map_ko_json",
+    "llm_name_zh",
+    "llm_name_ko",
+    "llm_desc_zh",
+    "llm_desc_ko",
+    "product_desc_html",
+    "detail_response_json",
+    "listing_llm_json",
+)
 
 
 def sqlite_db_path() -> Path:
@@ -46,12 +132,176 @@ def connect_sqlite() -> sqlite3.Connection:
     return conn
 
 
+def _table_columns(conn: sqlite3.Connection, table: str) -> set[str]:
+    cur = conn.execute(f"PRAGMA table_info({table})")
+    return {str(r[1]) for r in cur.fetchall()}
+
+
+def _table_column_names(conn: sqlite3.Connection, table: str) -> list[str]:
+    cur = conn.execute(f"PRAGMA table_info({table})")
+    return [str(r[1]) for r in cur.fetchall()]
+
+
+def _select_expr_from_old(col: str, old_names: set[str], *, table: str) -> str:
+    """从旧表 SELECT 表达式（按列名映射到新表顺序）。"""
+    if col in old_names:
+        return col
+    if col == "llm_attempt_count":
+        if "llm_fail_count" in old_names:
+            return "COALESCE(llm_fail_count, 0)"
+        return "0"
+    if col in ("created_at", "updated_at"):
+        return f"datetime('now', '+8 hours')"
+    if col == "id" and "id" not in old_names:
+        return "rowid"
+    return "NULL"
+
+
+def _rebuild_pf_store_item_layout(conn: sqlite3.Connection) -> None:
+    names = _table_column_names(conn, "pf_store_item")
+    if len(names) > 1 and names[1] == "tag_id":
+        return
+    old_names = set(names)
+    conn.execute("ALTER TABLE pf_store_item RENAME TO pf_store_item__layout_old")
+    conn.execute(_CREATE_PF_STORE_ITEM)
+    insert_cols = ", ".join(_PF_STORE_ITEM_COLS)
+    select_list = ", ".join(_select_expr_from_old(c, old_names, table="item") for c in _PF_STORE_ITEM_COLS)
+    conn.execute(
+        f"INSERT INTO pf_store_item ({insert_cols}) SELECT {select_list} FROM pf_store_item__layout_old",
+    )
+    conn.execute("DROP TABLE pf_store_item__layout_old")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pf_item_upload ON pf_store_item (album_id, uploaded_to_platform)",
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pf_item_goods ON pf_store_item (album_id, goods_id)",
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pf_item_album ON pf_store_item (album_id)",
+    )
+
+
+def _rebuild_pf_store_info_layout(conn: sqlite3.Connection) -> None:
+    info_cols = (
+        "id",
+        "skip_detail",
+        "detail_delay_sec",
+        "last_saved_at",
+        "updated_at",
+        "album_id",
+        "store_url",
+        "trans_lang",
+        "stats_json",
+    )
+    names = _table_column_names(conn, "pf_store_info")
+    if len(names) > 1 and names[1] == "skip_detail":
+        return
+    old_names = set(names)
+    conn.execute("ALTER TABLE pf_store_info RENAME TO pf_store_info__layout_old")
+    conn.execute(_CREATE_PF_STORE_INFO)
+    insert_cols = ", ".join(info_cols)
+    select_list = ", ".join(_select_expr_from_old(c, old_names, table="info") for c in info_cols)
+    conn.execute(
+        f"INSERT INTO pf_store_info ({insert_cols}) SELECT {select_list} FROM pf_store_info__layout_old",
+    )
+    conn.execute("DROP TABLE pf_store_info__layout_old")
+
+
+def _migrate_sqlite_columns(conn: sqlite3.Connection) -> None:
+    cur = conn.execute("PRAGMA table_info(pf_store_item)")
+    cols = {str(r[1]) for r in cur.fetchall()}
+    if "llm_attempt_count" not in cols:
+        if "llm_fail_count" in cols:
+            conn.execute(
+                "ALTER TABLE pf_store_item ADD COLUMN llm_attempt_count INTEGER NOT NULL DEFAULT 0",
+            )
+            conn.execute(
+                "UPDATE pf_store_item SET llm_attempt_count = COALESCE(llm_fail_count, 0)",
+            )
+        else:
+            conn.execute(
+                "ALTER TABLE pf_store_item ADD COLUMN llm_attempt_count INTEGER NOT NULL DEFAULT 0",
+            )
+
+
+def _migrate_store_info_to_int_pk(conn: sqlite3.Connection) -> None:
+    if "id" in _table_columns(conn, "pf_store_info"):
+        return
+    conn.execute("ALTER TABLE pf_store_info RENAME TO pf_store_info__old")
+    conn.execute(_CREATE_PF_STORE_INFO)
+    conn.execute(
+        """
+        INSERT INTO pf_store_info (
+          id, skip_detail, detail_delay_sec, last_saved_at, updated_at,
+          album_id, store_url, trans_lang, stats_json
+        )
+        SELECT
+          rowid, skip_detail, detail_delay_sec, last_saved_at, updated_at,
+          album_id, store_url, trans_lang, stats_json
+        FROM pf_store_info__old
+        """,
+    )
+    conn.execute("DROP TABLE pf_store_info__old")
+
+
+def _migrate_store_item_to_int_pk(conn: sqlite3.Connection) -> None:
+    if "id" in _table_columns(conn, "pf_store_item"):
+        return
+    conn.execute("ALTER TABLE pf_store_item RENAME TO pf_store_item__old")
+    conn.execute(_CREATE_PF_STORE_ITEM)
+    old_names = set(_table_column_names(conn, "pf_store_item__old"))
+    insert_cols = ", ".join(_PF_STORE_ITEM_COLS)
+    select_list = ", ".join(_select_expr_from_old(c, old_names, table="item") for c in _PF_STORE_ITEM_COLS)
+    conn.execute(
+        f"INSERT INTO pf_store_item ({insert_cols}) SELECT {select_list} FROM pf_store_item__old",
+    )
+    conn.execute("DROP TABLE pf_store_item__old")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pf_item_upload ON pf_store_item (album_id, uploaded_to_platform)",
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pf_item_goods ON pf_store_item (album_id, goods_id)",
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pf_item_album ON pf_store_item (album_id)",
+    )
+
+
+def _migrate_int_pk(conn: sqlite3.Connection) -> None:
+    _migrate_store_info_to_int_pk(conn)
+    _migrate_store_item_to_int_pk(conn)
+    _rebuild_pf_store_info_layout(conn)
+    _rebuild_pf_store_item_layout(conn)
+
+
+def _lookup_store_info_id(conn: sqlite3.Connection, album_id: str) -> int | None:
+    cur = conn.execute("SELECT id FROM pf_store_info WHERE album_id = ? LIMIT 1", (album_id,))
+    row = cur.fetchone()
+    return int(row[0]) if row else None
+
+
+def _lookup_item_id(
+    conn: sqlite3.Connection,
+    album_id: str,
+    goods_id: str,
+    tag_id: int,
+) -> int | None:
+    cur = conn.execute(
+        "SELECT id FROM pf_store_item WHERE album_id = ? AND goods_id = ? AND tag_id = ? LIMIT 1",
+        (album_id, goods_id, tag_id),
+    )
+    row = cur.fetchone()
+    return int(row[0]) if row else None
+
+
 def ensure_sqlite_schema(conn: sqlite3.Connection) -> None:
     if not _SCHEMA_PATH.is_file():
         raise FileNotFoundError(f"未找到建表脚本: {_SCHEMA_PATH}")
     sql = _SCHEMA_PATH.read_text(encoding="utf-8")
     with _write_lock(sqlite_db_path()):
         conn.executescript(sql)
+        _migrate_sqlite_columns(conn)
+        _migrate_int_pk(conn)
         conn.commit()
 
 
@@ -191,10 +441,17 @@ def row_to_product_record(row: dict[str, Any]) -> dict[str, Any]:
         "tag_id": int(row["tag_id"]),
         "goods_url": row["goods_url"],
         "goods_id": row["goods_id"],
+    }
+    if row.get("id") is not None:
+        try:
+            rec["id"] = int(row["id"])
+        except (TypeError, ValueError):
+            pass
+    rec.update({
         "uploaded_to_platform": bool(row["uploaded_to_platform"]),
         "seven17_uploaded_at": (str(row.get("seven17_uploaded_at")).strip() if row.get("seven17_uploaded_at") is not None else None),
         "detail_response": detail_response,
-    }
+    })
     scp = row.get("shop_category_path_json")
     if isinstance(scp, str) and scp.strip():
         try:
@@ -249,7 +506,75 @@ def row_to_product_record(row: dict[str, Any]) -> dict[str, Any]:
         "product_desc_html": (str(row.get("product_desc_html")) if row.get("product_desc_html") is not None else None),
     }
     rec["llm_processed_at"] = rec["commodity_min"]["llm_processed_at"]
+    try:
+        raw_ac = row.get("llm_attempt_count")
+        if raw_ac is None:
+            raw_ac = row.get("llm_fail_count")
+        rec["llm_attempt_count"] = int(raw_ac or 0)
+    except (TypeError, ValueError):
+        rec["llm_attempt_count"] = 0
     return rec
+
+
+def _llm_attempt_count_for_db(rec: dict[str, Any]) -> int:
+    try:
+        raw = rec.get("llm_attempt_count")
+        if raw is None:
+            raw = rec.get("llm_fail_count")
+        return max(0, int(raw or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def scrape_detail_ready(rec: dict[str, Any]) -> bool:
+    """抓取入库：仅当 ``detail_response`` 含有效 ``result.commodity`` 时写 ``pf_store_item``。"""
+    dr = rec.get("detail_response")
+    if not isinstance(dr, dict):
+        return False
+    if dr.get("errcode") not in (0, None):
+        return False
+    res = dr.get("result")
+    if not isinstance(res, dict):
+        return False
+    return isinstance(res.get("commodity"), dict)
+
+
+def sqlite_count_store_items(conn: sqlite3.Connection, album_id: str) -> int:
+    cur = conn.execute(
+        "SELECT COUNT(*) FROM pf_store_item WHERE album_id = ?",
+        (album_id,),
+    )
+    row = cur.fetchone()
+    return int(row[0]) if row else 0
+
+
+def sqlite_load_existing_goods_ids(conn: sqlite3.Connection, album_id: str) -> tuple[set[str], int]:
+    """返回 (已有 goods_id 集合, 库内商品行数)；不加载整行，避免 checkpoint 用旧快照覆盖 LLM。"""
+    total = sqlite_count_store_items(conn, album_id)
+    cur = conn.execute(
+        "SELECT DISTINCT goods_id FROM pf_store_item WHERE album_id = ?",
+        (album_id,),
+    )
+    skip_ids: set[str] = set()
+    for r in cur.fetchall():
+        gid = r[0]
+        if isinstance(gid, str) and gid.strip():
+            skip_ids.add(gid.strip())
+    store_id = _lookup_store_info_id(conn, album_id)
+    _log.info(
+        "%s",
+        pf_kv(
+            [
+                ("event", "db.read"),
+                ("op", "load_existing_goods_ids"),
+                *pf_db_row_id_kv(row_id=store_id),
+                ("distinct_goods_id", len(skip_ids)),
+                ("rows", total),
+            ],
+            zh="读库：仅载入已有 goods_id（用于跳过，不载入整行）",
+        ),
+    )
+    return skip_ids, total
 
 
 def sqlite_load_existing_products(conn: sqlite3.Connection, album_id: str) -> tuple[list[dict[str, Any]], set[str]]:
@@ -267,6 +592,20 @@ def sqlite_load_existing_products(conn: sqlite3.Connection, album_id: str) -> tu
     )
     for row in cur.fetchall():
         records.append(row_to_product_record(_row_to_dict(row)))
+    store_id = _lookup_store_info_id(conn, album_id)
+    _log.info(
+        "%s",
+        pf_kv(
+            [
+                ("event", "db.read"),
+                ("op", "load_existing_products"),
+                *pf_db_row_id_kv(row_id=store_id),
+                ("rows", len(records)),
+                ("distinct_goods_id", len(skip_ids)),
+            ],
+            zh="读库：载入本店已有商品",
+        ),
+    )
     return records, skip_ids
 
 
@@ -286,10 +625,25 @@ def sqlite_load_products_for_upload(
             "SELECT * FROM pf_store_item WHERE album_id = ? ORDER BY goods_id, tag_id",
             (album_id,),
         )
-    return [row_to_product_record(_row_to_dict(r)) for r in cur.fetchall()]
+    rows = [row_to_product_record(_row_to_dict(r)) for r in cur.fetchall()]
+    store_id = _lookup_store_info_id(conn, album_id)
+    _log.info(
+        "%s",
+        pf_kv(
+            [
+                ("event", "db.read"),
+                ("op", "load_products_for_upload"),
+                *pf_db_row_id_kv(row_id=store_id),
+                ("skip_uploaded", 1 if skip_uploaded else 0),
+                ("rows", len(rows)),
+            ],
+            zh="读库：载入待上架/处理商品列表",
+        ),
+    )
+    return rows
 
 
-def sqlite_checkpoint(
+def sqlite_write_store_meta(
     conn: sqlite3.Connection,
     album_id: str,
     *,
@@ -298,15 +652,15 @@ def sqlite_checkpoint(
     detail_delay_sec: float,
     skip_detail: bool,
     meta_extra: dict[str, Any],
-    records: list[dict[str, Any]],
 ) -> None:
+    """仅更新 ``pf_store_info``（进度/统计），不写商品行。"""
     db_path = sqlite_db_path()
     saved_at = str(meta_extra.get("saved_at") or "")
     stats = meta_extra.get("stats")
     stats_json = json.dumps(stats, ensure_ascii=False) if isinstance(stats, dict) else None
     with _write_lock(db_path):
         conn.execute(
-            """
+            f"""
             INSERT INTO pf_store_info (
               album_id, store_url, trans_lang, detail_delay_sec, skip_detail, last_saved_at, stats_json
             )
@@ -318,7 +672,7 @@ def sqlite_checkpoint(
               skip_detail = excluded.skip_detail,
               last_saved_at = excluded.last_saved_at,
               stats_json = excluded.stats_json,
-              updated_at = datetime('now')
+              updated_at = {SQLITE_NOW_CST8}
             """,
             (
                 album_id,
@@ -330,16 +684,42 @@ def sqlite_checkpoint(
                 stats_json,
             ),
         )
-        sql_prod = """
+        conn.commit()
+    store_id = _lookup_store_info_id(conn, album_id)
+    _log.info(
+        "%s",
+        pf_kv(
+            [
+                ("event", "db.write"),
+                ("op", "store_meta"),
+                *pf_db_row_id_kv(row_id=store_id),
+            ],
+            zh="写库：店铺元信息",
+        ),
+    )
+
+
+def sqlite_upsert_scrape_items(
+    conn: sqlite3.Connection,
+    album_id: str,
+    records: list[dict[str, Any]],
+) -> int:
+    """仅 upsert 本批已抓到有效详情的商品行；不触碰仅有 goods_id、无详情的记录。"""
+    to_write = [rec for rec in records if scrape_detail_ready(rec)]
+    if not to_write:
+        return 0
+    db_path = sqlite_db_path()
+    with _write_lock(db_path):
+        sql_prod = f"""
             INSERT INTO pf_store_item (
               album_id, goods_id, tag_id, wecatalog_group, wecatalog_tag,
               shop_category_path_json, goods_url, uploaded_to_platform, seven17_uploaded_at,
               commodity_title, commodity_price_raw, commodity_goods_num,
               commodity_image_urls_json, commodity_tag_names_json,
               fx_krw_per_cny, price_krw, attr_map_json, attr_map_ko_json,
-              llm_name_zh, llm_name_ko, llm_desc_zh, llm_desc_ko, llm_processed_at, product_desc_html,
-              detail_response_json, listing_llm_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+              llm_name_zh, llm_name_ko, llm_desc_zh, llm_desc_ko, llm_processed_at, llm_attempt_count,
+              product_desc_html, detail_response_json, listing_llm_json
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(album_id, goods_id, tag_id) DO UPDATE SET
               wecatalog_group = excluded.wecatalog_group,
               wecatalog_tag = excluded.wecatalog_tag,
@@ -352,24 +732,26 @@ def sqlite_checkpoint(
               commodity_goods_num = excluded.commodity_goods_num,
               commodity_image_urls_json = excluded.commodity_image_urls_json,
               commodity_tag_names_json = excluded.commodity_tag_names_json,
-              fx_krw_per_cny = excluded.fx_krw_per_cny,
-              price_krw = excluded.price_krw,
-              attr_map_json = excluded.attr_map_json,
-              attr_map_ko_json = excluded.attr_map_ko_json,
-              llm_name_zh = excluded.llm_name_zh,
-              llm_name_ko = excluded.llm_name_ko,
-              llm_desc_zh = excluded.llm_desc_zh,
-              llm_desc_ko = excluded.llm_desc_ko,
-              llm_processed_at = excluded.llm_processed_at,
-              product_desc_html = excluded.product_desc_html,
+              fx_krw_per_cny = COALESCE(excluded.fx_krw_per_cny, pf_store_item.fx_krw_per_cny),
+              price_krw = COALESCE(excluded.price_krw, pf_store_item.price_krw),
+              attr_map_json = COALESCE(excluded.attr_map_json, pf_store_item.attr_map_json),
+              attr_map_ko_json = COALESCE(excluded.attr_map_ko_json, pf_store_item.attr_map_ko_json),
+              llm_name_zh = COALESCE(excluded.llm_name_zh, pf_store_item.llm_name_zh),
+              llm_name_ko = COALESCE(excluded.llm_name_ko, pf_store_item.llm_name_ko),
+              llm_desc_zh = COALESCE(excluded.llm_desc_zh, pf_store_item.llm_desc_zh),
+              llm_desc_ko = COALESCE(excluded.llm_desc_ko, pf_store_item.llm_desc_ko),
+              llm_processed_at = COALESCE(excluded.llm_processed_at, pf_store_item.llm_processed_at),
+              llm_attempt_count = pf_store_item.llm_attempt_count,
+              product_desc_html = COALESCE(excluded.product_desc_html, pf_store_item.product_desc_html),
               detail_response_json = excluded.detail_response_json,
-              listing_llm_json = excluded.listing_llm_json,
-              updated_at = datetime('now')
+              listing_llm_json = COALESCE(excluded.listing_llm_json, pf_store_item.listing_llm_json),
+              updated_at = {SQLITE_NOW_CST8}
             """
-        for rec in records:
+        for rec in to_write:
             dr = rec.get("detail_response")
-            dr_json = json.dumps(dr, ensure_ascii=False) if isinstance(dr, dict) else None
-            mins = _extract_min_fields_from_detail(dr if isinstance(dr, dict) else None)
+            assert isinstance(dr, dict)
+            dr_json = json.dumps(dr, ensure_ascii=False)
+            mins = _extract_min_fields_from_detail(dr)
             ll = rec.get("listing_llm")
             ll_json = json.dumps(ll, ensure_ascii=False) if isinstance(ll, dict) else None
             enrich = _extract_enriched_fields(rec)
@@ -380,11 +762,12 @@ def sqlite_checkpoint(
                 tag_id = int(tid) if tid is not None else 0
             except (TypeError, ValueError):
                 tag_id = 0
+            gid = str(rec.get("goods_id") or "")
             conn.execute(
                 sql_prod,
                 (
                     album_id,
-                    str(rec.get("goods_id") or ""),
+                    gid,
                     tag_id,
                     str(rec.get("wecatalog_group") or ""),
                     str(rec.get("wecatalog_tag") or ""),
@@ -406,12 +789,65 @@ def sqlite_checkpoint(
                     enrich["llm_desc_zh"],
                     enrich["llm_desc_ko"],
                     enrich["llm_processed_at"],
+                    _llm_attempt_count_for_db(rec),
                     enrich["product_desc_html"],
                     dr_json,
                     ll_json,
                 ),
             )
+            item_id = _lookup_item_id(conn, album_id, gid, tag_id)
+            if item_id is not None:
+                rec["id"] = item_id
+            _log.info(
+                "%s",
+                pf_kv(
+                    [
+                        ("event", "db.write"),
+                        ("op", "upsert_item"),
+                        *pf_db_row_id_kv(rec, row_id=item_id),
+                    ],
+                    zh="写库：upsert 商品行",
+                ),
+            )
         conn.commit()
+    store_id = _lookup_store_info_id(conn, album_id)
+    _log.info(
+        "%s",
+        pf_kv(
+            [
+                ("event", "db.write"),
+                ("op", "upsert_scrape_items_done"),
+                *pf_db_row_id_kv(row_id=store_id),
+                ("rows", len(to_write)),
+            ],
+            zh="写库：本批详情入库完成",
+        ),
+    )
+    return len(to_write)
+
+
+def sqlite_checkpoint(
+    conn: sqlite3.Connection,
+    album_id: str,
+    *,
+    store_url: str,
+    trans_lang: str,
+    detail_delay_sec: float,
+    skip_detail: bool,
+    meta_extra: dict[str, Any],
+    records: list[dict[str, Any]],
+) -> int:
+    """店铺元信息 + 仅写入 ``records`` 中已含有效详情的行。返回本批写入商品行数。"""
+    sqlite_write_store_meta(
+        conn,
+        album_id,
+        store_url=store_url,
+        trans_lang=trans_lang,
+        detail_delay_sec=detail_delay_sec,
+        skip_detail=skip_detail,
+        meta_extra=meta_extra,
+    )
+    return sqlite_upsert_scrape_items(conn, album_id, records)
 
 
 def sqlite_update_product_row(conn: sqlite3.Connection, album_id: str, rec: dict[str, Any]) -> None:
@@ -427,33 +863,35 @@ def sqlite_update_product_row(conn: sqlite3.Connection, album_id: str, rec: dict
     uploaded = 1 if rec.get("uploaded_to_platform") is True else 0
     uploaded_at = (str(rec.get("seven17_uploaded_at")).strip() if rec.get("seven17_uploaded_at") else None)
     gid = str(rec.get("goods_id") or "")
+    attempt_count = _llm_attempt_count_for_db(rec)
     db_path = sqlite_db_path()
     with _write_lock(db_path):
         if isinstance(dr, dict):
             mins = _extract_min_fields_from_detail(dr)
             conn.execute(
-                """
+                f"""
                 UPDATE pf_store_item SET
                   commodity_title = ?,
                   commodity_price_raw = ?,
                   commodity_goods_num = ?,
                   commodity_image_urls_json = ?,
                   commodity_tag_names_json = ?,
-                  fx_krw_per_cny = ?,
-                  price_krw = ?,
-                  attr_map_json = ?,
-                  attr_map_ko_json = ?,
-                  llm_name_zh = ?,
-                  llm_name_ko = ?,
-                  llm_desc_zh = ?,
-                  llm_desc_ko = ?,
-                  llm_processed_at = ?,
-                  product_desc_html = ?,
+                  fx_krw_per_cny = COALESCE(?, fx_krw_per_cny),
+                  price_krw = COALESCE(?, price_krw),
+                  attr_map_json = COALESCE(?, attr_map_json),
+                  attr_map_ko_json = COALESCE(?, attr_map_ko_json),
+                  llm_name_zh = COALESCE(?, llm_name_zh),
+                  llm_name_ko = COALESCE(?, llm_name_ko),
+                  llm_desc_zh = COALESCE(?, llm_desc_zh),
+                  llm_desc_ko = COALESCE(?, llm_desc_ko),
+                  llm_processed_at = COALESCE(?, llm_processed_at),
+                  llm_attempt_count = ?,
+                  product_desc_html = COALESCE(?, product_desc_html),
                   detail_response_json = ?,
-                  listing_llm_json = ?,
+                  listing_llm_json = COALESCE(?, listing_llm_json),
                   uploaded_to_platform = ?,
                   seven17_uploaded_at = ?,
-                  updated_at = datetime('now')
+                  updated_at = {SQLITE_NOW_CST8}
                 WHERE album_id = ? AND goods_id = ? AND tag_id = ?
                 """,
                 (
@@ -471,6 +909,7 @@ def sqlite_update_product_row(conn: sqlite3.Connection, album_id: str, rec: dict
                     enrich["llm_desc_zh"],
                     enrich["llm_desc_ko"],
                     enrich["llm_processed_at"],
+                    attempt_count,
                     enrich["product_desc_html"],
                     json.dumps(dr, ensure_ascii=False),
                     ll_json,
@@ -483,22 +922,23 @@ def sqlite_update_product_row(conn: sqlite3.Connection, album_id: str, rec: dict
             )
         elif ll_json is not None:
             conn.execute(
-                """
+                f"""
                 UPDATE pf_store_item SET
                   listing_llm_json = ?,
-                  fx_krw_per_cny = ?,
-                  price_krw = ?,
-                  attr_map_json = ?,
-                  attr_map_ko_json = ?,
-                  llm_name_zh = ?,
-                  llm_name_ko = ?,
-                  llm_desc_zh = ?,
-                  llm_desc_ko = ?,
-                  llm_processed_at = ?,
-                  product_desc_html = ?,
+                  fx_krw_per_cny = COALESCE(?, fx_krw_per_cny),
+                  price_krw = COALESCE(?, price_krw),
+                  attr_map_json = COALESCE(?, attr_map_json),
+                  attr_map_ko_json = COALESCE(?, attr_map_ko_json),
+                  llm_name_zh = COALESCE(?, llm_name_zh),
+                  llm_name_ko = COALESCE(?, llm_name_ko),
+                  llm_desc_zh = COALESCE(?, llm_desc_zh),
+                  llm_desc_ko = COALESCE(?, llm_desc_ko),
+                  llm_processed_at = COALESCE(?, llm_processed_at),
+                  llm_attempt_count = ?,
+                  product_desc_html = COALESCE(?, product_desc_html),
                   uploaded_to_platform = ?,
                   seven17_uploaded_at = ?,
-                  updated_at = datetime('now')
+                  updated_at = {SQLITE_NOW_CST8}
                 WHERE album_id = ? AND goods_id = ? AND tag_id = ?
                 """,
                 (
@@ -512,6 +952,7 @@ def sqlite_update_product_row(conn: sqlite3.Connection, album_id: str, rec: dict
                     enrich["llm_desc_zh"],
                     enrich["llm_desc_ko"],
                     enrich["llm_processed_at"],
+                    attempt_count,
                     enrich["product_desc_html"],
                     uploaded,
                     uploaded_at,
@@ -522,19 +963,20 @@ def sqlite_update_product_row(conn: sqlite3.Connection, album_id: str, rec: dict
             )
         else:
             conn.execute(
-                """
+                f"""
                 UPDATE pf_store_item SET
-                  fx_krw_per_cny = ?,
-                  price_krw = ?,
-                  llm_name_zh = ?,
-                  llm_name_ko = ?,
-                  llm_desc_zh = ?,
-                  llm_desc_ko = ?,
-                  llm_processed_at = ?,
-                  product_desc_html = ?,
+                  fx_krw_per_cny = COALESCE(?, fx_krw_per_cny),
+                  price_krw = COALESCE(?, price_krw),
+                  llm_name_zh = COALESCE(?, llm_name_zh),
+                  llm_name_ko = COALESCE(?, llm_name_ko),
+                  llm_desc_zh = COALESCE(?, llm_desc_zh),
+                  llm_desc_ko = COALESCE(?, llm_desc_ko),
+                  llm_processed_at = COALESCE(?, llm_processed_at),
+                  llm_attempt_count = ?,
+                  product_desc_html = COALESCE(?, product_desc_html),
                   uploaded_to_platform = ?,
                   seven17_uploaded_at = ?,
-                  updated_at = datetime('now')
+                  updated_at = {SQLITE_NOW_CST8}
                 WHERE album_id = ? AND goods_id = ? AND tag_id = ?
                 """,
                 (
@@ -545,6 +987,7 @@ def sqlite_update_product_row(conn: sqlite3.Connection, album_id: str, rec: dict
                     enrich["llm_desc_zh"],
                     enrich["llm_desc_ko"],
                     enrich["llm_processed_at"],
+                    attempt_count,
                     enrich["product_desc_html"],
                     uploaded,
                     uploaded_at,
@@ -554,6 +997,22 @@ def sqlite_update_product_row(conn: sqlite3.Connection, album_id: str, rec: dict
                 ),
             )
         conn.commit()
+    item_id = rec.get("id")
+    if item_id is None:
+        item_id = _lookup_item_id(conn, album_id, gid, tag_id)
+        if item_id is not None:
+            rec["id"] = item_id
+    _log.info(
+        "%s",
+        pf_kv(
+            [
+                ("event", "db.write"),
+                ("op", "update_product_row"),
+                *pf_db_row_id_kv(rec, row_id=item_id if isinstance(item_id, int) else None),
+            ],
+            zh="写库：更新商品行",
+        ),
+    )
 
 
 def sqlite_mark_uploaded(conn: sqlite3.Connection, album_id: str, rec: dict[str, Any]) -> None:
@@ -565,24 +1024,66 @@ def sqlite_mark_uploaded(conn: sqlite3.Connection, album_id: str, rec: dict[str,
     db_path = sqlite_db_path()
     with _write_lock(db_path):
         conn.execute(
-            """
+            f"""
             UPDATE pf_store_item SET
               uploaded_to_platform = 1,
-              seven17_uploaded_at = datetime('now'),
-              updated_at = datetime('now')
+              seven17_uploaded_at = {SQLITE_NOW_CST8},
+              updated_at = {SQLITE_NOW_CST8}
             WHERE album_id = ? AND goods_id = ? AND tag_id = ?
             """,
             (album_id, str(rec.get("goods_id") or ""), tag_id),
         )
         conn.commit()
+    item_id = rec.get("id")
+    if item_id is None:
+        item_id = _lookup_item_id(conn, album_id, str(rec.get("goods_id") or ""), tag_id)
+        if item_id is not None:
+            rec["id"] = item_id
+    _log.info(
+        "%s",
+        pf_kv(
+            [
+                ("event", "db.write"),
+                ("op", "mark_uploaded"),
+                *pf_db_row_id_kv(rec, row_id=item_id if isinstance(item_id, int) else None),
+            ],
+            zh="写库：标记已上架",
+        ),
+    )
 
 
 def sqlite_load_store_snapshot(conn: sqlite3.Connection, album_id: str) -> dict[str, Any] | None:
     cur = conn.execute("SELECT * FROM pf_store_info WHERE album_id = ? LIMIT 1", (album_id,))
     row = cur.fetchone()
     if not row:
+        store_id = _lookup_store_info_id(conn, album_id)
+        _log.info(
+            "%s",
+            pf_kv(
+                [
+                    ("event", "db.read"),
+                    ("op", "load_store_snapshot"),
+                    *pf_db_row_id_kv(row_id=store_id),
+                    ("found", 0),
+                ],
+                zh="读库：店铺快照不存在",
+            ),
+        )
         return None
     d = _row_to_dict(row)
+    store_id = int(d["id"]) if d.get("id") is not None else None
+    _log.info(
+        "%s",
+        pf_kv(
+            [
+                ("event", "db.read"),
+                ("op", "load_store_snapshot"),
+                *pf_db_row_id_kv(row_id=store_id),
+                ("found", 1),
+            ],
+            zh="读库：店铺快照",
+        ),
+    )
     stats: dict[str, Any] | None = None
     if isinstance(d.get("stats_json"), str) and str(d.get("stats_json") or "").strip():
         try:

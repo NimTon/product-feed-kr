@@ -14,14 +14,14 @@ import re
 import time
 import urllib.error
 import urllib.request
-from datetime import datetime, timezone
+from product_feed_kr.pf_time import now_cst8_iso
 from typing import Any, TypedDict
 from urllib.parse import urlparse
 
 from product_feed_kr.seven17_config import bool_env as _cfg_bool
 from product_feed_kr.seven17_config import getenv as _cfg_get
 from product_feed_kr.seven17_config import load_seven17_config
-from product_feed_kr.pf_log import log_item_separator, pf_kv
+from product_feed_kr.pf_log import log_item_separator, pf_goods_id, pf_kv, pf_store_row_id_kv
 
 _log = logging.getLogger(__name__)
 
@@ -136,7 +136,7 @@ _SYSTEM = """你是电商商品信息抽取助手。只输出一个 JSON 对象�
   - **鞋类**（标题含鞋/靴/运动鞋 등）：`사이즈` 请用韩国通贩 **毫米脚长**（230、235…）；欧码两位数字可先写欧码，后处理会换算毫米。
   - 无对应项时填 {} 或省略 key。
 - name_zh：字符串，必须精简为核心中文商品名（尽量 8~20 字），去掉营销词、emoji、口号、重复品牌/型号堆砌。
-- name_ko：字符串，韩文精简商品名（尽量 8~24 字），同样去掉营销冗余；不确定可留空字符串 ""。
+- name_ko：字符串，韩文精简商品名（尽量 8~24 字），同样去掉营销冗余。**只要输出了非空的 name_zh，就必须同时给出对应的韩文 name_ko（不得留空）**；仅当整段标题无法提炼中文名时才允许 name_ko 为 ""。
 - desc_zh：字符串，来自标题原文的中文描述提取与轻润色（建议 2~5 句，约 80~220 字）。
   - 尽量保留原文里的核心信息：款式/设计/搭配/赠品等；颜色若已在 attr_map 中列出，描述里不必重复罗列色表。
   - 不确定或原文缺失的信息不要补写。
@@ -168,7 +168,7 @@ _SYSTEM_BATCH = """你是电商商品信息抽取助手。输入是一个 JSON �
 - cny_price：字符串或 null。能确定人民币售价时填数字字符串；完全无法判断填 null，不要猜价。
 - attr_map：仅 **颜色**、**尺码** 两个中文 key；无则 {} 或省略键。尺码值不要带「码」字后缀；「012码」类可写 ["S","M","L"] 或数字串（后处理按位展开）。
 - attr_map_ko：仅 **색상**、**사이즈**；与 attr_map 颜色/尺码一一对应（顺序一致）。鞋类 `사이즈` 用毫米脚长。
-- name_zh / name_ko / desc_zh / desc_ko 同单条模式。
+- name_zh / name_ko / desc_zh / desc_ko 同单条模式；有 name_zh 时 name_ko 必填韩文译名。
 - 只输出 JSON，不要 Markdown、不要额外解释。
 """
 
@@ -422,14 +422,50 @@ def apply_listing_llm_price_to_commodity(commodity: dict[str, Any], listing_llm:
     commodity["optimaPrice"] = s
 
 
-def listing_llm_cny_usable(listing_llm: dict[str, Any]) -> bool:
-    """是否为 ``source=openai`` 且 ``cny_price`` 非空（价格值以 LLM 原样为准）。"""
-    if listing_llm.get("source") != "openai":
+def listing_llm_name_ko_usable(listing_llm: dict[str, Any] | None) -> bool:
+    """``name_ko`` 非空且含韩文字符（上架标题用，不用 ``name_zh`` 顶替）。"""
+    if not isinstance(listing_llm, dict):
         return False
-    cp = listing_llm.get("cny_price")
+    nk = str(listing_llm.get("name_ko") or "").strip()
+    if not nk:
+        return False
+    return any("\uac00" <= ch <= "\ud7a3" for ch in nk)
+
+
+def listing_llm_needs_name_ko(
+    listing_llm: dict[str, Any] | None,
+    *,
+    title: str = "",
+) -> bool:
+    """已有 LLM 结果但缺可用韩文标题，且仍有中文名或原标题可译。"""
+    if listing_llm_name_ko_usable(listing_llm):
+        return False
+    if not isinstance(listing_llm, dict):
+        return bool(str(title or "").strip())
+    src = str(listing_llm.get("name_zh") or "").strip() or str(title or "").strip()
+    return bool(src)
+
+
+def _cny_price_field_usable(cp: Any) -> bool:
     if cp is None:
         return False
-    return bool(str(cp).strip() and str(cp).strip().lower() != "null" and str(cp).strip() != "-1")
+    s = str(cp).strip()
+    return bool(s and s.lower() != "null" and s != "-1")
+
+
+def listing_llm_cny_usable(listing_llm: dict[str, Any]) -> bool:
+    """``cny_price`` 可用；达次数上限但已保留价格时仍可上架。"""
+    if not isinstance(listing_llm, dict):
+        return False
+    if not _cny_price_field_usable(listing_llm.get("cny_price")):
+        return False
+    src = str(listing_llm.get("source") or "")
+    reason = str(listing_llm.get("reason") or "")
+    if src == "openai":
+        return True
+    if reason in (LLM_EXHAUSTED_REASON, "max_attempts"):
+        return True
+    return False
 
 
 def parse_listing_llm_response(text: str, *, listing_hint: str | None = None) -> dict[str, Any]:
@@ -448,6 +484,144 @@ def listing_llm_enabled() -> bool:
 
 def listing_llm_force_refresh() -> bool:
     return _cfg_bool("OPENAI_LISTING_LLM_FORCE", False)
+
+
+LLM_SKIP_SOURCE = "llm_skipped"
+LLM_EXHAUSTED_REASON = "max_attempts"
+
+
+def listing_llm_max_attempts() -> int:
+    """单商品累计 LLM 处理次数上限（``LISTING_LLM_MAX_ATTEMPTS``，默认 3）。"""
+    raw = (_cfg_get("LISTING_LLM_MAX_ATTEMPTS") or _cfg_get("LISTING_LLM_FAIL_SKIP_AFTER") or "3").strip()
+    try:
+        n = int(raw)
+    except ValueError:
+        n = 3
+    return max(1, n)
+
+
+def record_llm_attempt_count(rec: dict[str, Any]) -> int:
+    try:
+        raw = rec.get("llm_attempt_count")
+        if raw is None:
+            raw = rec.get("llm_fail_count")
+        return max(0, int(raw or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
+def listing_llm_attempts_exhausted(rec: dict[str, Any]) -> bool:
+    """已达 LLM 处理次数上限，不再处理、不可上架。"""
+    return record_llm_attempt_count(rec) >= listing_llm_max_attempts()
+
+
+def listing_llm_is_gave_up(rec: dict[str, Any]) -> bool:
+    """已达 LLM 次数上限，或旧版 ``llm_skipped`` 永久跳过。"""
+    if listing_llm_attempts_exhausted(rec):
+        return True
+    ll = rec.get("listing_llm")
+    if not isinstance(ll, dict) or str(ll.get("source") or "") != LLM_SKIP_SOURCE:
+        return False
+    return bool(rec.get("llm_processed_at"))
+
+
+def listing_llm_needs_api(rec: dict[str, Any]) -> bool:
+    if listing_llm_force_refresh():
+        return True
+    if listing_llm_attempts_exhausted(rec):
+        return False
+    if listing_llm_is_gave_up(rec):
+        return False
+    existing = rec.get("listing_llm")
+    if isinstance(existing, dict) and rec.get("llm_processed_at"):
+        from product_feed_kr.wecatalog_store_record import commodity_from_wecatalog_record
+
+        com = commodity_from_wecatalog_record(rec)
+        title = str(com.get("title") or "").strip() if isinstance(com, dict) else ""
+        if listing_llm_needs_name_ko(existing, title=title):
+            return True
+        return False
+    return True
+
+
+def note_llm_attempt_consumed(record: dict[str, Any], *, error: str | None = None) -> bool:
+    """
+    本条计为 1 次 LLM 处理（成功/失败均计数，不重置）。
+    达上限后写入 ``listing_llm``（source=llm_skipped）并标记 ``llm_processed_at``。
+    返回 True 表示已达上限。
+    """
+    cap = listing_llm_max_attempts()
+    n = record_llm_attempt_count(record) + 1
+    record["llm_attempt_count"] = n
+    record.pop("llm_fail_count", None)
+
+    last_errors: list[str] = []
+    prev = record.get("listing_llm")
+    if isinstance(prev, dict) and isinstance(prev.get("last_errors"), list):
+        last_errors = [str(x) for x in prev["last_errors"] if str(x).strip()]
+    if error:
+        last_errors.append(str(error)[:500])
+    last_errors = last_errors[-3:]
+
+    if n >= cap:
+        now = now_cst8_iso()
+        prev_ll = record.get("listing_llm") if isinstance(record.get("listing_llm"), dict) else {}
+        record["listing_llm"] = {
+            **prev_ll,
+            "source": prev_ll.get("source") or LLM_SKIP_SOURCE,
+            "reason": LLM_EXHAUSTED_REASON,
+            "attempt_count": n,
+            "max_attempts": cap,
+            "last_errors": last_errors,
+            "processed_at": now,
+        }
+        record["llm_processed_at"] = now
+        _log.warning(
+            "%s",
+            pf_kv(
+                [
+                    ("event", "llm.attempts.exhausted"),
+                    *pf_store_row_id_kv(record),
+                    ("attempt_count", n),
+                    ("max_attempts", cap),
+                    ("cny_ok", 1 if listing_llm_cny_usable(record["listing_llm"]) else 0),
+                    ("name_ko_ok", 1 if listing_llm_name_ko_usable(record["listing_llm"]) else 0),
+                ],
+                zh="LLM 处理次数已达上限，不再处理；字段齐全时仍可上架",
+            ),
+        )
+        return True
+
+    if error:
+        _log.warning(
+            "%s",
+            pf_kv(
+                [
+                    ("event", "llm.attempt"),
+                    *pf_store_row_id_kv(record),
+                    ("attempt_count", n),
+                    ("max_attempts", cap),
+                    ("err", error),
+                ],
+                zh="LLM 本条已计入处理次数",
+            ),
+        )
+    return False
+
+
+def record_after_llm_attempt(
+    record: dict[str, Any],
+    commodity: dict[str, Any],
+    *,
+    ok: bool,
+    error: str | None = None,
+) -> bool:
+    """处理单次 LLM 结果；返回是否应将 record 写回 SQLite。"""
+    note_llm_attempt_consumed(record, error=None if ok else error)
+    ll = record.get("listing_llm")
+    if isinstance(ll, dict):
+        apply_listing_llm_price_to_commodity(commodity, ll)
+    return True
 
 
 def listing_llm_batch_size() -> int:
@@ -474,59 +648,158 @@ def _cfg_raw(key: str) -> Any:
     return cfg.get(key)
 
 
-def _default_openai_profile_fields() -> tuple[str | None, str]:
-    base = (_cfg_get("OPENAI_BASE_URL") or "").strip() or None
-    model = (_cfg_get("OPENAI_MODEL") or "").strip() or "gpt-4o-mini"
-    return base, model
-
-
-def _openai_api_keys_from_config() -> list[str]:
-    """``OPENAI_API_KEY``：字符串为单 key；JSON 数组则每项一个 key（每项对应一个 LLM 工作线程）。"""
-    raw = _cfg_raw("OPENAI_API_KEY")
-    keys: list[str] = []
+def _coerce_json_array(raw: Any) -> list[Any]:
     if isinstance(raw, list):
-        for item in raw:
-            k = str(item).strip()
-            if k:
-                keys.append(k)
-        return keys
+        return raw
+    if isinstance(raw, dict):
+        return [raw]
     if not isinstance(raw, str):
-        return keys
+        return []
     t = raw.strip()
     if not t:
+        return []
+    if not t.startswith("["):
+        return []
+    try:
+        parsed = json.loads(t)
+    except json.JSONDecodeError:
+        return []
+    if isinstance(parsed, list):
+        return parsed
+    if isinstance(parsed, dict):
+        return [parsed]
+    return []
+
+
+def _api_keys_from_profile_item(item: dict[str, Any]) -> list[str]:
+    """单项内 ``api_key`` 或 ``api_keys`` / ``keys`` 数组。"""
+    keys: list[str] = []
+    raw_list = item.get("api_keys")
+    if raw_list is None:
+        raw_list = item.get("keys")
+    if isinstance(raw_list, list):
+        for entry in raw_list:
+            k = str(entry).strip()
+            if k:
+                keys.append(k)
+    if keys:
         return keys
-    if t.startswith("["):
-        try:
-            parsed = json.loads(t)
-            if isinstance(parsed, list):
-                for item in parsed:
-                    k = str(item).strip()
-                    if k:
-                        keys.append(k)
-                return keys
-        except json.JSONDecodeError:
-            pass
-    keys.append(t)
+    single = str(item.get("api_key") or item.get("key") or "").strip()
+    if single:
+        keys.append(single)
     return keys
 
 
-def listing_llm_api_profiles() -> list[ListingLlmApiProfile]:
-    """
-    从 ``OPENAI_API_KEY`` 解析：单个字符串 → 1 线程；JSON 数组 → 数组长度个线程（共用 ``OPENAI_BASE_URL`` / ``OPENAI_MODEL``）。
-    """
-    default_base, default_model = _default_openai_profile_fields()
-    keys = _openai_api_keys_from_config()
+def _profiles_from_mapping(
+    item: dict[str, Any],
+    *,
+    index: int,
+    multi_groups: bool,
+) -> list[ListingLlmApiProfile]:
+    """同一 ``base_url`` 下可写多个 ``api_keys``，展开为多个工作线程。"""
+    api_keys = _api_keys_from_profile_item(item)
+    if not api_keys:
+        return []
+    base_raw = item.get("base_url") if item.get("base_url") is not None else item.get("baseURL")
+    base = str(base_raw).strip() if base_raw is not None else ""
+    if not base:
+        _log.warning(
+            "%s",
+            pf_kv(
+                [("event", "llm.profile.skip"), ("reason", "missing_base_url"), ("index", index)],
+                zh="OPENAI_PROFILES 某项缺少 base_url，已跳过",
+            ),
+        )
+        return []
+    model_raw = item.get("model")
+    model = str(model_raw).strip() if model_raw is not None and str(model_raw).strip() else "gpt-4o-mini"
+    label_raw = item.get("label")
+    if label_raw is not None and str(label_raw).strip():
+        label_base = str(label_raw).strip()
+    elif multi_groups or len(api_keys) > 1:
+        host = urlparse(base or "").netloc if base else "default"
+        label_base = f"{host or 'default'}-{index}"
+    else:
+        label_base = "default"
+    multi_keys = len(api_keys) > 1
     profiles: list[ListingLlmApiProfile] = []
-    for i, key in enumerate(keys):
+    for ki, api_key in enumerate(api_keys):
+        if multi_keys:
+            label = f"{label_base}-{ki}"
+        else:
+            label = label_base
         profiles.append(
-            ListingLlmApiProfile(
-                label=f"thread-{i}" if len(keys) > 1 else "default",
-                api_key=key,
-                base_url=default_base,
-                model=default_model,
-            )
+            ListingLlmApiProfile(label=label, api_key=api_key, base_url=base, model=model),
         )
     return profiles
+
+
+def _openai_profiles_from_openai_profiles_key() -> list[ListingLlmApiProfile]:
+    """``OPENAI_PROFILES``：对象数组；每项可含 api_key 或 api_keys[]、base_url、model、label。"""
+    raw = _cfg_raw("OPENAI_PROFILES")
+    items = _coerce_json_array(raw)
+    if not items:
+        return []
+    profiles: list[ListingLlmApiProfile] = []
+    dict_items = [x for x in items if isinstance(x, dict)]
+    multi_groups = len(dict_items) > 1 or any(
+        len(_api_keys_from_profile_item(x)) > 1 for x in dict_items
+    )
+    group_i = 0
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        profiles.extend(
+            _profiles_from_mapping(item, index=group_i, multi_groups=multi_groups),
+        )
+        group_i += 1
+    return profiles
+
+
+def listing_llm_api_profiles() -> list[ListingLlmApiProfile]:
+    """从 ``OPENAI_PROFILES`` 解析；每项可 ``api_keys: [..]`` 共享同一 base_url/model。每个 api_key 一线程。"""
+    return _openai_profiles_from_openai_profiles_key()
+
+
+def listing_llm_all_profile_slots() -> list[ListingLlmApiProfile]:
+    """配置中的全部厂商槽位（含未填 api_key 的项，每项至少一条），供对比脚本列出计划。"""
+    raw = _cfg_raw("OPENAI_PROFILES")
+    items = _coerce_json_array(raw)
+    if not items:
+        return []
+    slots: list[ListingLlmApiProfile] = []
+    dict_items = [x for x in items if isinstance(x, dict)]
+    multi_groups = len(dict_items) > 1 or any(
+        len(_api_keys_from_profile_item(x)) > 1 for x in dict_items
+    )
+    group_i = 0
+    for item in items:
+        if not isinstance(item, dict):
+            continue
+        expanded = _profiles_from_mapping(item, index=group_i, multi_groups=multi_groups)
+        if expanded:
+            slots.extend(expanded)
+        else:
+            base_raw = item.get("base_url") if item.get("base_url") is not None else item.get("baseURL")
+            base = str(base_raw).strip() if base_raw is not None else ""
+            model_raw = item.get("model")
+            model = str(model_raw).strip() if model_raw is not None and str(model_raw).strip() else "gpt-4o-mini"
+            label_raw = item.get("label")
+            label = str(label_raw).strip() if label_raw is not None and str(label_raw).strip() else f"slot-{group_i}"
+            slots.append(
+                ListingLlmApiProfile(label=label, api_key="", base_url=base or None, model=model),
+            )
+        group_i += 1
+    return slots
+
+
+def _resolve_api_profile(api_profile: ListingLlmApiProfile | None) -> ListingLlmApiProfile:
+    if api_profile is not None:
+        return api_profile
+    profiles = listing_llm_api_profiles()
+    if not profiles:
+        raise RuntimeError("OPENAI_PROFILES 未配置或没有有效的 api_key/base_url")
+    return profiles[0]
 
 
 def listing_llm_thread_count() -> int:
@@ -605,16 +878,12 @@ def _openai_client(
     *,
     api_profile: ListingLlmApiProfile | None = None,
 ):
-    if api_profile is not None:
-        api_key = api_profile["api_key"].strip()
-        base_url = api_profile.get("base_url")
-        model = api_profile.get("model") or "gpt-4o-mini"
-    else:
-        api_key = (_cfg_get("OPENAI_API_KEY") or "").strip()
-        base_url = (_cfg_get("OPENAI_BASE_URL") or "").strip() or None
-        model = (_cfg_get("OPENAI_MODEL") or "").strip() or "gpt-4o-mini"
+    prof = _resolve_api_profile(api_profile)
+    api_key = prof["api_key"].strip()
+    base_url = prof.get("base_url")
+    model = prof.get("model") or "gpt-4o-mini"
     if not api_key:
-        raise RuntimeError("OPENAI_API_KEY 为空")
+        raise RuntimeError("OPENAI_PROFILES 某项 api_key 为空")
     try:
         from openai import OpenAI
     except ImportError as e:
@@ -623,6 +892,98 @@ def _openai_client(
     bu = (base_url or "").strip()
     host = urlparse(bu).netloc if bu else "default"
     return client, model, host
+
+
+_SYSTEM_NAME_KO_ONLY = """你是电商标题翻译助手。只输出一个 JSON 对象，不要 Markdown。
+格式：{"name_ko":"韩文精简商品名"}
+将输入的中文商品名译为韩文标题（约 8~24 字），去掉营销词与 emoji，不新增原文没有的信息。"""
+
+
+def _parse_name_ko_only_response(content: str) -> str:
+    raw = _strip_json_fence(content)
+    data = json.loads(raw)
+    if not isinstance(data, dict):
+        return ""
+    nk = data.get("name_ko")
+    t = str(nk).strip() if nk is not None else ""
+    t = re.sub(r"[\u200b\ufeff]", "", t)
+    t = " ".join(t.split())
+    if len(t) > 30:
+        t = t[:30].rstrip(" ,-/|")
+    return t
+
+
+def _translate_name_to_ko(
+    source_text: str,
+    *,
+    timeout: float | None = None,
+    api_profile: ListingLlmApiProfile | None = None,
+) -> str | None:
+    """将中文商品名译为韩文 ``name_ko``；失败返回 None。"""
+    src = str(source_text or "").strip()
+    if not src:
+        return None
+    client, model, host = _openai_client(timeout, api_profile=api_profile)
+    use_response_format = "dashscope.aliyuncs.com" not in host.lower()
+    messages = [
+        {"role": "system", "content": _SYSTEM_NAME_KO_ONLY},
+        {"role": "user", "content": f"中文商品名：\n{src}"},
+    ]
+    content, _elapsed_ms = _chat_once_json(
+        client,
+        model=model,
+        messages=messages,
+        use_response_format=use_response_format,
+    )
+    nk = _parse_name_ko_only_response(content)
+    if nk and listing_llm_name_ko_usable({"name_ko": nk}):
+        return nk
+    return None
+
+
+def ensure_listing_llm_name_ko(
+    record: dict[str, Any],
+    commodity: dict[str, Any],
+    *,
+    timeout: float | None = None,
+    api_profile: ListingLlmApiProfile | None = None,
+    count_attempt: bool = True,
+) -> bool:
+    """若 ``listing_llm`` 缺可用 ``name_ko``，用 LLM 从 ``name_zh`` 或原标题补译；成功返回 True。"""
+    if listing_llm_attempts_exhausted(record):
+        return False
+    ll = record.get("listing_llm")
+    if not isinstance(ll, dict):
+        ll = {}
+        record["listing_llm"] = ll
+    if listing_llm_name_ko_usable(ll):
+        return True
+    title = str(commodity.get("title") or "").strip()
+    src = str(ll.get("name_zh") or "").strip() or title
+    if not src:
+        return False
+    nk = _translate_name_to_ko(src, timeout=timeout, api_profile=api_profile)
+    if not nk:
+        return False
+    ll["name_ko"] = nk
+    record["listing_llm"] = ll
+    record["llm_processed_at"] = now_cst8_iso()
+    ll["processed_at"] = record["llm_processed_at"]
+    if count_attempt:
+        note_llm_attempt_consumed(record)
+    _log.info(
+        "%s",
+        pf_kv(
+            [
+                ("event", "llm.name_ko.fill"),
+                *pf_store_row_id_kv(record),
+                ("name_ko_len", len(nk)),
+                ("source", "name_zh" if str(ll.get("name_zh") or "").strip() else "title"),
+            ],
+            zh="已用 LLM 补译韩文商品名（未用中文名直接上架）",
+        ),
+    )
+    return True
 
 
 def _chat_once_json(
@@ -661,10 +1022,6 @@ def _chat_once_json(
     return content, elapsed_ms
 
 
-def _now_utc_iso() -> str:
-    return datetime.now(timezone.utc).isoformat()
-
-
 def enrich_records_listing_llm_batch(
     rows: list[tuple[dict[str, Any], dict[str, Any]]],
     *,
@@ -681,12 +1038,11 @@ def enrich_records_listing_llm_batch(
 
     for i, (record, commodity) in enumerate(rows):
         title = str(commodity.get("title") or "").strip()
-        gid_short = str(record.get("goods_id") or "")[:36]
         if not title:
             _log.warning(
                 "%s",
                 pf_kv(
-                    [("event", "llm.skip"), ("reason", "no_title"), ("goods_id", gid_short)],
+                    [("event", "llm.skip"), ("reason", "no_title"), *pf_store_row_id_kv(record)],
                     zh="跳过 LLM：商品无标题",
                 ),
             )
@@ -698,7 +1054,7 @@ def enrich_records_listing_llm_batch(
             _log.info(
                 "%s",
                 pf_kv(
-                    [("event", "llm.cache"), ("goods_id", gid_short)],
+                    [("event", "llm.cache"), *pf_store_row_id_kv(record)],
                     zh="使用已有 LLM 缓存，未重新请求接口",
                 ),
             )
@@ -721,7 +1077,18 @@ def enrich_records_listing_llm_batch(
             ),
         )
         for _idx, record, commodity, _title in need_call:
-            if enrich_record_listing_llm(record, commodity, timeout=timeout, api_profile=api_profile):
+            try:
+                ok = enrich_record_listing_llm(record, commodity, timeout=timeout, api_profile=api_profile)
+            except Exception as e:
+                if record_after_llm_attempt(record, commodity, ok=False, error=str(e)):
+                    changed.append(record)
+                continue
+            if record_after_llm_attempt(
+                record,
+                commodity,
+                ok=ok,
+                error=None if ok else "enrich_returned_false",
+            ):
                 changed.append(record)
         return changed
 
@@ -735,7 +1102,7 @@ def enrich_records_listing_llm_batch(
         payload = [
             {
                 "idx": idx,
-                "goods_id": str(record.get("goods_id") or "")[:36],
+                "goods_id": pf_goods_id(record),
                 "title": title,
             }
             for idx, record, _commodity, title in chunk
@@ -780,23 +1147,50 @@ def enrich_records_listing_llm_batch(
             for idx, record, commodity, _title in chunk:
                 norm = by_idx.get(idx)
                 if norm is None:
-                    # 该条缺失时回退单条调用，避免整批失败影响上架。
-                    if enrich_record_listing_llm(record, commodity, timeout=timeout, api_profile=api_profile):
+                    try:
+                        ok = enrich_record_listing_llm(
+                            record,
+                            commodity,
+                            timeout=timeout,
+                            api_profile=api_profile,
+                        )
+                    except Exception as e:
+                        if record_after_llm_attempt(record, commodity, ok=False, error=str(e)):
+                            changed.append(record)
+                        continue
+                    if record_after_llm_attempt(
+                        record,
+                        commodity,
+                        ok=ok,
+                        error=None if ok else "batch_item_missing",
+                    ):
                         changed.append(record)
                     continue
                 norm["source"] = "openai"
                 norm["model"] = model
-                norm["processed_at"] = _now_utc_iso()
                 record["listing_llm"] = norm
-                record["llm_processed_at"] = norm["processed_at"]
-                apply_listing_llm_price_to_commodity(commodity, norm)
+                ensure_listing_llm_name_ko(
+                    record,
+                    commodity,
+                    timeout=timeout,
+                    api_profile=api_profile,
+                    count_attempt=False,
+                )
+                ll_final = record.get("listing_llm")
+                if not isinstance(ll_final, dict):
+                    ll_final = norm
+                ll_final["processed_at"] = now_cst8_iso()
+                record["listing_llm"] = ll_final
+                record["llm_processed_at"] = ll_final["processed_at"]
+                note_llm_attempt_consumed(record)
+                apply_listing_llm_price_to_commodity(commodity, ll_final)
                 changed.append(record)
                 _log.info(
                     "%s",
                     pf_kv(
                         [
                             ("event", "llm.response"),
-                            ("goods_id", str(record.get("goods_id") or "")[:36]),
+                            *pf_store_row_id_kv(record),
                             ("elapsed_ms", elapsed_ms),
                             ("cny_price", norm.get("cny_price")),
                             ("optimaPrice", commodity.get("optimaPrice")),
@@ -817,7 +1211,18 @@ def enrich_records_listing_llm_batch(
                 ),
             )
             for _idx, record, commodity, _title in chunk:
-                if enrich_record_listing_llm(record, commodity, timeout=timeout, api_profile=api_profile):
+                try:
+                    ok = enrich_record_listing_llm(record, commodity, timeout=timeout, api_profile=api_profile)
+                except Exception as e:
+                    if record_after_llm_attempt(record, commodity, ok=False, error=str(e)):
+                        changed.append(record)
+                    continue
+                if record_after_llm_attempt(
+                    record,
+                    commodity,
+                    ok=ok,
+                    error=None if ok else "batch_fallback_failed",
+                ):
                     changed.append(record)
 
     return changed
@@ -829,6 +1234,7 @@ def enrich_record_listing_llm(
     *,
     timeout: float | None = None,
     api_profile: ListingLlmApiProfile | None = None,
+    register_attempt: bool = True,
 ) -> bool:
     """
     将 LLM 结果写入 ``record['listing_llm']``；识别到价则写入 ``commodity['optimaPrice']``，否则 ``cny_price`` 为 ``null`` 并清空 ``optimaPrice``。
@@ -836,7 +1242,6 @@ def enrich_record_listing_llm(
     返回 **True** 表示应写回 store-json（内存中 ``raw`` 已改）；无 title 等放弃时为 **False**。
     """
     title = str(commodity.get("title") or "").strip()
-    gid_short = str(record.get("goods_id") or "")[:36]
     log_item_separator(_log)
     if not title:
         _log.warning(
@@ -845,9 +1250,25 @@ def enrich_record_listing_llm(
                 [
                     ("event", "llm.skip"),
                     ("reason", "no_title"),
-                    ("goods_id", str(record.get("goods_id") or "")[:36]),
+                    *pf_store_row_id_kv(record),
                 ],
                 zh="跳过 LLM：商品无标题",
+            ),
+        )
+        return False
+
+    if listing_llm_attempts_exhausted(record):
+        _log.warning(
+            "%s",
+            pf_kv(
+                [
+                    ("event", "llm.skip"),
+                    ("reason", "attempts_exhausted"),
+                    *pf_store_row_id_kv(record),
+                    ("attempt_count", record_llm_attempt_count(record)),
+                    ("max_attempts", listing_llm_max_attempts()),
+                ],
+                zh="跳过 LLM：该商品处理次数已达上限",
             ),
         )
         return False
@@ -855,17 +1276,37 @@ def enrich_record_listing_llm(
     existing = record.get("listing_llm")
     if isinstance(existing, dict) and record.get("llm_processed_at") and not listing_llm_force_refresh():
         apply_listing_llm_price_to_commodity(commodity, existing)
-        _log.info(
+        if listing_llm_name_ko_usable(existing):
+            _log.info(
+                "%s",
+                pf_kv(
+                    [
+                        ("event", "llm.cache"),
+                        *pf_store_row_id_kv(record),
+                    ],
+                    zh="使用已有 LLM 缓存，未重新请求接口",
+                ),
+            )
+            return True
+        if ensure_listing_llm_name_ko(
+            record,
+            commodity,
+            timeout=timeout,
+            api_profile=api_profile,
+            count_attempt=True,
+        ):
+            apply_listing_llm_price_to_commodity(commodity, record["listing_llm"])
+            return True
+        _log.warning(
             "%s",
             pf_kv(
                 [
-                    ("event", "llm.cache"),
-                    ("goods_id", str(record.get("goods_id") or "")[:36])
+                    ("event", "llm.name_ko.missing"),
+                    *pf_store_row_id_kv(record),
                 ],
-                zh="使用已有 LLM 缓存，未重新请求接口",
+                zh="缓存无韩文标题，将重新走完整 LLM",
             ),
         )
-        return True
 
     client, model, host = _openai_client(timeout, api_profile=api_profile)
     use_response_format = "dashscope.aliyuncs.com" not in host.lower()
@@ -886,7 +1327,7 @@ def enrich_record_listing_llm(
                 pf_kv(
                     [
                         ("event", "llm.vision_no_images"),
-                        ("goods_id", gid_short),
+                        *pf_store_row_id_kv(record),
                         ("url_candidates", len(urls)),
                     ],
                     zh="颜色修正已开启但未得到有效缩略图，退回纯文本请求",
@@ -911,10 +1352,10 @@ def enrich_record_listing_llm(
         ]
         log_kv: list[tuple[str, Any]] = [
             ("event", "llm.request"),
+            *pf_store_row_id_kv(record),
             ("model", model),
             ("host", host),
             ("title_len", len(title)),
-            ("goods_id", gid_short),
             ("vision", 1),
             ("vision_images", len(data_urls)),
         ]
@@ -928,10 +1369,10 @@ def enrich_record_listing_llm(
         ]
         log_kv = [
             ("event", "llm.request"),
+            *pf_store_row_id_kv(record),
             ("model", model),
             ("host", host),
             ("title_len", len(title)),
-            ("goods_id", gid_short),
         ]
         if api_profile is not None:
             log_kv.append(("thread", api_profile.get("label", "")))
@@ -947,16 +1388,30 @@ def enrich_record_listing_llm(
     normalized = parse_listing_llm_response(content, listing_hint=title)
     normalized["source"] = "openai"
     normalized["model"] = model
-    normalized["processed_at"] = _now_utc_iso()
     record["listing_llm"] = normalized
-    record["llm_processed_at"] = normalized["processed_at"]
-    apply_listing_llm_price_to_commodity(commodity, normalized)
+    ensure_listing_llm_name_ko(
+        record,
+        commodity,
+        timeout=timeout,
+        api_profile=api_profile,
+        count_attempt=False,
+    )
+    ll_final = record.get("listing_llm")
+    if not isinstance(ll_final, dict):
+        ll_final = normalized
+    ll_final["processed_at"] = now_cst8_iso()
+    record["listing_llm"] = ll_final
+    record["llm_processed_at"] = ll_final["processed_at"]
+    if register_attempt:
+        note_llm_attempt_consumed(record)
+    apply_listing_llm_price_to_commodity(commodity, ll_final)
+    normalized = ll_final
     _log.info(
         "%s",
         pf_kv(
             [
                 ("event", "llm.response"),
-                ("goods_id", str(record.get("goods_id") or "")[:36]),
+                *pf_store_row_id_kv(record),
                 ("elapsed_ms", elapsed_ms),
                 ("cny_price", normalized.get("cny_price")),
                 ("optimaPrice", commodity.get("optimaPrice")),
