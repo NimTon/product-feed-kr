@@ -6,8 +6,9 @@
 
 必填：`SEVEN17_MB_ID`、`SEVEN17_MB_PASSWORD`。数据库：`PRODUCT_FEED_SQLITE`（默认 `data/product_feed.db`）。相册 ID：命令行 **`--album-id`**，或配置 / 环境变量 **`WECATALOG_ALBUM_ID`**（与店铺 URL 中 albumId 一致）。
 
-后台分类 **`ca_id`**：仅使用 **`wecatalog_tag_category_map.json`** 里对应 `(wecatalog_group, wecatalog_tag)` 的
-**`meta.seven17_ca_id`**（与后台「기본분류」 option value 一致）；未写则该条跳过并报错。
+后台分类 **`ca_id`**：优先 **`wecatalog_tag_category_map.json`** 的 **`meta.seven17_ca_id`**；
+若无则按韩文路径精确匹配后台下拉；仍无则 **`OPENAI_CATEGORY_FALLBACK`** 时用 LLM 从
+``data/seven17_ca_options.json`` 候选中选择（结果写入 ``seven17_ca_id`` 列）。
 
 常用可选：`SEVEN17_CONFIG`、`SEVEN17_BASE_URL`、`SEVEN17_HEADLESS`、`SEVEN17_STOCK_QTY`、
 `SEVEN17_DEFAULT_PRICE`（货源无价格时兜底）、`SEVEN17_SC_TYPE`、`SEVEN17_MAX_IMAGES`、
@@ -70,6 +71,12 @@ from product_feed_kr.seven17_config import (
     EXIT_RESTART_FRESH_DATA,
     reload_seven17_config,
     restart_after_n,
+)
+from product_feed_kr.seven17_category_llm import (
+    category_llm_fallback_enabled,
+    category_map_suggest_message,
+    load_seven17_ca_catalog,
+    resolve_ca_id_for_store_record,
 )
 from product_feed_kr.wecatalog_tag_mapping import resolve_category_path, resolve_seven17_ca_id
 from product_feed_kr.wego_commodity import DEFAULT_WEGO_DESC_TEMPLATE, parse_wego_product
@@ -453,8 +460,16 @@ def itemform_preview_dict_from_store_record(
     gid_top = str(record.get("goods_id") or prod["goods_id"] or "").strip()
     gname = str(record.get("wecatalog_group") or "")
     tname = str(record.get("wecatalog_tag") or "")
-    mapped_ca = resolve_seven17_ca_id(gname, tname)
-    effective_ca = (mapped_ca or "").strip() or "(未设置：请在 map 对应行的 meta 中填写 seven17_ca_id)"
+    resolved_ca, ca_src = resolve_ca_id_for_store_record(record, commodity=com, allow_llm=False)
+    effective_ca = (resolved_ca or "").strip() or "(未解析：可配置 map / 韩文路径匹配 / LLM 兜底)"
+    if not resolve_seven17_ca_id(gname, tname):
+        hint = category_map_suggest_message(
+            record,
+            ca_id=(resolved_ca or "").strip(),
+            source=ca_src if resolved_ca else "none",
+        )
+        if hint:
+            warnings.append(hint)
 
     cny_src = prod["price"]
     if convert_cny_to_krw and krw_per_cny is not None:
@@ -474,10 +489,10 @@ def itemform_preview_dict_from_store_record(
             **img_slots,
         },
         "form_fields_note": (
-            "ca_id：仅来自 map.meta.seven17_ca_id（按分组+标签）。"
-            "shop_category_path 仅韩文展示路径。图片先下载再填入 it_img1～。"
+            "ca_id：map → 韩文路径精确匹配 → DB 缓存 seven17_ca_id → 上架时 LLM（OPENAI_CATEGORY_FALLBACK）。"
+            "shop_category_path 为韩文展示路径。图片先下载再填入 it_img1～。"
         ),
-        "seven17_ca_source": ("map.seven17_ca_id" if mapped_ca else "（未配置 seven17_ca_id）"),
+        "seven17_ca_source": ca_src if resolved_ca else "none",
         "wecatalog_record_summary": {
             "goods_id": gid_top,
             "goods_url": record.get("goods_url"),
@@ -926,10 +941,10 @@ def _upload_skip_reason(
 
         if not listing_llm_name_ko_usable(llm_data):
             return "llm_name_ko_missing"
-    gname = str(rec.get("wecatalog_group") or "")
-    tname = str(rec.get("wecatalog_tag") or "")
-    if not (resolve_seven17_ca_id(gname, tname) or "").strip():
-        return "no_category"
+    ca_id, _ca_src = resolve_ca_id_for_store_record(rec, allow_llm=False)
+    if not (ca_id or "").strip():
+        if not (category_llm_fallback_enabled() and load_seven17_ca_catalog()):
+            return "no_category"
     try:
         prod = parse_wego_product(com, default_price_if_missing=default_price)
     except ValueError:
@@ -1024,7 +1039,7 @@ def _claim_next_uploadable(
     claim_lock: threading.Lock | None = None,
     in_flight: set[tuple[str, int]] | None = None,
 ) -> dict[str, Any] | None:
-    """每次从 SQLite 重新加载，返回第一条可上架且本 run 未占用/未跳过的记录。"""
+    """每次从 SQLite 重新加载，按 id 正序取第一条可上架且本 run 未占用/未跳过的记录。"""
     from product_feed_kr.store_sqlite import sqlite_load_products_for_upload
 
     def _scan() -> dict[str, Any] | None:
@@ -1134,15 +1149,30 @@ def _process_upload_record(
 
     gname = str(rec.get("wecatalog_group") or "")
     tname = str(rec.get("wecatalog_tag") or "")
-    ca_id = (resolve_seven17_ca_id(gname, tname) or "").strip()
+    ca_id, ca_src = resolve_ca_id_for_store_record(rec, commodity=com, allow_llm=True)
+    ca_id = (ca_id or "").strip()
     if not ca_id:
         return (
             "fail",
             {
                 "goods_id": gid,
-                "error": "未设置 seven17 分类：请在 wecatalog_tag_category_map.json 该 (分组,标签) 的 meta 中加 seven17_ca_id",
+                "error": "无法解析 seven17 分类：请配置 map.meta.seven17_ca_id 或生成 data/seven17_ca_options.json 并开启 OPENAI_CATEGORY_FALLBACK",
             },
         )
+    _log.info(
+        "%s",
+        pf_kv(
+            [
+                ("event", "upload.ca_id"),
+                *pf_store_row_id_kv(rec),
+                ("ca_id", ca_id),
+                ("source", ca_src),
+            ],
+            zh="本条上架分类来源",
+        ),
+    )
+    if ca_src in ("llm", "path_match") and (ctx.write_back or ctx.write_back_after_llm):
+        sqlite_update_product_row(conn, aid, rec)
 
     upload_title = _upload_title_from_record(
         rec,
@@ -1535,8 +1565,8 @@ def upload_from_wecatalog_store(
     """从 SQLite 逐条上架：每处理完一条（成功/失败/跳过）后重新读库，取下一条可上架记录。
 
     字段来源：`detail_response.result.commodity` → `parse_wego_product`；
-    `ca_id`：仅 map 的 meta.seven17_ca_id。
-    上传阶段不发起 LLM 请求；仅使用 DB 中已有 ``listing_llm``。
+    `ca_id`：map → 韩文路径匹配 → DB 缓存；map 为空时可 LLM 兜底（``OPENAI_CATEGORY_FALLBACK``）。
+    上传阶段不发起 listing LLM；分类 LLM 仅在 map/缓存均无时调用。
     **LLM 开关生效且 ``cny_price`` 为空** 时跳过。
     """
     mb_id = _env_required("SEVEN17_MB_ID")

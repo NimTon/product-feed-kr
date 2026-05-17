@@ -49,6 +49,7 @@ CREATE TABLE pf_store_item (
   updated_at TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
   llm_processed_at TEXT,
   seven17_uploaded_at TEXT,
+  seven17_ca_id TEXT,
   album_id TEXT NOT NULL,
   goods_id TEXT NOT NULL,
   wecatalog_group TEXT NOT NULL DEFAULT '',
@@ -84,6 +85,7 @@ _PF_STORE_ITEM_COLS: tuple[str, ...] = (
     "updated_at",
     "llm_processed_at",
     "seven17_uploaded_at",
+    "seven17_ca_id",
     "album_id",
     "goods_id",
     "wecatalog_group",
@@ -222,6 +224,8 @@ def _migrate_sqlite_columns(conn: sqlite3.Connection) -> None:
             conn.execute(
                 "ALTER TABLE pf_store_item ADD COLUMN llm_attempt_count INTEGER NOT NULL DEFAULT 0",
             )
+    if "seven17_ca_id" not in cols:
+        conn.execute("ALTER TABLE pf_store_item ADD COLUMN seven17_ca_id TEXT")
 
 
 def _migrate_store_info_to_int_pk(conn: sqlite3.Connection) -> None:
@@ -447,9 +451,11 @@ def row_to_product_record(row: dict[str, Any]) -> dict[str, Any]:
             rec["id"] = int(row["id"])
         except (TypeError, ValueError):
             pass
+    ca_raw = row.get("seven17_ca_id")
     rec.update({
         "uploaded_to_platform": bool(row["uploaded_to_platform"]),
         "seven17_uploaded_at": (str(row.get("seven17_uploaded_at")).strip() if row.get("seven17_uploaded_at") is not None else None),
+        "seven17_ca_id": (str(ca_raw).strip() if ca_raw is not None and str(ca_raw).strip() else None),
         "detail_response": detail_response,
     })
     scp = row.get("shop_category_path_json")
@@ -615,14 +621,15 @@ def sqlite_load_products_for_upload(
     *,
     skip_uploaded: bool = True,
 ) -> list[dict[str, Any]]:
+    """载入商品行，按表主键 ``id`` 正序（先入先处理）。"""
     if skip_uploaded:
         cur = conn.execute(
-            "SELECT * FROM pf_store_item WHERE album_id = ? AND seven17_uploaded_at IS NULL ORDER BY goods_id, tag_id",
+            "SELECT * FROM pf_store_item WHERE album_id = ? AND seven17_uploaded_at IS NULL ORDER BY id ASC",
             (album_id,),
         )
     else:
         cur = conn.execute(
-            "SELECT * FROM pf_store_item WHERE album_id = ? ORDER BY goods_id, tag_id",
+            "SELECT * FROM pf_store_item WHERE album_id = ? ORDER BY id ASC",
             (album_id,),
         )
     rows = [row_to_product_record(_row_to_dict(r)) for r in cur.fetchall()]
@@ -864,6 +871,7 @@ def sqlite_update_product_row(conn: sqlite3.Connection, album_id: str, rec: dict
     uploaded_at = (str(rec.get("seven17_uploaded_at")).strip() if rec.get("seven17_uploaded_at") else None)
     gid = str(rec.get("goods_id") or "")
     attempt_count = _llm_attempt_count_for_db(rec)
+    ca_id_store = (str(rec.get("seven17_ca_id")).strip() if rec.get("seven17_ca_id") else None)
     db_path = sqlite_db_path()
     with _write_lock(db_path):
         if isinstance(dr, dict):
@@ -891,6 +899,7 @@ def sqlite_update_product_row(conn: sqlite3.Connection, album_id: str, rec: dict
                   listing_llm_json = COALESCE(?, listing_llm_json),
                   uploaded_to_platform = ?,
                   seven17_uploaded_at = ?,
+                  seven17_ca_id = COALESCE(?, seven17_ca_id),
                   updated_at = {SQLITE_NOW_CST8}
                 WHERE album_id = ? AND goods_id = ? AND tag_id = ?
                 """,
@@ -915,6 +924,7 @@ def sqlite_update_product_row(conn: sqlite3.Connection, album_id: str, rec: dict
                     ll_json,
                     uploaded,
                     uploaded_at,
+                    ca_id_store,
                     album_id,
                     gid,
                     tag_id,
@@ -938,6 +948,7 @@ def sqlite_update_product_row(conn: sqlite3.Connection, album_id: str, rec: dict
                   product_desc_html = COALESCE(?, product_desc_html),
                   uploaded_to_platform = ?,
                   seven17_uploaded_at = ?,
+                  seven17_ca_id = COALESCE(?, seven17_ca_id),
                   updated_at = {SQLITE_NOW_CST8}
                 WHERE album_id = ? AND goods_id = ? AND tag_id = ?
                 """,
@@ -956,6 +967,7 @@ def sqlite_update_product_row(conn: sqlite3.Connection, album_id: str, rec: dict
                     enrich["product_desc_html"],
                     uploaded,
                     uploaded_at,
+                    ca_id_store,
                     album_id,
                     gid,
                     tag_id,
@@ -976,6 +988,7 @@ def sqlite_update_product_row(conn: sqlite3.Connection, album_id: str, rec: dict
                   product_desc_html = COALESCE(?, product_desc_html),
                   uploaded_to_platform = ?,
                   seven17_uploaded_at = ?,
+                  seven17_ca_id = COALESCE(?, seven17_ca_id),
                   updated_at = {SQLITE_NOW_CST8}
                 WHERE album_id = ? AND goods_id = ? AND tag_id = ?
                 """,
@@ -991,6 +1004,7 @@ def sqlite_update_product_row(conn: sqlite3.Connection, album_id: str, rec: dict
                     enrich["product_desc_html"],
                     uploaded,
                     uploaded_at,
+                    ca_id_store,
                     album_id,
                     gid,
                     tag_id,

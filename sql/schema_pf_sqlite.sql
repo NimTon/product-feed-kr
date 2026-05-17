@@ -26,6 +26,7 @@ CREATE TABLE IF NOT EXISTS pf_store_item (
   updated_at TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
   llm_processed_at TEXT,
   seven17_uploaded_at TEXT,
+  seven17_ca_id TEXT,
   album_id TEXT NOT NULL,
   goods_id TEXT NOT NULL,
   wecatalog_group TEXT NOT NULL DEFAULT '',
