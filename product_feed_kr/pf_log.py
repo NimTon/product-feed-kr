@@ -10,6 +10,7 @@ from typing import Any
 # 长 logger.name → 短标签（前缀列宽稳定）
 _MOD: dict[str, str] = {
     "product_feed_kr.seven17_upload": "upload",
+    "product_feed_kr.seven17_category_llm": "category",
     "product_feed_kr.seven17_llm": "llm",
     "product_feed_kr.listing_llm_enrich": "llm",
     "product_feed_kr.store_sqlite": "db",
@@ -56,6 +57,7 @@ STORE_SQLITE_LOGGER_NAME = "product_feed_kr.store_sqlite"
 
 UPLOAD_LOGGER_NAMES: tuple[str, ...] = (
     "product_feed_kr.seven17_upload",
+    "product_feed_kr.seven17_category_llm",
     STORE_SQLITE_LOGGER_NAME,
 )
 
@@ -93,6 +95,7 @@ def configure_pf_stderr(*logger_names: str) -> None:
         h = logging.StreamHandler(sys.stderr)
         h.addFilter(_InjectMod())
         h.setFormatter(PfFormatter())
+        h.setLevel(logging.DEBUG)
         setattr(h, _MARK, True)
         lg.addHandler(h)
         lg.setLevel(logging.INFO)
@@ -112,6 +115,7 @@ def configure_module_logging(
     sh = logging.StreamHandler(sys.stderr)
     sh.addFilter(_InjectMod())
     sh.setFormatter(PfFormatter())
+    sh.setLevel(logging.DEBUG)
     setattr(sh, _MARK, True)
     lg.addHandler(sh)
     if log_file is not None:
@@ -119,6 +123,7 @@ def configure_module_logging(
         fh = logging.FileHandler(log_file, encoding="utf-8")
         fh.addFilter(_InjectMod())
         fh.setFormatter(PfFormatter())
+        fh.setLevel(logging.DEBUG)
         setattr(fh, _MARK_FILE, True)
         lg.addHandler(fh)
     lg.propagate = False
