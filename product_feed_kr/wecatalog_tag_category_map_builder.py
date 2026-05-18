@@ -8,11 +8,7 @@
 
 维护：编辑 **config/wecatalog_tag_category_map.txt**（UTF-8）。每行 ``左 = 右``；新分组用
 ``数字,主标签 = 韩文路径``（该行 anchor_only）；同组后续 ``子标签 = 路径``。
-支持全角 ``＝``；若无 ``=`` 可用 Tab 分隔左右。``#`` 行与以 ``注`` 开头的行忽略。
-
-元组可选第五项 ``tag_id``（整数）仅适合在代码里构造；txt 未解析该项，需要时可扩展。
-
-重新生成 JSON 时，会保留现有文件中已填的 **`meta.seven17_ca_id`**。
+``meta.tag_id`` 由抓取 commodity/tags 写入，不在 txt 中维护。
 """
 
 from __future__ import annotations
@@ -44,7 +40,7 @@ _FIX_DUP = "Remove or rename one of the two lines so (group, tag) is unique, or 
 
 
 class CategoryMapTxtError(ValueError):
-    """Human-readable error for mapping txt / preserved JSON issues."""
+    """Human-readable error for mapping txt / JSON issues."""
 
     def __init__(
         self,
@@ -107,11 +103,11 @@ def _path_segments_or_raise(path_str: str, *, line: int | None, source_line: str
     return segs
 
 
-def parse_category_map_txt(content: str) -> list[tuple[str, str, str, bool] | tuple[str, str, str, bool, int]]:
+def parse_category_map_txt(content: str) -> list[tuple[str, str, str, bool]]:
     """Parse mapping txt into rows for build_json_rows."""
     text = content.lstrip("\ufeff")
     current_group: str | None = None
-    out: list[tuple[str, str, str, bool] | tuple[str, str, str, bool, int]] = []
+    out: list[tuple[str, str, str, bool]] = []
     first_line_for_key: dict[tuple[str, str], int] = {}
 
     def _register_key(group: str, tag: str, ln: int, raw_display: str) -> None:
@@ -205,51 +201,10 @@ def parse_category_map_txt(content: str) -> list[tuple[str, str, str, bool] | tu
     return out
 
 
-def _split_path(s: str) -> list[str]:
-    return [p.strip() for p in s.split(">") if p.strip()]
-
-
-def _parse_meta_row(row: list) -> dict:
-    if len(row) < 4:
-        return {}
-    m = row[3]
-    return m if isinstance(m, dict) else {}
-
-
-def build_json_rows(
-    raw_rows: Sequence[tuple[str, str, str, bool] | tuple[str, str, str, bool, int]],
-    *,
-    preserve_meta_path: Path | None = None,
-) -> list[list]:
-    preserved_ca: dict[tuple[str, str], str] = {}
-    path = preserve_meta_path or Path(__file__).resolve().with_name("wecatalog_tag_category_map.json")
-    if path.is_file():
-        try:
-            raw_prev = json.loads(path.read_text(encoding="utf-8"))
-        except json.JSONDecodeError as e:
-            raise CategoryMapTxtError(
-                f"existing JSON is invalid and cannot be read to preserve seven17_ca_id: {path}",
-                fix=f"Repair JSON syntax (see parser message: {e.msg} at char {e.pos}) or temporarily rename the file.",
-            ) from e
-        except OSError as e:
-            raise CategoryMapTxtError(
-                f"cannot read existing JSON for meta merge: {path}: {e}",
-                fix="Check permissions or close programs locking the file.",
-            ) from e
-        if isinstance(raw_prev, list):
-            for row in raw_prev:
-                if not isinstance(row, list) or len(row) < 3:
-                    continue
-                meta = _parse_meta_row(row)
-                v = meta.get("seven17_ca_id")
-                if v is not None and str(v).strip():
-                    preserved_ca[(str(row[0]), str(row[1]))] = str(v).strip()
-
+def build_json_rows(raw_rows: Sequence[tuple[str, str, str, bool]]) -> list[list]:
     out: list[list] = []
     seen: set[tuple[str, str]] = set()
-    for tup in raw_rows:
-        group, tag, path_str, anchor = tup[0], tup[1], tup[2], tup[3]
-        tag_id = tup[4] if len(tup) > 4 else None
+    for group, tag, path_str, anchor in raw_rows:
         key = (group, tag)
         if key in seen:
             raise CategoryMapTxtError(
@@ -259,22 +214,8 @@ def build_json_rows(
         seen.add(key)
         segs = _path_segments_or_raise(path_str, line=None, source_line=f"{group!r} / {tag!r} -> {path_str!r}")
         row: list = [group, tag, segs]
-        meta: dict = {}
         if anchor:
-            meta["anchor_only"] = True
-        if tag_id is not None:
-            try:
-                meta["tag_id"] = int(tag_id)
-            except (TypeError, ValueError) as e:
-                raise CategoryMapTxtError(
-                    f"tag_id must be int-compatible, got {tag_id!r}",
-                    fix="Only programmatic tuples may include tag_id; omit in txt.",
-                ) from e
-        ca_prev = preserved_ca.get((group, tag))
-        if ca_prev is not None:
-            meta["seven17_ca_id"] = ca_prev
-        if meta:
-            row.append(meta)
+            row.append({"anchor_only": True})
         out.append(row)
     return out
 

@@ -1,4 +1,4 @@
-"""map 未配置 ``seven17_ca_id`` 时，用 LLM 从后台分类下拉（``seven17_ca_options.json``）中选 ``ca_id``。"""
+"""路径映射表无 ``ca_id`` 时，用 LLM 从 ``seven17_ca_options.json`` 候选中选 ``ca_id``。"""
 
 from __future__ import annotations
 
@@ -13,14 +13,13 @@ from product_feed_kr.listing_llm_enrich import _chat_once_json, _openai_client, 
 from product_feed_kr.pf_log import pf_kv, pf_store_row_id_kv
 from product_feed_kr.seven17_config import bool_env as _cfg_bool
 from product_feed_kr.seven17_config import getenv as _cfg_get
-from product_feed_kr.wecatalog_tag_mapping import resolve_category_path, resolve_seven17_ca_id
+from product_feed_kr.wecatalog_tag_mapping import resolve_category_path
 
 _log = logging.getLogger("product_feed_kr.seven17_category_llm")
 
 _CATEGORY_MAP_SUGGEST_ZH = (
-    "未在 wecatalog_tag_category_map.json 配置分类映射；"
-    "建议为对应 (wecatalog_group, wecatalog_tag) 在 meta 中手动填写 seven17_ca_id，"
-    "避免依赖韩文路径匹配或 LLM 兜底"
+    "未在 wecatalog_tag_category_map 配置韩文路径，或 seven17_path_ca_map 无对应 ca_id；"
+    "请补全 txt 映射并重新抓取同步 path_ca_map"
 )
 
 
@@ -30,24 +29,23 @@ def category_map_suggest_message(
     ca_id: str = "",
     source: str,
 ) -> str | None:
-    """未走 map 时返回给人看的建议文案；走 map 返回 None。"""
-    if source == "map":
+    """未走 path_map 时返回给人看的建议文案。"""
+    if source == "path_map":
         return None
     g = str(record.get("wecatalog_group") or "").strip()
     t = str(record.get("wecatalog_tag") or "").strip()
     src_label = {
-        "path_match": "韩文路径精确匹配",
+        "path_map": "路径→ca_id 映射表",
         "llm": "LLM 选定",
         "cache": "DB 缓存",
         "none": "尚未解析（上架时可能走 LLM）",
     }.get(source, source)
     parts = [
-        f"未在 wecatalog_tag_category_map.json 为「{g}」+「{t}」配置 meta.seven17_ca_id",
-        f"（当前来源：{src_label}",
+        f"「{g}」+「{t}」未通过 path_ca_map 解析 ca_id（来源：{src_label}",
     ]
     if ca_id:
         parts.append(f"，ca_id={ca_id}")
-    parts.append("）；建议在 map 中手动补全映射关系")
+    parts.append("）；请补全 config/wecatalog_tag_category_map.txt 韩文路径")
     return "".join(parts)
 
 
@@ -57,8 +55,8 @@ def warn_suggest_category_map(
     ca_id: str,
     source: str,
 ) -> None:
-    """map 未配置且分类来自路径匹配 / LLM / 缓存时打 WARNING。"""
-    if source == "map":
+    """分类来自 LLM / 缓存时打 WARNING。"""
+    if source == "path_map":
         return
     g = str(record.get("wecatalog_group") or "").strip()
     t = str(record.get("wecatalog_tag") or "").strip()
@@ -139,17 +137,6 @@ def _record_shop_path_label(record: dict[str, Any]) -> str:
     t = str(record.get("wecatalog_tag") or "")
     seg = resolve_category_path(g, t)
     return _path_tuple_to_label(seg)
-
-
-def match_ca_id_by_korean_path(path_label: str) -> str | None:
-    """韩文路径与后台 option label 完全一致时直接返回 value（不调 LLM）。"""
-    lab = path_label.strip()
-    if not lab:
-        return None
-    for val, label in load_seven17_ca_catalog():
-        if label == lab:
-            return val
-    return None
 
 
 def _tokenize_hint(text: str) -> set[str]:
@@ -277,8 +264,10 @@ def suggest_seven17_ca_id_llm(
     if not category_llm_fallback_enabled():
         return None, None
 
+    from product_feed_kr.seven17_path_ca_map import resolve_ca_id_by_path_label
+
     path_label = _record_shop_path_label(record)
-    hit = match_ca_id_by_korean_path(path_label)
+    hit = resolve_ca_id_by_path_label(path_label)
     if hit:
         catalog = dict(load_seven17_ca_catalog())
         return hit, catalog.get(hit)
@@ -396,20 +385,16 @@ def resolve_ca_id_for_store_record(
     allow_llm: bool = True,
 ) -> tuple[str | None, str]:
     """
-    解析上架用 ``ca_id``。返回 (ca_id, source)，source 为 map | path_match | cache | llm | none。
+    解析上架用 ``ca_id``。返回 (ca_id, source)，source 为 path_map | cache | llm | none。
     """
-    g = str(record.get("wecatalog_group") or "")
-    t = str(record.get("wecatalog_tag") or "")
-    from_map = resolve_seven17_ca_id(g, t)
-    if from_map:
-        return from_map, "map"
+    from product_feed_kr.seven17_path_ca_map import resolve_ca_id_by_path_label
 
     path_label = _record_shop_path_label(record)
-    by_path = match_ca_id_by_korean_path(path_label)
-    if by_path:
-        record["seven17_ca_id"] = by_path
-        warn_suggest_category_map(record, ca_id=by_path, source="path_match")
-        return by_path, "path_match"
+    if path_label:
+        by_path_map = resolve_ca_id_by_path_label(path_label)
+        if by_path_map:
+            record["seven17_ca_id"] = by_path_map
+            return by_path_map, "path_map"
 
     stored = str(record.get("seven17_ca_id") or "").strip()
     if stored:

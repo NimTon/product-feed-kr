@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 import logging
 from collections import defaultdict
 from pathlib import Path
@@ -13,11 +14,15 @@ from product_feed_kr.wecatalog_tag_category_map_builder import (
     CategoryMapTxtError,
     _DEFAULT_TXT,
     _SECTION_HEADER_LEFT,
-    build_json_rows,
     parse_category_map_txt,
     write_map_from_txt,
 )
-from product_feed_kr.wecatalog_tag_mapping import invalidate_mapping_cache, resolve_category_path
+from product_feed_kr.seven17_path_ca_map import sync_path_ca_map_from_itemform
+from product_feed_kr.wecatalog_tag_mapping import (
+    _map_path,
+    invalidate_mapping_cache,
+    resolve_category_path,
+)
 
 _log = logging.getLogger(__name__)
 
@@ -58,6 +63,29 @@ def init_map_from_txt_at_scrape(logger: logging.Logger | None = None) -> int | N
         ),
     )
     return n
+
+
+def init_seven17_path_ca_at_scrape(logger: logging.Logger | None = None) -> int | None:
+    """抓取开始前：登录 itemform，写入韩文路径→ca_id 映射（与 txt 映射分离）。"""
+    lg = logger or _log
+    try:
+        return sync_path_ca_map_from_itemform(logger=lg)
+    except Exception as e:
+        lg.error(
+            "%s",
+            pf_kv(
+                [("event", "scrape.path_ca.fail"), ("err", str(e)[:400])],
+                zh="同步 seven17 路径→ca_id 失败；将沿用已有映射文件",
+            ),
+        )
+        return None
+
+
+def init_maps_at_scrape(logger: logging.Logger | None = None) -> tuple[int | None, int | None]:
+    """抓取初始化：用户 txt→韩文路径 JSON + seven17 路径→ca_id JSON。"""
+    rows = init_map_from_txt_at_scrape(logger)
+    path_entries = init_seven17_path_ca_at_scrape(logger)
+    return rows, path_entries
 
 
 def iter_leaf_tags_from_groups(
@@ -183,11 +211,10 @@ def append_missing_tags_to_map_txt(
             groups_known.add(gname)
             existing.add((gname, gname))
             added += 1
-        for tname, tid in items:
+        for tname, _tid in items:
             if (gname, tname) in existing:
                 continue
-            suffix = f"  # tag_id={tid}"
-            new_lines.append(f"{tname} = {PLACEHOLDER_PATH}{suffix}")
+            new_lines.append(f"{tname} = {PLACEHOLDER_PATH}")
             existing.add((gname, tname))
             added += 1
 
@@ -217,6 +244,7 @@ def sync_unmapped_tags_after_tags(
             "%s",
             pf_kv([("event", "scrape.map.ok")], zh="微猫全部分组/标签均已有分类映射"),
         )
+        sync_tag_ids_from_groups(groups, logger=lg)
         return 0, []
 
     added = append_missing_tags_to_map_txt(missing)
@@ -277,4 +305,77 @@ def sync_unmapped_tags_after_tags(
             ),
         )
 
+    sync_tag_ids_from_groups(groups, logger=lg)
     return added, missing
+
+
+def sync_tag_ids_from_groups(
+    groups: list[dict[str, Any]],
+    *,
+    logger: logging.Logger | None = None,
+) -> int:
+    """用 commodity/tags API 的 ``tagId`` 写入 JSON ``meta.tag_id``。返回更新的行数。"""
+    lg = logger or _log
+    api_ids = { (g, t): tid for g, t, tid in iter_leaf_tags_from_groups(groups) }
+    if not api_ids:
+        return 0
+
+    map_path = _map_path()
+    if not map_path.is_file():
+        return 0
+
+    try:
+        rows = json.loads(map_path.read_text(encoding="utf-8"))
+    except (json.JSONDecodeError, OSError) as e:
+        lg.warning(
+            "%s",
+            pf_kv(
+                [("event", "scrape.map.tag_id_fail"), ("err", str(e)[:200])],
+                zh="无法读取映射 JSON，未写入 tag_id",
+            ),
+        )
+        return 0
+
+    if not isinstance(rows, list):
+        return 0
+
+    updated = 0
+    for row in rows:
+        if not isinstance(row, list) or len(row) < 3:
+            continue
+        g = str(row[0])
+        t = str(row[1])
+        tid = api_ids.get((g, t))
+        if tid is None:
+            continue
+
+        meta: dict[str, Any]
+        if len(row) > 3 and isinstance(row[3], dict):
+            meta = dict(row[3])
+        else:
+            meta = {}
+        meta.pop("seven17_ca_id", None)
+        if meta.get("tag_id") != tid:
+            meta["tag_id"] = tid
+            updated += 1
+        row[:] = [row[0], row[1], row[2], meta] if meta else [row[0], row[1], row[2]]
+
+    if updated > 0:
+        map_path.write_text(
+            json.dumps(rows, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+        invalidate_mapping_cache()
+
+    lg.info(
+        "%s",
+        pf_kv(
+            [
+                ("event", "scrape.map.tag_ids"),
+                ("api_tags", len(api_ids)),
+                ("rows_updated", updated),
+            ],
+            zh="已用 commodity/tags 的 tagId 更新映射 JSON",
+        ),
+    )
+    return updated

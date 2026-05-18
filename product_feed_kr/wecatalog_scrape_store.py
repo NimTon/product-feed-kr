@@ -2,9 +2,10 @@
 
 1. **`commodity/tags`**：得到分组顺序与每个叶子 `tagId` / `tagName`，遍历顺序与相册后台一致。
 2. **`album/personal/all`**：分页拉全店列表；**每拉一页即按分类树匹配并（按需）拉详情**，不先攒齐全部列表再处理。
-3. **`wecatalog_tag_category_map.json`**：由 **`config/wecatalog_tag_category_map.txt`** 在每次抓取开始前生成；
-   未映射的 `(分组, 标签)` 会自动追加到 txt（路径占位 ``（待补全）``）并打 **WARNING**。
-   未配置时该字段为 `null`，不影响爬取与遍历。
+3. **分类映射（两份）**：每次抓取开始前
+   - **`config/wecatalog_tag_category_map.txt`** → **`wecatalog_tag_category_map.json`**（微猫分组/标签 → 韩文路径，用户维护）；
+   - **`data/seven17_path_ca_map.json`**（韩文路径 → seven17 ``ca_id``，从 itemform 自动同步，需配置 ``SEVEN17_MB_*``）。
+   未映射的 `(分组, 标签)` 会自动追加到 txt（路径占位 ``（待补全）``）；``tag_id`` 由 commodity/tags API 写入 JSON ``meta``，勿写在路径行尾。
 
 每条 **`pf_store_item`** 写入 **`detail_response`**（详情接口整包），**不写**列表卡片对象 `list_item`。
 每条另有 **`uploaded_to_platform`**（布尔）：抓取时默认为 **`false`**。
@@ -64,7 +65,7 @@ from product_feed_kr.seven17_config import (
     restart_after_n,
 )
 from product_feed_kr.wecatalog_tag_category_map_sync import (
-    init_map_from_txt_at_scrape,
+    init_maps_at_scrape,
     sync_unmapped_tags_after_tags,
 )
 from product_feed_kr.wecatalog_tag_mapping import resolve_category_path
@@ -361,10 +362,14 @@ def scrape_store(
         "throttle_delay_sec_range": [delay_lo, delay_hi],
         "map_unmapped": 0,
         "map_txt_appended": 0,
+        "path_ca_entries": None,
     }
     restart_after_new = restart_after_n("WECATALOG_SCRAPE_RESTART_AFTER_ITEMS", 1000)
 
-    init_map_from_txt_at_scrape(logger)
+    map_rows, path_ca_n = init_maps_at_scrape(logger)
+    stats["path_ca_entries"] = path_ca_n
+    if map_rows is not None:
+        stats["map_rows"] = map_rows
 
     conn_db = None
     records: list[dict[str, Any]] = []

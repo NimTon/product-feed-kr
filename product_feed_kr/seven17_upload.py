@@ -6,9 +6,8 @@
 
 必填：`SEVEN17_MB_ID`、`SEVEN17_MB_PASSWORD`。数据库：`PRODUCT_FEED_SQLITE`（默认 `data/product_feed.db`）。相册 ID：命令行 **`--album-id`**，或配置 / 环境变量 **`WECATALOG_ALBUM_ID`**（与店铺 URL 中 albumId 一致）。
 
-后台分类 **`ca_id`**：优先 **`wecatalog_tag_category_map.json`** 的 **`meta.seven17_ca_id`**；
-若无则按韩文路径精确匹配后台下拉；仍无则 **`OPENAI_CATEGORY_FALLBACK`** 时用 LLM 从
-``data/seven17_ca_options.json`` 候选中选择（结果写入 ``seven17_ca_id`` 列）。
+后台分类 **`ca_id`**：微猫 (分组, 标签) → 韩文路径（``wecatalog_tag_category_map``）→
+``data/seven17_path_ca_map.json``；仍无则 **`OPENAI_CATEGORY_FALLBACK`** LLM 兜底。
 
 常用可选：`SEVEN17_CONFIG`、`SEVEN17_BASE_URL`、`SEVEN17_HEADLESS`、`SEVEN17_STOCK_QTY`、
 `SEVEN17_DEFAULT_PRICE`（货源无价格时兜底）、`SEVEN17_SC_TYPE`、`SEVEN17_MAX_IMAGES`、
@@ -556,7 +555,7 @@ def itemform_preview_dict_from_store_record(
             **img_slots,
         },
         "form_fields_note": (
-            "ca_id：map → 韩文路径精确匹配 → DB 缓存 seven17_ca_id → 上架时 LLM（OPENAI_CATEGORY_FALLBACK）。"
+            "ca_id：韩文路径→path_ca_map → DB 缓存 → LLM（OPENAI_CATEGORY_FALLBACK）。"
             "shop_category_path 为韩文展示路径。图片先下载再填入 it_img1～。"
         ),
         "seven17_ca_source": ca_src if resolved_ca else "none",
@@ -1226,7 +1225,7 @@ def _process_upload_record(
             "fail",
             {
                 "goods_id": gid,
-                "error": "无法解析 seven17 分类：请配置 map.meta.seven17_ca_id 或生成 data/seven17_ca_options.json 并开启 OPENAI_CATEGORY_FALLBACK",
+                "error": "无法解析 seven17 分类：请补全韩文路径映射、运行抓取同步 path_ca_map，或开启 OPENAI_CATEGORY_FALLBACK",
             },
         )
     _log.info(
@@ -1241,7 +1240,7 @@ def _process_upload_record(
             zh="本条上架分类来源",
         ),
     )
-    if ca_src in ("llm", "path_match") and (ctx.write_back or ctx.write_back_after_llm):
+    if ca_src == "llm" and (ctx.write_back or ctx.write_back_after_llm):
         sqlite_update_product_row(conn, aid, rec)
 
     upload_title = _upload_title_from_record(
