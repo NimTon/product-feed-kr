@@ -122,6 +122,12 @@ def leaf_match_specs() -> tuple[tuple[str, str, tuple[str, ...], int | None], ..
     return tuple((g, t, p, tid) for g, t, p, a, tid, _ca in _load_rows() if not a)
 
 
+def invalidate_mapping_cache() -> None:
+    """txt/JSON 更新后清除 ``lru_cache``，使爬取/上架读到最新映射。"""
+    _load_rows.cache_clear()
+    _lookup_dict.cache_clear()
+
+
 def extend_mapping(rows: list[list[Any]]) -> None:
     """运行时追加并写回 JSON（测试或生成脚本用）；按 (group,tag) 去重覆盖。"""
     existing: dict[tuple[str, str], tuple[tuple[str, ...], dict[str, Any]]] = {}
@@ -149,5 +155,4 @@ def extend_mapping(rows: list[list[Any]]) -> None:
             item.append(meta)
         compact.append(item)
     _map_path().write_text(json.dumps(compact, ensure_ascii=False, separators=(",", ":")), encoding="utf-8")
-    _load_rows.cache_clear()
-    _lookup_dict.cache_clear()
+    invalidate_mapping_cache()

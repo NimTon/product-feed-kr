@@ -2,7 +2,8 @@
 
 1. **`commodity/tags`**：得到分组顺序与每个叶子 `tagId` / `tagName`，遍历顺序与相册后台一致。
 2. **`album/personal/all`**：分页拉全店列表；**每拉一页即按分类树匹配并（按需）拉详情**，不先攒齐全部列表再处理。
-3. **`wecatalog_tag_category_map.json`**：仅把 `(分组名, 标签名)` 映射为独立站 **`shop_category_path`**；
+3. **`wecatalog_tag_category_map.json`**：由 **`config/wecatalog_tag_category_map.txt`** 在每次抓取开始前生成；
+   未映射的 `(分组, 标签)` 会自动追加到 txt（路径占位 ``（待补全）``）并打 **WARNING**。
    未配置时该字段为 `null`，不影响爬取与遍历。
 
 每条 **`pf_store_item`** 写入 **`detail_response`**（详情接口整包），**不写**列表卡片对象 `list_item`。
@@ -61,6 +62,10 @@ from product_feed_kr.seven17_config import (
     getenv,
     reload_seven17_config,
     restart_after_n,
+)
+from product_feed_kr.wecatalog_tag_category_map_sync import (
+    init_map_from_txt_at_scrape,
+    sync_unmapped_tags_after_tags,
 )
 from product_feed_kr.wecatalog_tag_mapping import resolve_category_path
 from product_feed_kr.pf_cli_loop import run_forever
@@ -354,8 +359,12 @@ def scrape_store(
         "skipped_existing": 0,
         "restart_fresh": False,
         "throttle_delay_sec_range": [delay_lo, delay_hi],
+        "map_unmapped": 0,
+        "map_txt_appended": 0,
     }
     restart_after_new = restart_after_n("WECATALOG_SCRAPE_RESTART_AFTER_ITEMS", 1000)
+
+    init_map_from_txt_at_scrape(logger)
 
     conn_db = None
     records: list[dict[str, Any]] = []
@@ -405,6 +414,9 @@ def scrape_store(
                 "%s",
                 pf_kv([("event", "scrape.tags_ok"), ("groups", len(groups))], zh="分类/标签树拉取成功"),
             )
+            appended, unmapped = sync_unmapped_tags_after_tags(groups, logger)
+            stats["map_unmapped"] = len(unmapped)
+            stats["map_txt_appended"] = appended
 
             logger.info(
                 "%s",

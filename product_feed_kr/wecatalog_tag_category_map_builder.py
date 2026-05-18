@@ -279,6 +279,30 @@ def build_json_rows(
     return out
 
 
+def write_map_from_txt(
+    inp: Path | None = None,
+    *,
+    target: Path | None = None,
+) -> tuple[Path, int]:
+    """解析 txt 并写入 JSON；返回 (输出路径, 行数)。"""
+    src = inp if inp is not None else _DEFAULT_TXT
+    text = _read_mapping_txt_file(src)
+    raw_rows = parse_category_map_txt(text)
+    out_path = target or Path(__file__).resolve().with_name("wecatalog_tag_category_map.json")
+    rows = build_json_rows(raw_rows)
+    try:
+        out_path.write_text(
+            json.dumps(rows, ensure_ascii=False, separators=(",", ":")),
+            encoding="utf-8",
+        )
+    except OSError as e:
+        raise CategoryMapTxtError(
+            f"cannot write output JSON: {out_path}: {e}",
+            fix="Close editors/locks on wecatalog_tag_category_map.json or pick a writable disk.",
+        ) from e
+    return out_path, len(rows)
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description="从 txt 生成 wecatalog_tag_category_map.json")
     ap.add_argument(
@@ -299,20 +323,7 @@ def main() -> None:
 
     inp = args.input if args.input is not None else _DEFAULT_TXT
     try:
-        text = _read_mapping_txt_file(inp)
-        raw_rows = parse_category_map_txt(text)
-        target = Path(__file__).resolve().with_name("wecatalog_tag_category_map.json")
-        rows = build_json_rows(raw_rows)
-        try:
-            target.write_text(
-                json.dumps(rows, ensure_ascii=False, separators=(",", ":")),
-                encoding="utf-8",
-            )
-        except OSError as e:
-            raise CategoryMapTxtError(
-                f"cannot write output JSON: {target}: {e}",
-                fix="Close editors/locks on wecatalog_tag_category_map.json or pick a writable disk.",
-            ) from e
+        target, row_count = write_map_from_txt(inp)
     except CategoryMapTxtError as e:
         print(str(e), file=sys.stderr)
         raise SystemExit(1) from None
@@ -323,7 +334,7 @@ def main() -> None:
             [
                 ("event", "mapbuild.wrote"),
                 ("path", str(target)),
-                ("rows", len(rows)),
+                ("rows", row_count),
                 ("input", str(inp)),
             ],
             zh="已从 txt 生成并写入分类映射表",
