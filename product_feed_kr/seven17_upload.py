@@ -18,6 +18,7 @@
 `SEVEN17_FILL_IT_EXPLAN`（默认 false：不向后台填写 상품설명/모바일 상품설명；设为 true 恢复填写）、
 `LISTING_LLM_RESTART_AFTER_ITEMS` / `SEVEN17_UPLOAD_RESTART_AFTER_ITEMS`（默认 1000：本 run 写回 LLM / 上架成功达 N 条后退出码 75，供外层立即重跑；0 关闭）、
 `SEVEN17_UPLOAD_THREADS`（默认 1：上架工作线程数，每线程独立 Playwright 登录）。
+检测到 ``login.php``（会话失效）时自动 ``login_admin`` 并重试当前商品一次。
 
 上传模块不再调用 LLM：只读取 SQLite 已有的 ``listing_llm`` 结果（如 ``cny_price`` / ``name_ko`` / ``desc_ko``）。LLM 写回请用 ``python -m product_feed_kr.seven17_llm``（``llm_enrich_sqlite.bat``）。
 
@@ -192,6 +193,72 @@ def _stdout_utf8() -> None:
 
 def _env_required(name: str) -> str:
     return _cfg_required(name)
+
+
+def _page_is_login(page: Any) -> bool:
+    return "login.php" in (getattr(page, "url", None) or "")
+
+
+def _upload_fail_is_session_expired(fail_reason: str | None, page: Any) -> bool:
+    if fail_reason and "会话失效" in fail_reason:
+        return True
+    return _page_is_login(page)
+
+
+def _relogin_upload_session(
+    page: Any,
+    ctx: UploadRunContext,
+    *,
+    thread_label: str = "",
+    rec: dict[str, Any] | None = None,
+) -> bool:
+    """会话失效时重新登录；成功返回 True，仍停留在 login.php 返回 False。"""
+    th_kv = [("thread", thread_label)] if thread_label else []
+    row_kv = pf_store_row_id_kv(rec) if rec else []
+    _log.warning(
+        "%s",
+        pf_kv(
+            [
+                *th_kv,
+                ("event", "upload.session.relogin"),
+                *row_kv,
+                ("url", page.url),
+            ],
+            zh="检测到登录页，自动重新登录后台",
+        ),
+    )
+    login_admin(
+        page,
+        base=ctx.seven17_base,
+        mb_id=ctx.mb_id,
+        mb_password=ctx.mb_password,
+        redirect_full_url=ctx.itemform_url,
+    )
+    if _page_is_login(page):
+        _log.error(
+            "%s",
+            pf_kv(
+                [
+                    *th_kv,
+                    ("event", "upload.session.relogin_fail"),
+                    ("url", page.url),
+                ],
+                zh="重新登录失败，仍停留在登录页",
+            ),
+        )
+        return False
+    _log.info(
+        "%s",
+        pf_kv(
+            [
+                *th_kv,
+                *row_kv,
+                ("event", "upload.session.relogin_ok"),
+            ],
+            zh="重新登录成功，将重试当前商品",
+        ),
+    )
+    return True
 
 
 def _classify_after_submit(page, dialogs: list[str]) -> tuple[bool, str | None, str | None]:
@@ -1080,6 +1147,9 @@ class UploadRunContext:
     write_back: bool
     limit: int | None
     itemform_url: str
+    seven17_base: str
+    mb_id: str
+    mb_password: str
     stock_qty: str
     default_price: str
     sc_type: str
@@ -1258,77 +1328,110 @@ def _process_upload_record(
             sqlite_update_product_row(conn, aid, rec)
 
         ca_ko, ca_zh = _ca_id_log_paths(gname, tname)
-        page.goto(ctx.itemform_url, wait_until="domcontentloaded", timeout=120_000)
-        _fill_itemform(
-            page,
-            goods_id=gid,
-            wecatalog_group=gname,
-            wecatalog_tag=tname,
-            ca_id=ca_id,
-            ca_path_ko=ca_ko,
-            ca_path_zh=ca_zh,
-            title=upload_title,
-            price=listing_price,
-            stock_qty=ctx.stock_qty,
-            desc_html=desc_html,
-            image_path=None,
-            image_paths=tmp_files,
-            sc_type=ctx.sc_type,
-            option_attr_map_ko=llm_data.get("attr_map_ko")
-            if isinstance(llm_data.get("attr_map_ko"), dict)
-            else None,
-            price_cny_for_log=pcny_log,
-            fx_krw_per_cny=fx_log_rate,
-        )
+        last_fail_reason: str | None = None
+        for upload_attempt in range(2):
+            if upload_attempt > 0:
+                if not _relogin_upload_session(page, ctx, thread_label=thread_label, rec=rec):
+                    return (
+                        "fail",
+                        {
+                            "goods_id": gid,
+                            "error": "会话失效后重新登录失败（仍停留在 login.php）",
+                        },
+                    )
+                dialogs.clear()
 
-        if ctx.dry_run:
-            dry_payload: dict[str, Any] = {
-                "dry_run": True,
-                "goods_id": gid,
-                "title": upload_title,
-                "price_cny": cny_src,
-                "it_price_krw": listing_price,
-            }
-            if llm_data:
-                dry_payload["listing_llm"] = {
-                    "cny_price": llm_data.get("cny_price"),
-                    "attr_map": llm_data.get("attr_map"),
-                    "attr_map_ko": llm_data.get("attr_map_ko"),
-                    "name_zh": llm_data.get("name_zh"),
-                    "name_ko": llm_data.get("name_ko"),
-                    "desc_zh": llm_data.get("desc_zh"),
-                    "desc_ko": llm_data.get("desc_ko"),
+            page.goto(ctx.itemform_url, wait_until="domcontentloaded", timeout=120_000)
+            if _page_is_login(page):
+                if upload_attempt == 0 and _relogin_upload_session(
+                    page, ctx, thread_label=thread_label, rec=rec
+                ):
+                    dialogs.clear()
+                    page.goto(ctx.itemform_url, wait_until="domcontentloaded", timeout=120_000)
+                if _page_is_login(page):
+                    return (
+                        "fail",
+                        {
+                            "goods_id": gid,
+                            "error": "打开商品表单时被重定向到登录页",
+                        },
+                    )
+
+            _fill_itemform(
+                page,
+                goods_id=gid,
+                wecatalog_group=gname,
+                wecatalog_tag=tname,
+                ca_id=ca_id,
+                ca_path_ko=ca_ko,
+                ca_path_zh=ca_zh,
+                title=upload_title,
+                price=listing_price,
+                stock_qty=ctx.stock_qty,
+                desc_html=desc_html,
+                image_path=None,
+                image_paths=tmp_files,
+                sc_type=ctx.sc_type,
+                option_attr_map_ko=llm_data.get("attr_map_ko")
+                if isinstance(llm_data.get("attr_map_ko"), dict)
+                else None,
+                price_cny_for_log=pcny_log,
+                fx_krw_per_cny=fx_log_rate,
+            )
+
+            if ctx.dry_run:
+                dry_payload: dict[str, Any] = {
+                    "dry_run": True,
+                    "goods_id": gid,
+                    "title": upload_title,
+                    "price_cny": cny_src,
+                    "it_price_krw": listing_price,
                 }
-            if ctx.convert_fx and krw_pc is not None:
-                dry_payload["fx_krw_per_cny"] = krw_pc
-                dry_payload["fx_source"] = fx_src
-            print(json.dumps(dry_payload, ensure_ascii=False))
-            return "ok", None
+                if llm_data:
+                    dry_payload["listing_llm"] = {
+                        "cny_price": llm_data.get("cny_price"),
+                        "attr_map": llm_data.get("attr_map"),
+                        "attr_map_ko": llm_data.get("attr_map_ko"),
+                        "name_zh": llm_data.get("name_zh"),
+                        "name_ko": llm_data.get("name_ko"),
+                        "desc_zh": llm_data.get("desc_zh"),
+                        "desc_ko": llm_data.get("desc_ko"),
+                    }
+                if ctx.convert_fx and krw_pc is not None:
+                    dry_payload["fx_krw_per_cny"] = krw_pc
+                    dry_payload["fx_source"] = fx_src
+                print(json.dumps(dry_payload, ensure_ascii=False))
+                return "ok", None
 
-        click_itemform_submit(page)
-        page.wait_for_load_state("load", timeout=120_000)
+            click_itemform_submit(page)
+            page.wait_for_load_state("load", timeout=120_000)
 
-        ok_submit, it_id, fail_reason = _classify_after_submit(page, dialogs)
-        if ok_submit:
-            if ctx.write_back:
-                rec["uploaded_to_platform"] = True
-                rec["seven17_uploaded_at"] = now_cst8_iso()
-                sqlite_mark_uploaded(conn, aid, rec)
-            row_out: dict[str, Any] = {
-                "ok": True,
-                "goods_id": gid,
-                "title": upload_title,
-                "it_price": listing_price,
-            }
-            if ctx.convert_fx and krw_pc is not None:
-                row_out["price_cny"] = cny_src
-                row_out["fx_krw_per_cny"] = krw_pc
-            if it_id:
-                row_out["it_id"] = it_id
-            print(json.dumps(row_out, ensure_ascii=False))
-            return "ok", None
+            ok_submit, it_id, fail_reason = _classify_after_submit(page, dialogs)
+            if ok_submit:
+                if ctx.write_back:
+                    rec["uploaded_to_platform"] = True
+                    rec["seven17_uploaded_at"] = now_cst8_iso()
+                    sqlite_mark_uploaded(conn, aid, rec)
+                row_out: dict[str, Any] = {
+                    "ok": True,
+                    "goods_id": gid,
+                    "title": upload_title,
+                    "it_price": listing_price,
+                }
+                if ctx.convert_fx and krw_pc is not None:
+                    row_out["price_cny"] = cny_src
+                    row_out["fx_krw_per_cny"] = krw_pc
+                if it_id:
+                    row_out["it_id"] = it_id
+                print(json.dumps(row_out, ensure_ascii=False))
+                return "ok", None
 
-        return "fail", {"goods_id": gid, "error": fail_reason or "未知错误"}
+            last_fail_reason = fail_reason
+            if upload_attempt == 0 and _upload_fail_is_session_expired(fail_reason, page):
+                continue
+            break
+
+        return "fail", {"goods_id": gid, "error": last_fail_reason or "未知错误"}
     except Exception as e:
         return "fail", {"goods_id": gid, "error": str(e)}
     finally:
@@ -1616,6 +1719,9 @@ def upload_from_wecatalog_store(
         write_back=write_back,
         limit=limit,
         itemform_url=itemform_url,
+        seven17_base=base,
+        mb_id=mb_id,
+        mb_password=mb_password,
         stock_qty=stock_qty,
         default_price=default_price,
         sc_type=sc_type,
