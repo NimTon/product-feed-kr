@@ -1,5 +1,5 @@
 {
-  "_说明": "OPENAI_PROFILES：label 用中文备注即可；必填 base_url、model、api_key/api_keys。未填 key 不建线程。豆包 model 填 ep- 接入点 ID。",
+  "_说明": "OPENAI_PROFILES：label 用中文备注即可；必填 base_url、model、api_key/api_keys。未填 key 不建线程。豆包 model 填 ep- 接入点 ID。threads 可选，控制该 API 并发线程数（0=禁用，默认 1，最大 3）。",
   "PRODUCT_FEED_SQLITE": "data/product_feed.db",
   "WECATALOG_ALBUM_ID": "",
   "WECATALOG_DETAIL_DELAY": "5",
@@ -8,7 +8,8 @@
       "label": "阿里云通义千问",
       "api_keys": [""],
       "base_url": "https://dashscope.aliyuncs.com/compatible-mode/v1",
-      "model": "qwen-plus"
+      "model": "qwen-plus",
+      "threads": 1
     },
     {
       "label": "腾讯混元",
@@ -38,7 +39,7 @@
   "OPENAI_TIMEOUT": "120",
   "OPENAI_LISTING_LLM_BATCH_SIZE": "12",
   "OPENAI_ENRICH_LISTING": true,
-  "OPENAI_CATEGORY_FALLBACK": true,
+  "OPENAI_CATEGORY_FALLBACK": false,
   "SEVEN17_CA_OPTIONS_JSON": "data/seven17_ca_options.json",
   "SEVEN17_PATH_CA_MAP_JSON": "data/seven17_path_ca_map.json",
   "SEVEN17_SYNC_PATH_CA_AT_SCRAPE": true,
@@ -63,6 +64,8 @@
   "SEVEN17_MAX_IMAGES": "10",
   "WEGO_TITLE_PREFIX": "",
   "WEGO_DESC_TEMPLATE": "",
+  "WECATALOG_SCRAPE_SKIP_UNCATEGORIZED": true,
+  "WECATALOG_AUTO_APPEND_TXT": false,
   "WECATALOG_SCRAPE_RESTART_AFTER_ITEMS": 1000,
   "LISTING_LLM_RESTART_AFTER_ITEMS": 1000,
   "LISTING_LLM_ROUND_DELAY_SEC": "5",

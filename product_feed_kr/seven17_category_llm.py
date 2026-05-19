@@ -77,7 +77,7 @@ def warn_suggest_category_map(
 
 
 def category_llm_fallback_enabled() -> bool:
-    if not _cfg_bool("OPENAI_CATEGORY_FALLBACK", True):
+    if not _cfg_bool("OPENAI_CATEGORY_FALLBACK", False):
         return False
     return bool(listing_llm_api_profiles())
 
