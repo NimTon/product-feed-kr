@@ -34,6 +34,8 @@
 
 ``WECATALOG_DETAIL_DELAY``（默认 ``5``）：未传命令行 ``--detail-delay`` 时的节流默认值；格式与 ``--detail-delay`` 相同（如 ``"3,8"`` 或 JSON 数组 ``[3, 8]``）。环境变量优先于 ``seven17.json``。
 
+``WECATALOG_SCRAPE_SKIP_UNCATEGORIZED``（默认 ``true``）：仅爬取已在 ``wecatalog_tag_category_map.txt`` 中完成分类映射的商品，未映射的标签/分组下的商品将被跳过。设为 ``false`` / ``0`` 时也爬未映射商品（有分类的仍优先处理）。命令行 ``--skip-uncategorized`` 覆盖此配置。
+
 日志：与上架脚本同一套格式（**`event=`** + 短模块名 **`scrape:`**）；默认 **INFO** stderr；**`--log-file`** UTF-8；**`-v`** DEBUG。**`--headed`** 有界面浏览器。
 """
 
@@ -60,6 +62,7 @@ from product_feed_kr.wecatalog_fetch_tags import (
 )
 from product_feed_kr.seven17_config import (
     EXIT_RESTART_FRESH_DATA,
+    bool_env,
     getenv,
     reload_seven17_config,
     restart_after_n,
@@ -308,6 +311,8 @@ def scrape_store(
     detail_delay_range: tuple[float, float] = (5.0, 5.0),
     max_list_pages: int = 500,
     skip_detail: bool = False,
+    skip_uncategorized: bool = False,
+    auto_append_txt: bool = True,
     checkpoint_every: int = 0,
     max_records: int = 0,
     headed: bool = False,
@@ -343,8 +348,12 @@ def scrape_store(
                 ("seed", seed),
                 ("sqlite", str(sqlite_db_path())),
                 ("throttle_delay_sec_range", [delay_lo, delay_hi]),
+                ("skip_uncategorized", skip_uncategorized),
+                ("auto_append_txt", auto_append_txt),
             ],
-            zh="开始抓取微猫店铺：打开种子页并准备写 SQLite",
+            zh="开始抓取微猫店铺：打开种子页并准备写 SQLite"
+            + ("（跳过无分类商品）" if skip_uncategorized else "")
+            + ("（txt 自动补全关闭）" if not auto_append_txt else ""),
         ),
     )
 
@@ -419,7 +428,7 @@ def scrape_store(
                 "%s",
                 pf_kv([("event", "scrape.tags_ok"), ("groups", len(groups))], zh="分类/标签树拉取成功"),
             )
-            appended, unmapped = sync_unmapped_tags_after_tags(groups, logger)
+            appended, unmapped = sync_unmapped_tags_after_tags(groups, logger, auto_append=auto_append_txt)
             stats["map_unmapped"] = len(unmapped)
             stats["map_txt_appended"] = appended
 
@@ -641,6 +650,7 @@ def scrape_store(
                 return True
 
             stop_run = False
+            skipped_uncategorized = 0
             for new_items, _raw_pg, page_num in iter_album_list_pages(
                 page,
                 album_id,
@@ -650,33 +660,49 @@ def scrape_store(
                 stats["list_pages"] = page_num
                 stats["list_items_unique"] += len(new_items)
 
-                for g in groups:
-                    if stop_run:
-                        break
-                    gname = str(g.get("groupName") or "").strip()
-                    raw_tags = g.get("tags") or []
-                    if not isinstance(raw_tags, list):
-                        continue
-                    for t in raw_tags:
+                def _iter_groups_tags(*, categorized_only: bool):
+                    """遍历 groups×tags 处理 new_items；categorized_only=True 时只处理有分类的。"""
+                    nonlocal stop_run, skipped_uncategorized
+                    for g in groups:
                         if stop_run:
                             break
-                        if not isinstance(t, dict):
+                        gname = str(g.get("groupName") or "").strip()
+                        raw_tags = g.get("tags") or []
+                        if not isinstance(raw_tags, list):
                             continue
-                        tid = t.get("tagId")
-                        tname = str(t.get("tagName") or "").strip()
-                        if tid is None or not tname:
-                            continue
-                        try:
-                            tid_int = int(tid)
-                        except (TypeError, ValueError):
-                            continue
-                        shop_path = resolve_category_path(gname, tname)
-                        for it in new_items:
-                            if tid_int not in _tag_ids_on_item(it):
-                                continue
-                            if not append_product_row(it, gname, tname, tid_int, shop_path):
-                                stop_run = True
+                        for t in raw_tags:
+                            if stop_run:
                                 break
+                            if not isinstance(t, dict):
+                                continue
+                            tid = t.get("tagId")
+                            tname = str(t.get("tagName") or "").strip()
+                            if tid is None or not tname:
+                                continue
+                            try:
+                                tid_int = int(tid)
+                            except (TypeError, ValueError):
+                                continue
+                            shop_path = resolve_category_path(gname, tname)
+                            has_category = shop_path is not None and all(
+                                "（待补全）" not in seg for seg in shop_path
+                            )
+                            if categorized_only and not has_category:
+                                continue
+                            if not categorized_only and has_category:
+                                continue
+                            for it in new_items:
+                                if tid_int not in _tag_ids_on_item(it):
+                                    continue
+                                if not has_category:
+                                    skipped_uncategorized += 1
+                                if not append_product_row(it, gname, tname, tid_int, shop_path):
+                                    stop_run = True
+                                    break
+
+                _iter_groups_tags(categorized_only=True)
+                if not stop_run and not skip_uncategorized:
+                    _iter_groups_tags(categorized_only=False)
 
                 logger.info(
                     "%s",
@@ -687,6 +713,7 @@ def scrape_store(
                             ("page_items", len(new_items)),
                             ("list_unique", stats["list_items_unique"]),
                             ("records", len(records)),
+                            ("uncategorized_items", skipped_uncategorized if skipped_uncategorized else None),
                         ],
                         zh="本列表页处理完并已 checkpoint",
                     ),
@@ -697,6 +724,7 @@ def scrape_store(
 
             stats["records"] = len(records)
             stats["records_new"] = new_appended
+            stats["skipped_uncategorized"] = skipped_uncategorized
             write_checkpoint()
             logger.info(
                 "%s",
@@ -706,6 +734,8 @@ def scrape_store(
                         ("records", stats["records"]),
                         ("new", stats["records_new"]),
                         ("skipped", stats["skipped_existing"]),
+                        ("skipped_uncategorized", skipped_uncategorized),
+                        ("skip_uncategorized_enabled", skip_uncategorized),
                         ("detail_ok", stats["detail_ok"]),
                         ("detail_err", stats["detail_err"]),
                         ("album_id", album_id),
@@ -757,6 +787,12 @@ def main() -> int:
         help="本Run最多新增多少条「分组×标签×商品」记录（0 不限）；不含库内已有 goods_id",
     )
     ap.add_argument(
+        "--skip-uncategorized",
+        action="store_true",
+        default=None,
+        help="跳过未映射分类的商品（仅爬有分类的）；未传时读 WECATALOG_SCRAPE_SKIP_UNCATEGORIZED 配置",
+    )
+    ap.add_argument(
         "--log-file",
         type=Path,
         default=None,
@@ -782,6 +818,9 @@ def main() -> int:
         log_file = Path(__file__).resolve().parent.parent / "data" / "wecatalog_scrape_store.log"
     configure_scrape_logging(log_file, verbose=args.verbose)
 
+    skip_uncat = args.skip_uncategorized if args.skip_uncategorized is not None else bool_env("WECATALOG_SCRAPE_SKIP_UNCATEGORIZED", True)
+    auto_append = bool_env("WECATALOG_AUTO_APPEND_TXT", False)
+
     def _run_once() -> int:
         try:
             stats = scrape_store(
@@ -790,6 +829,8 @@ def main() -> int:
                 detail_delay_range=(d_lo, d_hi),
                 max_list_pages=max(1, args.max_list_pages),
                 skip_detail=args.skip_detail,
+                skip_uncategorized=skip_uncat,
+                auto_append_txt=auto_append,
                 checkpoint_every=max(0, args.checkpoint_every),
                 max_records=max(0, args.max_records),
                 headed=args.headed,

@@ -232,9 +232,13 @@ def append_missing_tags_to_map_txt(
 def sync_unmapped_tags_after_tags(
     groups: list[dict[str, Any]],
     logger: logging.Logger | None = None,
+    *,
+    auto_append: bool = True,
 ) -> tuple[int, list[tuple[str, str, int]]]:
     """
     对比 API 标签树与当前映射：缺失项写入 txt，打 WARNING 列出清单。
+
+    ``auto_append=False`` 时仅打日志提醒，不修改 txt 文件。
     返回 (本次追加到 txt 的行数, 未映射列表)。
     """
     lg = logger or _log
@@ -247,7 +251,17 @@ def sync_unmapped_tags_after_tags(
         sync_tag_ids_from_groups(groups, logger=lg)
         return 0, []
 
-    added = append_missing_tags_to_map_txt(missing)
+    added = 0
+    if auto_append:
+        added = append_missing_tags_to_map_txt(missing)
+    else:
+        lg.info(
+            "%s",
+            pf_kv(
+                [("event", "scrape.map.auto_append_off"), ("unmapped", len(missing))],
+                zh="txt 自动补全已关闭，跳过追加未映射标签",
+            ),
+        )
     if added > 0:
         try:
             rebuild_map_json_from_txt()
