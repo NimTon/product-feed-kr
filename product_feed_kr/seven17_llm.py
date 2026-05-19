@@ -1,6 +1,6 @@
 """对 SQLite 店铺商品执行 LLM enrich 并写回（不登录 seven17、不上架）。
 
-``OPENAI_PROFILES`` 展开后多于 1 个 ``api_key`` 时同进程多线程；每完成一次 API 响应后重新读库取下一条待处理记录。
+``OPENAI_PROFILES`` 总线程数 > 1（多 api_key 或单 key ``"threads": 1~3``）时同进程多线程；每完成一次 API 响应后重新读库取下一条待处理记录。
 
 运行示例::
 
@@ -15,6 +15,7 @@ from __future__ import annotations
 import argparse
 import json
 import logging
+import queue
 import sys
 import threading
 from pathlib import Path
@@ -145,14 +146,16 @@ def _run_llm_multithread_claim_loop(
     include_uploaded: bool,
     limit: int | None,
     restart_after: int,
+    active_profiles: list | None = None,
 ) -> tuple[int, bool]:
     from product_feed_kr.listing_llm_enrich import enrich_record_listing_llm, listing_llm_api_profiles
-    from product_feed_kr.store_sqlite import connect_sqlite, sqlite_update_product_row
+    from product_feed_kr.store_sqlite import connect_sqlite, sqlite_update_llm_result
 
-    profiles = listing_llm_api_profiles()
-    if len(profiles) <= 1:
+    profiles = active_profiles if active_profiles is not None else listing_llm_api_profiles()
+    total_threads = sum(p.get("threads", 1) for p in profiles)
+    if total_threads <= 1:
         raise ValueError(
-            "multithread claim loop 需要 OPENAI_PROFILES 展开后至少 2 个 api_key",
+            "multithread claim loop 需要总线程数 > 1（通过多 api_key 或 threads 配置）",
         )
 
     aid = album_id.strip()
@@ -162,6 +165,9 @@ def _run_llm_multithread_claim_loop(
     updated_total = 0
     restart_fresh = False
     stop_event = threading.Event()
+    work_q: queue.Queue[tuple[dict[str, Any], dict[str, Any]] | None] = queue.Queue(
+        maxsize=max(2, total_threads * 2)
+    )
 
     _log.info(
         "%s",
@@ -169,8 +175,8 @@ def _run_llm_multithread_claim_loop(
             [
                 ("event", "llm.threads.start"),
                 ("mode", "claim_next"),
-                ("threads", len(profiles)),
-                ("labels", ",".join(p["label"] for p in profiles)),
+                ("threads", total_threads),
+                ("labels", ",".join(f"{p['label']}x{p.get('threads',1)}" for p in profiles)),
                 (
                     "endpoints",
                     ",".join(
@@ -183,23 +189,25 @@ def _run_llm_multithread_claim_loop(
         ),
     )
 
+    max_consecutive_fail = 3
+    fused_profiles: set[str] = set()
+    fuse_lock = threading.Lock()
+
     def _worker(profile: Any) -> None:
         nonlocal updated_total, restart_fresh
+        label = profile.get("label", "?")
+        consecutive_fail = 0
         conn = connect_sqlite()
         try:
-            while not stop_event.is_set():
-                with updated_lock:
-                    if isinstance(limit, int) and limit > 0 and updated_total >= limit:
-                        stop_event.set()
-                        break
-                item = _claim_next_llm_work_item(
-                    conn,
-                    aid,
-                    include_uploaded=include_uploaded,
-                    claim_lock=claim_lock,
-                    in_flight=in_flight,
-                )
+            while True:
+                if stop_event.is_set() and work_q.empty():
+                    break
+                try:
+                    item = work_q.get(timeout=0.5)
+                except queue.Empty:
+                    continue
                 if item is None:
+                    work_q.task_done()
                     break
                 rec, com = item
                 key = _llm_row_key(rec)
@@ -223,10 +231,13 @@ def _run_llm_multithread_claim_loop(
                 except Exception as e:
                     record_after_llm_attempt(rec, com, ok=False, error=str(e))
                 finally:
-                    sqlite_update_product_row(conn, aid, rec)
+                    sqlite_update_llm_result(conn, aid, rec)
                     with claim_lock:
                         in_flight.discard(key)
+                    work_q.task_done()
+
                 if success:
+                    consecutive_fail = 0
                     with updated_lock:
                         updated_total += 1
                         if restart_after > 0 and updated_total >= restart_after:
@@ -239,28 +250,101 @@ def _run_llm_multithread_claim_loop(
                                         ("event", "llm.restart_after"),
                                         ("rows_updated", updated_total),
                                         ("restart_after", restart_after),
-                                        ("thread", profile["label"]),
+                                        ("thread", label),
                                     ],
                                     zh="已达 LLM 写回条数阈值，结束各线程",
                                 ),
                             )
+                else:
+                    consecutive_fail += 1
+                    if consecutive_fail >= max_consecutive_fail:
+                        with fuse_lock:
+                            fused_profiles.add(label)
+                        _log.warning(
+                            "%s",
+                            pf_kv(
+                                [
+                                    ("event", "llm.fuse"),
+                                    ("label", label),
+                                    ("consecutive_fail", consecutive_fail),
+                                ],
+                                zh=f"连续失败 {consecutive_fail} 次，熔断线程：{label}（可能 API 过期/余额不足）",
+                            ),
+                        )
+                        break
         finally:
             conn.close()
 
-    threads = [
-        threading.Thread(
-            target=_worker,
-            args=(profile,),
-            name=f"llm-{profile['label']}",
-            daemon=True,
-        )
-        for profile in profiles
-    ]
+    def _dispatch() -> None:
+        """仅调度线程读取 SQLite 并分配任务，worker 不直接读库。"""
+        conn = connect_sqlite()
+        try:
+            while not stop_event.is_set():
+                with updated_lock:
+                    if isinstance(limit, int) and limit > 0 and updated_total >= limit:
+                        stop_event.set()
+                        break
+                item = _claim_next_llm_work_item(
+                    conn,
+                    aid,
+                    include_uploaded=include_uploaded,
+                    claim_lock=claim_lock,
+                    in_flight=in_flight,
+                )
+                if item is None:
+                    break
+                while not stop_event.is_set():
+                    try:
+                        work_q.put(item, timeout=0.5)
+                        break
+                    except queue.Full:
+                        continue
+        finally:
+            conn.close()
+            for _ in range(total_threads):
+                while True:
+                    try:
+                        work_q.put(None, timeout=0.5)
+                        break
+                    except queue.Full:
+                        if stop_event.is_set():
+                            continue
+                        continue
+
+    threads: list[threading.Thread] = []
+    for profile in profiles:
+        n = max(1, profile.get("threads", 1))
+        for ti in range(n):
+            suffix = f"-{ti}" if n > 1 else ""
+            threads.append(
+                threading.Thread(
+                    target=_worker,
+                    args=(profile,),
+                    name=f"llm-{profile['label']}{suffix}",
+                    daemon=True,
+                )
+            )
+    dispatcher = threading.Thread(target=_dispatch, name="llm-dispatcher", daemon=True)
+    dispatcher.start()
     for t in threads:
         t.start()
+    dispatcher.join()
     for t in threads:
         t.join()
 
+    if fused_profiles:
+        _log.warning(
+            "%s",
+            pf_kv(
+                [
+                    ("event", "llm.fuse.summary"),
+                    ("fused", len(fused_profiles)),
+                    ("total_threads", len(threads)),
+                    ("fused_labels", ",".join(sorted(fused_profiles))),
+                ],
+                zh=f"本轮有 {len(fused_profiles)} 个线程被熔断：{','.join(sorted(fused_profiles))}",
+            ),
+        )
     _log.info(
         "%s",
         pf_kv(
@@ -268,6 +352,7 @@ def _run_llm_multithread_claim_loop(
                 ("event", "llm.threads.done"),
                 ("rows_updated", updated_total),
                 ("restart_fresh", restart_fresh),
+                ("fused", len(fused_profiles)),
             ],
             zh="多线程 LLM 本 run 结束",
         ),
@@ -286,7 +371,9 @@ def enrich_llm_for_sqlite_records(
         enrich_records_listing_llm_batch,
         listing_llm_api_profiles,
         listing_llm_batch_size,
+        listing_llm_color_vision_enabled,
         listing_llm_enabled,
+        probe_all_profiles,
     )
 
     aid = album_id.strip()
@@ -303,7 +390,7 @@ def enrich_llm_for_sqlite_records(
     from product_feed_kr.store_sqlite import (
         connect_sqlite,
         ensure_sqlite_schema,
-        sqlite_update_product_row,
+        sqlite_update_llm_result,
     )
 
     conn = connect_sqlite()
@@ -311,14 +398,24 @@ def enrich_llm_for_sqlite_records(
         ensure_sqlite_schema(conn)
         batch_size = listing_llm_batch_size()
         restart_after_llm = restart_after_n("LISTING_LLM_RESTART_AFTER_ITEMS", 1000)
-        api_profiles = listing_llm_api_profiles()
+        api_profiles = probe_all_profiles(
+            listing_llm_api_profiles(),
+            test_vision=listing_llm_color_vision_enabled(),
+        )
+        if not api_profiles:
+            return {
+                "ok": False,
+                "error": "所有 API 探测均未通过，本轮跳过 LLM 处理",
+                "all_probes_failed": True,
+            }
         updated_total = 0
         restart_fresh = False
         rows_total = 0
         rows_eligible = 0
         skipped_no_detail = 0
 
-        if len(api_profiles) > 1:
+        total_threads = sum(p.get("threads", 1) for p in api_profiles)
+        if total_threads > 1:
             _, rows_total, skipped_no_detail = _load_llm_work_rows(
                 conn,
                 aid,
@@ -345,6 +442,7 @@ def enrich_llm_for_sqlite_records(
                     include_uploaded=include_uploaded,
                     limit=limit,
                     restart_after=restart_after_llm,
+                    active_profiles=api_profiles,
                 )
         else:
             pending_rows, rows_total, skipped_no_detail = _load_llm_work_rows(
@@ -372,7 +470,7 @@ def enrich_llm_for_sqlite_records(
                 )
                 success_n = 0
                 for rec in changed:
-                    sqlite_update_product_row(conn, aid, rec)
+                    sqlite_update_llm_result(conn, aid, rec)
                     ll = rec.get("listing_llm")
                     if (
                         isinstance(ll, dict)
@@ -410,6 +508,9 @@ def enrich_llm_for_sqlite_records(
         conn.close()
 
 
+_EXIT_ALL_PROBES_FAILED = 3
+
+
 def _run_once(args: argparse.Namespace) -> int:
     aid = (args.album_id or _cfg_get("WECATALOG_ALBUM_ID") or "").strip()
     try:
@@ -422,6 +523,8 @@ def _run_once(args: argparse.Namespace) -> int:
         if out.get("restart_fresh"):
             reload_seven17_config()
             return EXIT_RESTART_FRESH_DATA
+        if out.get("all_probes_failed"):
+            return _EXIT_ALL_PROBES_FAILED
         return 0 if out.get("ok") else 2
     except Exception as e:
         print(json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False), file=sys.stderr)
@@ -484,6 +587,7 @@ def main() -> int:
                     logger=_log,
                     on_restart_fresh=reload_seven17_config,
                     round_delay_sec=_llm_round_delay_sec(),
+                    fatal_codes={_EXIT_ALL_PROBES_FAILED: 60},
                 )
             return _run_once(args)
     except SystemExit as e:

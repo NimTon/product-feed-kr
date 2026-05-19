@@ -31,6 +31,7 @@ class ListingLlmApiProfile(TypedDict):
     api_key: str
     base_url: str | None
     model: str
+    threads: int
 
 
 # 鞋类语境：用于 attr_map_ko 中欧码→韩版毫米标换算（与 name/desc 合并判断）。
@@ -129,7 +130,7 @@ _SYSTEM = """你是电商商品信息抽取助手。只输出一个 JSON 对象�
 字段要求：
 - cny_price：字符串或 null。能确定人民币售价时填数字字符串（如 "340"）；**完全无法判断时请填 null**（不要猜价）。
 - attr_map：对象，**下单必选项**，仅含 **颜色**、**尺码** 两类 key（中文名）：`颜色`、`尺码`。
-  - `颜色`：value 为颜色字符串数组（如 ["灰","黑"]）；标题或图中无法佐证的色不要写。
+  - `颜色`：value 为颜色字符串数组（如 ["灰","黑"]）；标题或图中无法佐证的色不要写。若提供了图片，**只允许输出图片里实际可见的颜色**。
   - `尺码`：value 为尺码字符串数组；尺码值以字母规格为主（S/M/L/XL…）；「012码」「0123码」表示多档（0=S、1=M、2=L、3=XL…），优先直接输出展开后的数组。
   - 无可抽取项时对应 key 可省略或填 []；两者皆无时 attr_map 为 {}。
 - attr_map_ko：对象，与 attr_map 对齐，key 仅用韩文 **`색상`**、**`사이즈`**，value 为韩文或通用尺码符号数组（색상 값尽量用韩文色名）。
@@ -153,6 +154,8 @@ _USER_TMPL = """请根据以下相册/微商商品标题抽取信息：
 _VISION_COLOR_SUPPLEMENT = """
 【已附带商品缩略图】须同时依据**图片中清晰可见的主体颜色/配色**校正颜色选项：
 - attr_map「颜色」与 attr_map_ko「색상」：只保留在图中**能明确辨认或强佐证**的颜色；标题列出但图中未见、无法确认的色**不要输出**。
+- 严禁“补色”：不要为了凑全标题颜色而补写图片里没有的颜色；宁缺毋滥。
+- 若无法从图片确定任何颜色，`颜色` / `색상` 置空（[] 或省略），不要猜。
 - 若图与标题在颜色上冲突，以**图为准**（仍须 >=90% 把握才写）。
 - 尺码、价格、名称与描述规则仍按上文；鞋类毫米规则不变。
 """
@@ -446,6 +449,40 @@ def listing_llm_needs_name_ko(
     return bool(src)
 
 
+def listing_llm_meets_upload_requirements(rec: dict[str, Any]) -> bool:
+    """按上架关键字段判断当前记录是否“已可上架”（LLM 侧可控字段）。"""
+    ll = rec.get("listing_llm")
+    if not isinstance(ll, dict):
+        return False
+    if not listing_llm_name_ko_usable(ll):
+        return False
+    if not str(ll.get("desc_ko") or "").strip():
+        return False
+    # 价格：优先 LLM cny_price；若缺失，可回退 commodity 价格（与 upload 侧一致）。
+    if listing_llm_cny_usable(ll):
+        return True
+    from product_feed_kr.wecatalog_store_record import commodity_from_wecatalog_record
+    from product_feed_kr.wego_commodity import parse_wego_product
+
+    com = commodity_from_wecatalog_record(rec)
+    if not isinstance(com, dict):
+        return False
+    default_price = str(_cfg_get("SEVEN17_DEFAULT_PRICE") or "0")
+    try:
+        prod = parse_wego_product(com, default_price_if_missing=default_price)
+    except ValueError:
+        return False
+    p = str(prod.get("price") or "").strip()
+    return bool(p and p not in ("0", "0.0"))
+
+
+def update_can_upload_flag(rec: dict[str, Any]) -> bool:
+    """按当前记录状态计算并写入 ``rec['can_upload']``。"""
+    ok = listing_llm_meets_upload_requirements(rec)
+    rec["can_upload"] = ok
+    return ok
+
+
 def _cny_price_field_usable(cp: Any) -> bool:
     if cp is None:
         return False
@@ -526,6 +563,8 @@ def listing_llm_is_gave_up(rec: dict[str, Any]) -> bool:
 
 
 def listing_llm_needs_api(rec: dict[str, Any]) -> bool:
+    if rec.get("can_process") is False:
+        return False
     if listing_llm_force_refresh():
         return True
     if listing_llm_attempts_exhausted(rec):
@@ -534,13 +573,7 @@ def listing_llm_needs_api(rec: dict[str, Any]) -> bool:
         return False
     existing = rec.get("listing_llm")
     if isinstance(existing, dict) and rec.get("llm_processed_at"):
-        from product_feed_kr.wecatalog_store_record import commodity_from_wecatalog_record
-
-        com = commodity_from_wecatalog_record(rec)
-        title = str(com.get("title") or "").strip() if isinstance(com, dict) else ""
-        if listing_llm_needs_name_ko(existing, title=title):
-            return True
-        return False
+        return not listing_llm_meets_upload_requirements(rec)
     return True
 
 
@@ -621,6 +654,7 @@ def record_after_llm_attempt(
     ll = record.get("listing_llm")
     if isinstance(ll, dict):
         apply_listing_llm_price_to_commodity(commodity, ll)
+    update_can_upload_flag(record)
     return True
 
 
@@ -721,6 +755,15 @@ def _profiles_from_mapping(
         label_base = f"{host or 'default'}-{index}"
     else:
         label_base = "default"
+    threads_raw = item.get("threads")
+    try:
+        threads_per_key = int(threads_raw) if threads_raw is not None else 1
+    except (TypeError, ValueError):
+        threads_per_key = 1
+    # 约束范围：0=禁用该 profile，1~3=有效并发，>3 按 3 处理。
+    threads_per_key = min(3, max(0, threads_per_key))
+    if threads_per_key == 0:
+        return []
     multi_keys = len(api_keys) > 1
     profiles: list[ListingLlmApiProfile] = []
     for ki, api_key in enumerate(api_keys):
@@ -729,7 +772,7 @@ def _profiles_from_mapping(
         else:
             label = label_base
         profiles.append(
-            ListingLlmApiProfile(label=label, api_key=api_key, base_url=base, model=model),
+            ListingLlmApiProfile(label=label, api_key=api_key, base_url=base, model=model, threads=threads_per_key),
         )
     return profiles
 
@@ -757,7 +800,7 @@ def _openai_profiles_from_openai_profiles_key() -> list[ListingLlmApiProfile]:
 
 
 def listing_llm_api_profiles() -> list[ListingLlmApiProfile]:
-    """从 ``OPENAI_PROFILES`` 解析；每项可 ``api_keys: [..]`` 共享同一 base_url/model。每个 api_key 一线程。"""
+    """从 ``OPENAI_PROFILES`` 解析；每项可 ``api_keys: [..]`` 共享同一 base_url/model。``threads`` 控制每个 api_key 的并发线程数（默认 1）。"""
     return _openai_profiles_from_openai_profiles_key()
 
 
@@ -787,7 +830,7 @@ def listing_llm_all_profile_slots() -> list[ListingLlmApiProfile]:
             label_raw = item.get("label")
             label = str(label_raw).strip() if label_raw is not None and str(label_raw).strip() else f"slot-{group_i}"
             slots.append(
-                ListingLlmApiProfile(label=label, api_key="", base_url=base or None, model=model),
+                ListingLlmApiProfile(label=label, api_key="", base_url=base or None, model=model, threads=1),
             )
         group_i += 1
     return slots
@@ -803,7 +846,7 @@ def _resolve_api_profile(api_profile: ListingLlmApiProfile | None) -> ListingLlm
 
 
 def listing_llm_thread_count() -> int:
-    return max(1, len(listing_llm_api_profiles()))
+    return max(1, sum(p.get("threads", 1) for p in listing_llm_api_profiles()))
 
 
 def listing_llm_color_vision_enabled() -> bool:
@@ -892,6 +935,211 @@ def _openai_client(
     bu = (base_url or "").strip()
     host = urlparse(bu).netloc if bu else "default"
     return client, model, host
+
+
+def _make_probe_image_data_url() -> str:
+    """生成一张 16x16 红色 JPEG 小图的 data URL，用于探测多模态能力。"""
+    try:
+        from PIL import Image
+        buf = io.BytesIO()
+        im = Image.new("RGB", (16, 16), color=(255, 0, 0))
+        im.save(buf, format="JPEG", quality=80)
+        b64 = base64.standard_b64encode(buf.getvalue()).decode("ascii")
+        return f"data:image/jpeg;base64,{b64}"
+    except ImportError:
+        return ""
+
+
+def probe_profile(
+    profile: ListingLlmApiProfile,
+    *,
+    timeout: float | None = None,
+    test_vision: bool = True,
+) -> dict[str, bool | str]:
+    """对单个 API profile 做连通性探测（文生文 + 图生文），返回结果 dict。
+
+    返回格式::
+
+        {"text_ok": True/False, "text_error": "...",
+         "vision_ok": True/False, "vision_error": "..."}
+    """
+    result: dict[str, bool | str] = {
+        "text_ok": False, "text_error": "",
+        "vision_ok": False, "vision_error": "",
+    }
+    label = profile.get("label", "?")
+    try:
+        client, model, host = _openai_client(timeout or 15, api_profile=profile)
+    except Exception as e:
+        err = f"客户端初始化失败: {e!s}"[:300]
+        _log.warning(
+            "%s",
+            pf_kv(
+                [("event", "llm.probe.init_fail"), ("label", label), ("err", err)],
+                zh=f"探测失败（{label}）：{err}",
+            ),
+        )
+        result["text_error"] = err
+        result["vision_error"] = err
+        return result
+
+    # --- 文生文 ---
+    try:
+        content, elapsed = _chat_once_json(
+            client,
+            model=model,
+            messages=[
+                {"role": "system", "content": "只输出 JSON：{\"status\":\"ok\"}"},
+                {"role": "user", "content": "ping"},
+            ],
+            use_response_format=False,
+        )
+        if "ok" in content.lower():
+            result["text_ok"] = True
+        else:
+            result["text_ok"] = True
+        _log.info(
+            "%s",
+            pf_kv(
+                [("event", "llm.probe.text_ok"), ("label", label), ("model", model),
+                 ("host", host), ("elapsed_ms", elapsed)],
+                zh=f"文生文探测通过（{label}）",
+            ),
+        )
+    except Exception as e:
+        err = str(e)[:300]
+        result["text_error"] = err
+        _log.warning(
+            "%s",
+            pf_kv(
+                [("event", "llm.probe.text_fail"), ("label", label), ("model", model),
+                 ("host", host), ("err", err)],
+                zh=f"文生文探测失败（{label}）：{err}",
+            ),
+        )
+
+    # --- 图生文 ---
+    if test_vision and result["text_ok"]:
+        probe_img = _make_probe_image_data_url()
+        if not probe_img:
+            result["vision_error"] = "Pillow 未安装，无法生成探测图片"
+            _log.warning(
+                "%s",
+                pf_kv(
+                    [("event", "llm.probe.vision_skip"), ("label", label)],
+                    zh=f"图生文探测跳过（{label}）：Pillow 未安装",
+                ),
+            )
+        else:
+            try:
+                t0 = time.monotonic()
+                resp = client.chat.completions.create(
+                    model=model,
+                    messages=[
+                        {"role": "system", "content": "描述图片内容，一句话。"},
+                        {"role": "user", "content": [
+                            {"type": "text", "text": "这是什么颜色？"},
+                            {"type": "image_url", "image_url": {"url": probe_img}},
+                        ]},
+                    ],
+                    temperature=0.1,
+                    )
+                elapsed_ms = int((time.monotonic() - t0) * 1000)
+                msg_content = (getattr(resp.choices[0].message, "content", None) or "").strip()
+                if msg_content:
+                    result["vision_ok"] = True
+                _log.info(
+                    "%s",
+                    pf_kv(
+                        [("event", "llm.probe.vision_ok"), ("label", label), ("model", model),
+                         ("host", host), ("elapsed_ms", elapsed_ms)],
+                        zh=f"图生文探测通过（{label}）",
+                    ),
+                )
+            except Exception as e:
+                err = str(e)[:300]
+                result["vision_error"] = err
+                _log.warning(
+                    "%s",
+                    pf_kv(
+                        [("event", "llm.probe.vision_fail"), ("label", label), ("model", model),
+                         ("host", host), ("err", err)],
+                        zh=f"图生文探测失败（{label}）：{err}",
+                    ),
+                )
+    elif not result["text_ok"]:
+        result["vision_error"] = "文生文未通过，跳过图生文"
+
+    return result
+
+
+def probe_all_profiles(
+    profiles: list[ListingLlmApiProfile],
+    *,
+    test_vision: bool = True,
+) -> list[ListingLlmApiProfile]:
+    """对所有 profile 做探测，返回通过探测的 profile 列表（不通过的已 WARNING 并过滤）。
+
+    同一 api_key + base_url 只探测一次；不同 key 并行探测。
+    """
+    import concurrent.futures
+
+    if not profiles:
+        return []
+
+    unique_map: dict[tuple[str, str], ListingLlmApiProfile] = {}
+    for p in profiles:
+        ck = (p.get("api_key", ""), p.get("base_url") or "")
+        if ck not in unique_map:
+            unique_map[ck] = p
+
+    probed: dict[tuple[str, str], dict[str, bool | str]] = {}
+    with concurrent.futures.ThreadPoolExecutor(max_workers=len(unique_map)) as pool:
+        futures = {
+            pool.submit(probe_profile, p, test_vision=test_vision): ck
+            for ck, p in unique_map.items()
+        }
+        for fut in concurrent.futures.as_completed(futures):
+            ck = futures[fut]
+            probed[ck] = fut.result()
+
+    passed: list[ListingLlmApiProfile] = []
+    for p in profiles:
+        label = p.get("label", "?")
+        cache_key = (p.get("api_key", ""), p.get("base_url") or "")
+        r = probed[cache_key]
+        ok = bool(r["text_ok"]) and (not test_vision or bool(r["vision_ok"]))
+        if ok:
+            passed.append(p)
+        else:
+            _log.warning(
+                "%s",
+                pf_kv(
+                    [("event", "llm.probe.disabled"), ("label", label),
+                     ("text_error", r.get("text_error", "")),
+                     ("vision_error", r.get("vision_error", ""))],
+                    zh=f"API 探测未通过，本次运行已屏蔽：{label}",
+                ),
+            )
+    unique_total = len(probed)
+    unique_passed = sum(
+        1
+        for r in probed.values()
+        if bool(r["text_ok"]) and (not test_vision or bool(r["vision_ok"]))
+    )
+    _log.info(
+        "%s",
+        pf_kv(
+            [("event", "llm.probe.summary"),
+             ("profiles", len(profiles)),
+             ("unique_apis", unique_total),
+             ("apis_passed", unique_passed),
+             ("threads_passed", len(passed)),
+             ("passed_labels", ",".join(p.get("label", "?") for p in passed))],
+            zh=f"API 探测完成：{unique_passed}/{unique_total} 个 API 通过，{len(passed)} 个线程可用",
+        ),
+    )
+    return passed
 
 
 _SYSTEM_NAME_KO_ONLY = """你是电商标题翻译助手。只输出一个 JSON 对象，不要 Markdown。
@@ -1050,6 +1298,7 @@ def enrich_records_listing_llm_batch(
         existing = record.get("listing_llm")
         if isinstance(existing, dict) and record.get("llm_processed_at") and not listing_llm_force_refresh():
             apply_listing_llm_price_to_commodity(commodity, existing)
+            update_can_upload_flag(record)
             changed.append(record)
             _log.info(
                 "%s",
@@ -1184,6 +1433,7 @@ def enrich_records_listing_llm_batch(
                 record["llm_processed_at"] = ll_final["processed_at"]
                 note_llm_attempt_consumed(record)
                 apply_listing_llm_price_to_commodity(commodity, ll_final)
+                update_can_upload_flag(record)
                 changed.append(record)
                 _log.info(
                     "%s",
@@ -1277,6 +1527,7 @@ def enrich_record_listing_llm(
     if isinstance(existing, dict) and record.get("llm_processed_at") and not listing_llm_force_refresh():
         apply_listing_llm_price_to_commodity(commodity, existing)
         if listing_llm_name_ko_usable(existing):
+            update_can_upload_flag(record)
             _log.info(
                 "%s",
                 pf_kv(
@@ -1296,6 +1547,7 @@ def enrich_record_listing_llm(
             count_attempt=True,
         ):
             apply_listing_llm_price_to_commodity(commodity, record["listing_llm"])
+            update_can_upload_flag(record)
             return True
         _log.warning(
             "%s",
@@ -1405,6 +1657,7 @@ def enrich_record_listing_llm(
     if register_attempt:
         note_llm_attempt_consumed(record)
     apply_listing_llm_price_to_commodity(commodity, ll_final)
+    update_can_upload_flag(record)
     normalized = ll_final
     _log.info(
         "%s",

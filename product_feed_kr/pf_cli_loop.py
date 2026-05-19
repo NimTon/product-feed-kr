@@ -28,7 +28,9 @@ def run_forever(
     logger: logging.Logger,
     on_restart_fresh: Callable[[], None] | None = None,
     round_delay_sec: float = 0.0,
+    fatal_codes: dict[int, float] | None = None,
 ) -> int:
+    """``fatal_codes``：退出码 → 等待秒数后终止进程（不继续循环）。"""
     round_n = 0
     while True:
         round_n += 1
@@ -38,6 +40,21 @@ def run_forever(
             return 130
         if code == EXIT_SINGLETON_CONFLICT:
             return code
+
+        if fatal_codes and code in fatal_codes:
+            wait = fatal_codes[code]
+            logger.warning(
+                "%s",
+                pf_kv(
+                    [("event", "run.fatal"), ("task", task_label), ("exit", code),
+                     ("wait_sec", wait), ("round", round_n)],
+                    zh=f"遇到致命退出码 {code}，等待 {wait:.0f}s 后退出",
+                ),
+            )
+            if wait > 0:
+                time.sleep(wait)
+            return code
+
         if code == EXIT_RESTART_FRESH_DATA:
             if on_restart_fresh is not None:
                 on_restart_fresh()
