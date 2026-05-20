@@ -25,6 +25,12 @@ from product_feed_kr.pf_log import log_item_separator, pf_goods_id, pf_kv, pf_st
 
 _log = logging.getLogger(__name__)
 
+_NO_PRICE_ALLOW_DEFAULT = (
+    "手表专区",
+    "女士包专区",
+    "定制皮夹克",
+)
+
 
 class ListingLlmApiProfile(TypedDict):
     label: str
@@ -34,7 +40,7 @@ class ListingLlmApiProfile(TypedDict):
     threads: int
 
 
-# 鞋类语境：用于 attr_map_ko 中欧码→韩版毫米标换算（与 name/desc 合并判断）。
+# 鞋类语境：用于提示词与后处理（欧码 → 韩版毫米脚长）。
 _FOOTWEAR_HINT_RE = re.compile(
     r"鞋|靴|拖|sneaker|boot|loafer|sandal|heel|flip\s*flop|"
     r"运动(?:鞋|靴)|休闲鞋|板鞋|跑鞋|球鞋|帆布|高跟|凉鞋|乐福|穆勒|豆豆|马丁|"
@@ -42,42 +48,49 @@ _FOOTWEAR_HINT_RE = re.compile(
     re.I,
 )
 
-# 欧码整数 → 韩国通贩常用脚长毫米标（与多数品牌对照表接近；半码见 _EU_HALF_TO_KR_MM）。
-_EU_INT_TO_KR_MM: dict[int, str] = {
-    33: "215",
-    34: "220",
-    35: "225",
-    36: "230",
-    37: "235",
-    38: "240",
-    39: "245",
-    40: "250",
-    41: "255",
-    42: "260",
-    43: "265",
-    44: "270",
-    45: "275",
-    46: "280",
-    47: "285",
-    48: "290",
+# 欧码 → 韩版毫米脚长（合并各鞋型/男女款对照表；整数码保留原表，半码取邻码上沿）。
+_KR_MM_EU_TO_MM: dict[str, str] = {
+    "32": "210",
+    "32.5": "215",
+    "33": "215",
+    "33.5": "220",
+    "34": "220",
+    "34.5": "225",
+    "35": "225",
+    "35.5": "230",
+    "36": "230",
+    "36.5": "235",
+    "37": "235",
+    "37.5": "240",
+    "38": "240",
+    "38.5": "245",
+    "39": "245",
+    "39.5": "250",
+    "40": "250",
+    "40.5": "255",
+    "41": "260",
+    "41.5": "265",
+    "42": "265",
+    "42.5": "270",
+    "43": "275",
+    "43.5": "280",
+    "44": "280",
+    "44.5": "285",
+    "45": "290",
+    "45.5": "295",
+    "46": "295",
+    "46.5": "300",
+    "47": "300",
+    "47.5": "305",
+    "48": "305",
+    "48.5": "310",
+    "49": "310",
+    "49.5": "315",
+    "50": "315",
 }
 
-_EU_HALF_TO_KR_MM: dict[str, str] = {
-    "33.5": "220",
-    "34.5": "225",
-    "35.5": "230",
-    "36.5": "235",
-    "37.5": "240",
-    "38.5": "245",
-    "39.5": "250",
-    "40.5": "255",
-    "41.5": "260",
-    "42.5": "265",
-    "43.5": "270",
-    "44.5": "275",
-    "45.5": "280",
-    "46.5": "285",
-}
+_EU_SHOE_SIZE_MIN = 32
+_EU_SHOE_SIZE_MAX = 50
 
 
 def _text_suggests_footwear(blob: str) -> bool:
@@ -87,19 +100,20 @@ def _text_suggests_footwear(blob: str) -> bool:
 
 
 def _shoe_size_token_to_kr_mm(tok: str) -> str:
-    """鞋类语境下：欧码/「EU42」等 → 韩版毫米字符串；已是 3 位 mm 或字母尺码则不变。"""
+    """鞋类：欧码 / 「EU42」等 → 韩版毫米脚长字符串；已是 210–320 毫米则原样保留。"""
     t0 = str(tok).strip()
     if not t0:
         return tok
+    size_map = _KR_MM_EU_TO_MM
     m_eu = re.fullmatch(r"(?i)EU\s*([0-9]{2})(\.[05])?", t0)
     if m_eu:
         whole = int(m_eu.group(1))
         frac = m_eu.group(2)
         if frac:
             key = f"{whole}{frac}"
-            return _EU_HALF_TO_KR_MM.get(key, tok)
-        if 33 <= whole <= 48:
-            return _EU_INT_TO_KR_MM.get(whole, tok)
+            return size_map.get(key, tok)
+        if _EU_SHOE_SIZE_MIN <= whole <= _EU_SHOE_SIZE_MAX:
+            return size_map.get(str(whole), tok)
         return tok
     # 含字母且非纯 EU 数字：S/M/L/XL、2XL 等保持原样。
     if re.search(r"[A-Za-z]", t0) and not re.fullmatch(r"(?i)EU\s*[0-9]{2}(?:\.[05])?", t0):
@@ -115,10 +129,21 @@ def _shoe_size_token_to_kr_mm(tok: str) -> str:
         whole = int(m2.group(1))
         if m2.group(2):
             key = f"{whole}{m2.group(2)}"
-            return _EU_HALF_TO_KR_MM.get(key, tok)
-        if 33 <= whole <= 48:
-            return _EU_INT_TO_KR_MM.get(whole, tok)
+            return size_map.get(key, tok)
+        if _EU_SHOE_SIZE_MIN <= whole <= _EU_SHOE_SIZE_MAX:
+            return size_map.get(str(whole), tok)
     return tok
+
+
+def _shoe_sizes_to_kr_mm(tokens: list[str]) -> list[str]:
+    out: list[str] = []
+    seen: set[str] = set()
+    for x in tokens:
+        y = _shoe_size_token_to_kr_mm(x)
+        if y not in seen:
+            seen.add(y)
+            out.append(y)
+    return out
 
 
 _SYSTEM = """你是电商商品信息抽取助手。只输出一个 JSON 对象，不要 Markdown 围栏，不要多余说明。
@@ -129,12 +154,15 @@ _SYSTEM = """你是电商商品信息抽取助手。只输出一个 JSON 对象�
 
 字段要求：
 - cny_price：字符串或 null。能确定人民币售价时填数字字符串（如 "340"）；**完全无法判断时请填 null**（不要猜价）。
+  - 价格优先级：标题里出现 `Pxxx` / `pxxx`（如 `P260`、`p318`）时，优先将其中数字视为实际售价。
+  - 若同时出现“原价/专柜价/吊牌价/划线价/市场价”等字样，对应数字视为营销参考价，**不要当作 cny_price**。
+  - 出现多个价格冲突且无法高置信判断真实成交价时，返回 null。
 - attr_map：对象，**下单必选项**，仅含 **颜色**、**尺码** 两类 key（中文名）：`颜色`、`尺码`。
   - `颜色`：value 为颜色字符串数组（如 ["灰","黑"]）；标题或图中无法佐证的色不要写。若提供了图片，**只允许输出图片里实际可见的颜色**。
-  - `尺码`：value 为尺码字符串数组；尺码值以字母规格为主（S/M/L/XL…）；「012码」「0123码」表示多档（0=S、1=M、2=L、3=XL…），优先直接输出展开后的数组。
+  - `尺码`：value 为尺码字符串数组。非鞋类以字母规格为主（S/M/L/XL…）；「012码」「0123码」表示多档（0=S、1=M、2=L、3=XL…），优先直接输出展开后的数组。
+  - **鞋类**（标题含鞋/靴/运动鞋 등）：`尺码` 只输出 **欧码数字**（如 36、37、40.5、EU42），不要换算成毫米脚长，不要输出 S/M/L。
   - 无可抽取项时对应 key 可省略或填 []；两者皆无时 attr_map 为 {}。
-- attr_map_ko：对象，与 attr_map 对齐，key 仅用韩文 **`색상`**、**`사이즈`**，value 为韩文或通用尺码符号数组（색상 값尽量用韩文色名）。
-  - **鞋类**（标题含鞋/靴/运动鞋 등）：`사이즈` 请用韩国通贩 **毫米脚长**（230、235…）；欧码两位数字可先写欧码，后处理会换算毫米。
+- attr_map_ko：对象，与 attr_map 对齐，key 仅用韩文 **`색상`**、**`사이즈`**，value 为韩文色名或与 attr_map 尺码 **相同的欧码数字**（색상 값尽量用韩文色名；鞋类 `사이즈` 勿换算毫米，后处理自动换算）。
   - 无对应项时填 {} 或省略 key。
 - name_zh：字符串，必须精简为核心中文商品名（尽量 8~20 字），去掉营销词、emoji、口号、重复品牌/型号堆砌。
 - name_ko：字符串，韩文精简商品名（尽量 8~24 字），同样去掉营销冗余。**只要输出了非空的 name_zh，就必须同时给出对应的韩文 name_ko（不得留空）**；仅当整段标题无法提炼中文名时才允许 name_ko 为 ""。
@@ -157,7 +185,7 @@ _VISION_COLOR_SUPPLEMENT = """
 - 严禁“补色”：不要为了凑全标题颜色而补写图片里没有的颜色；宁缺毋滥。
 - 若无法从图片确定任何颜色，`颜色` / `색상` 置空（[] 或省略），不要猜。
 - 若图与标题在颜色上冲突，以**图为准**（仍须 >=90% 把握才写）。
-- 尺码、价格、名称与描述规则仍按上文；鞋类毫米规则不变。
+- 尺码、价格、名称与描述规则仍按上文；鞋类只提取欧码数字，不做毫米换算。
 """
 
 _SYSTEM_BATCH = """你是电商商品信息抽取助手。输入是一个 JSON 数组，每项含 idx、goods_id、title。
@@ -169,8 +197,11 @@ _SYSTEM_BATCH = """你是电商商品信息抽取助手。输入是一个 JSON �
 - 置信度 <90% 的字段不要填（按类型返回空值）。
 - items 必须是数组，且每个 idx 必须对应输入的 idx。
 - cny_price：字符串或 null。能确定人民币售价时填数字字符串；完全无法判断填 null，不要猜价。
+  - 价格优先级：若 title 含 `Pxxx` / `pxxx`，优先取 `P` 后数字作为实际售价。
+  - “原价/专柜价/吊牌价/划线价/市场价”等数字是参考价，不要作为 cny_price。
+  - 多个价格冲突且无法高置信判定时，cny_price 必须为 null。
 - attr_map：仅 **颜色**、**尺码** 两个中文 key；无则 {} 或省略键。尺码值不要带「码」字后缀；「012码」类可写 ["S","M","L"] 或数字串（后处理按位展开）。
-- attr_map_ko：仅 **색상**、**사이즈**；与 attr_map 颜色/尺码一一对应（顺序一致）。鞋类 `사이즈` 用毫米脚长。
+- attr_map_ko：仅 **색상**、**사이즈**；与 attr_map 颜色/尺码一一对应（顺序一致）。鞋类 `사이즈` 与 `尺码` 相同，只写欧码数字，勿换算毫米。
 - name_zh / name_ko / desc_zh / desc_ko 同单条模式；有 name_zh 时 name_ko 必填韩文译名。
 - 只输出 JSON，不要 Markdown、不要额外解释。
 """
@@ -235,7 +266,6 @@ def _normalize_llm_payload(data: dict[str, Any], *, listing_hint: str | None = N
         key_max: int = 24,
         val_max: int = 40,
         ko: bool = False,
-        shoe_kr_mm: bool = False,
     ) -> dict[str, list[str]]:
         out_map: dict[str, list[str]] = {}
         if not isinstance(raw, dict):
@@ -339,7 +369,7 @@ def _normalize_llm_payload(data: dict[str, Any], *, listing_hint: str | None = N
 
         def _size_tokens(text: str) -> list[str]:
             out_toks: list[str] = []
-            for t in re.findall(r"[A-Za-z0-9]+", text):
+            for t in re.findall(r"(?i)EU\s*[0-9]{2}(?:\.[05])?|[0-9]{2}(?:\.[05])?|[A-Za-z0-9]+", text):
                 exp = _expand_digit_slot_code(t) if t.isdigit() else None
                 if exp:
                     out_toks.extend(exp)
@@ -368,15 +398,6 @@ def _normalize_llm_payload(data: dict[str, Any], *, listing_hint: str | None = N
                             continue
                         seen.add(tok)
                         uniq.append(tok)
-                if uniq and ko and shoe_kr_mm:
-                    conv: list[str] = []
-                    seen_mm: set[str] = set()
-                    for x in uniq:
-                        y = _shoe_size_token_to_kr_mm(x)
-                        if y not in seen_mm:
-                            seen_mm.add(y)
-                            conv.append(y)
-                    uniq = conv
             elif key_norm == canonical_color:
                 for v in arr:
                     vv = _norm_text(v, val_max)
@@ -392,10 +413,18 @@ def _normalize_llm_payload(data: dict[str, Any], *, listing_hint: str | None = N
                 out_map[key_norm] = prev + [x for x in uniq if x not in seen_prev]
         return out_map
 
-    out["attr_map"] = _normalize_attr_map(data.get("attr_map"), ko=False, shoe_kr_mm=False)
+    out["attr_map"] = _normalize_attr_map(data.get("attr_map"), ko=False)
     out["attr_map_ko"] = _normalize_attr_map(
-        data.get("attr_map_ko"), ko=True, key_max=30, val_max=48, shoe_kr_mm=shoe_ctx
+        data.get("attr_map_ko"), ko=True, key_max=30, val_max=48
     )
+    if shoe_ctx:
+        size_src = out["attr_map"].get("尺码") or []
+        if size_src:
+            mm_sizes = _shoe_sizes_to_kr_mm(size_src)
+            if mm_sizes:
+                ko_map = dict(out["attr_map_ko"])
+                ko_map["사이즈"] = mm_sizes
+                out["attr_map_ko"] = ko_map
 
     name_zh = data.get("name_zh")
     out["name_zh"] = _norm_text(name_zh, 24)
@@ -458,22 +487,33 @@ def listing_llm_meets_upload_requirements(rec: dict[str, Any]) -> bool:
         return False
     if not str(ll.get("desc_ko") or "").strip():
         return False
-    # 价格：优先 LLM cny_price；若缺失，可回退 commodity 价格（与 upload 侧一致）。
+    # 价格：优先 LLM cny_price；LLM/回退均无价时仅白名单可放行（走默认价）。
     if listing_llm_cny_usable(ll):
         return True
     from product_feed_kr.wecatalog_store_record import commodity_from_wecatalog_record
     from product_feed_kr.wego_commodity import parse_wego_product
+    from product_feed_kr.wego_commodity import parse_price_str
 
     com = commodity_from_wecatalog_record(rec)
     if not isinstance(com, dict):
         return False
-    default_price = str(_cfg_get("SEVEN17_DEFAULT_PRICE") or "0")
+    # 回退 1：抓取阶段写入的 commodity_price_raw。
+    raw = parse_price_str(rec.get("commodity_price_raw"), "")
+    if raw and raw not in ("0", "0.0"):
+        return True
+    # 回退 2：commodity 自身可解析价格（含 title 里的 Pxxx / ￥xxx）。
     try:
-        prod = parse_wego_product(com, default_price_if_missing=default_price)
+        prod = parse_wego_product(com, default_price_if_missing="")
+        p = str(prod.get("price") or "").strip()
+        if p and p not in ("0", "0.0"):
+            return True
     except ValueError:
+        pass
+    # LLM + 回退都无价：仅命中 map 分类白名单且默认价有效时可上架。
+    if not _record_is_no_price_allowed_by_map_category(rec):
         return False
-    p = str(prod.get("price") or "").strip()
-    return bool(p and p not in ("0", "0.0"))
+    default_price = parse_price_str(_cfg_get("SEVEN17_DEFAULT_PRICE"), "")
+    return bool(default_price and default_price not in ("0", "0.0"))
 
 
 def update_can_upload_flag(rec: dict[str, Any]) -> bool:
@@ -488,6 +528,74 @@ def _cny_price_field_usable(cp: Any) -> bool:
         return False
     s = str(cp).strip()
     return bool(s and s.lower() != "null" and s != "-1")
+
+
+def _no_price_allow_category_specs() -> list[str]:
+    raw = str(_cfg_get("SEVEN17_NO_PRICE_ALLOW_CATEGORIES") or "").strip()
+    if not raw:
+        return list(_NO_PRICE_ALLOW_DEFAULT)
+    out: list[str] = []
+    for part in re.split(r"[,\n;\|，、]+", raw):
+        tok = str(part).strip()
+        if tok:
+            out.append(tok)
+    return out or list(_NO_PRICE_ALLOW_DEFAULT)
+
+
+def _all_map_group_tag_pairs() -> tuple[tuple[str, str], ...]:
+    from product_feed_kr.wecatalog_tag_mapping import mapping_rows
+
+    out: list[tuple[str, str]] = []
+    for g, t, _path, _anchor, _tid in mapping_rows():
+        gs = str(g or "").strip()
+        ts = str(t or "").strip()
+        if gs and ts:
+            out.append((gs, ts))
+    return tuple(out)
+
+
+def _split_group_tag_spec(spec: str) -> tuple[str, str] | None:
+    text = str(spec or "").strip()
+    if not text:
+        return None
+    for sep in ("->", ">", "｜", "|", "/", "／", "＞"):
+        if sep in text:
+            left, right = text.split(sep, 1)
+            g = left.strip()
+            t = right.strip()
+            if g and t:
+                return g, t
+            return None
+    return None
+
+
+def _no_price_allow_group_tag_pairs() -> frozenset[tuple[str, str]]:
+    all_pairs = _all_map_group_tag_pairs()
+    all_pairs_set = set(all_pairs)
+    specs = _no_price_allow_category_specs()
+    allow: set[tuple[str, str]] = set()
+    for spec in specs:
+        pair = _split_group_tag_spec(spec)
+        if pair is not None:
+            if pair in all_pairs_set:
+                allow.add(pair)
+            continue
+        # 单值视为「tag 精确名」，展开到 map 中全部同名 tag（严格等值，不做模糊）。
+        tag = str(spec or "").strip()
+        if not tag:
+            continue
+        for g, t in all_pairs:
+            if t == tag:
+                allow.add((g, t))
+    return frozenset(allow)
+
+
+def _record_is_no_price_allowed_by_map_category(rec: dict[str, Any]) -> bool:
+    g = str(rec.get("wecatalog_group") or "").strip()
+    t = str(rec.get("wecatalog_tag") or "").strip()
+    if not g or not t:
+        return False
+    return (g, t) in _no_price_allow_group_tag_pairs()
 
 
 def listing_llm_cny_usable(listing_llm: dict[str, Any]) -> bool:

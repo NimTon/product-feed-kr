@@ -1,16 +1,17 @@
 @echo off
-rem Run from repo root: create venv and pip install -r requirements.txt
+rem Run from test\ ; this script operates on repo root
 rem PIP_CONFIG_FILE: config\pip_tsinghua.ini when present (Tsinghua mirror)
 rem If no Python: tries winget Microsoft Store Python 3.12, then winget Python.Python.3.12
 rem After Store install, if python is still missing: close this window, open a new cmd, run again
 chcp 65001 >nul
-cd /d "%~dp0"
+set "ROOT=%~dp0\.."
+cd /d "%ROOT%"
 
-if exist "%~dp0config\pip_tsinghua.ini" (
-  set "PIP_CONFIG_FILE=%~dp0config\pip_tsinghua.ini"
+if exist "%ROOT%\config\pip_tsinghua.ini" (
+  set "PIP_CONFIG_FILE=%ROOT%\config\pip_tsinghua.ini"
 )
 
-set "VENV_PY=%~dp0venv\Scripts\python.exe"
+set "VENV_PY=%ROOT%\venv\Scripts\python.exe"
 set "PYEXE="
 
 call :find_python
@@ -19,7 +20,7 @@ if defined PYEXE goto :have_python
 echo [setup] Python not found; trying winget (Microsoft Store: Python 3.12)...
 where winget >nul 2>nul
 if errorlevel 1 (
-  echo [setup] winget not found. Install Python 3.12 from Microsoft Store or https://www.python.org (add to PATH), then re-run setup_venv.bat.
+  echo [setup] winget not found. Install Python 3.12 from Microsoft Store or https://www.python.org (add to PATH), then re-run test\setup_venv.bat.
   pause
   exit /b 1
 )
@@ -32,7 +33,7 @@ if errorlevel 1 (
 
 call :find_python
 if not defined PYEXE (
-  echo [setup] Python still not found in this session. Close this window, open a new Command Prompt, run setup_venv.bat again (PATH refresh).
+  echo [setup] Python still not found in this session. Close this window, open a new Command Prompt, run test\setup_venv.bat again (PATH refresh).
   pause
   exit /b 1
 )
@@ -55,17 +56,17 @@ echo [setup] upgrading pip...
 if errorlevel 1 goto :fail
 
 echo [setup] pip install -r requirements.txt ...
-"%VENV_PY%" -m pip install -r "%~dp0requirements.txt"
+"%VENV_PY%" -m pip install -r "%ROOT%\requirements.txt"
 if errorlevel 1 goto :fail
 
-if not exist "%~dp0config\seven17.json" (
-  if exist "%~dp0config\seven17.example.json" (
+if not exist "%ROOT%\config\seven17.json" (
+  if exist "%ROOT%\config\seven17.example.json" (
     echo [setup] Tip: copy config\seven17.example.json to config\seven17.json and fill secrets.
   )
 )
 
 echo.
-echo [setup] Done. Run scrape_wecatalog_store.bat / llm_enrich_sqlite.bat / upload_*.bat
+echo [setup] Done. Run 01_采集微猫店铺.bat / 02_LLM补全上架信息.bat / 03_上传韩国站正式.bat
 echo [setup] Playwright: prefer chrome-win\chrome.exe, else system Chrome/Edge.
 echo [setup] Offline wheels: pip download -r requirements.txt -d wheels
 echo            then: venv\Scripts\pip install --no-index --find-links=wheels -r requirements.txt

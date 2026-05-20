@@ -1,12 +1,12 @@
 @echo off
 chcp 65001 >nul
 setlocal
-cd /d "%~dp0"
+cd /d "%~dp0\.."
 
-set "PY=%~dp0venv\Scripts\python.exe"
+set "PY=%~dp0..\venv\Scripts\python.exe"
 if not exist "%PY%" (
   echo [mapbuild] venv not found: %PY%
-  echo Run setup_venv.bat first.
+  echo Run test\setup_venv.bat first.
   pause
   endlocal & exit /b 1
 )

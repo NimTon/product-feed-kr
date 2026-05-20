@@ -21,7 +21,11 @@ python -m product_feed_kr.wecatalog_scrape_store --store-url "..." --out data/we
 
 # 映射表生成（编辑 config/wecatalog_tag_category_map.txt 后）
 python -m product_feed_kr.wecatalog_tag_category_map_builder
-# 或双击 build_wecatalog_tag_category_map.bat
+# 或双击 test\build_wecatalog_tag_category_map.bat
+
+# 无价格白名单 GUI（勾选 map.txt 分类并写入 SEVEN17_NO_PRICE_ALLOW_CATEGORIES）
+python -m product_feed_kr.seven17_no_price_whitelist_gui
+# 或双击 04_无价格白名单设置.bat
 
 # 上架（默认读取 data/wecatalog_store_products.json）
 python -m product_feed_kr.seven17_upload --limit 5
@@ -91,7 +95,7 @@ python -m product_feed_kr.seven17_upload --test-store-json data/wecatalog_store_
 
 若页面上「只剩分类像填对了」：先看 **가격是否为 0**（货源 `optimaPrice` / `priceArr` 是否为空）；再看 **상품설명** 是否在「웹에디터」里——脚本写的是 PC 설명栏，编辑器加载慢时已改为等待 CKEditor 实例后再 `setData`。
 
-Windows 一键爬取示例：**`scrape_wecatalog_store.bat`**（或并行三任务 **`run_scrape_llm_upload_parallel.bat`**）。
+Windows 核心入口：**`01_采集微猫店铺.bat`**、**`02_LLM补全上架信息.bat`**、**`03_上传韩国站正式.bat`**、**`04_无价格白名单设置.bat`**。并行三任务可用 **`test/run_scrape_llm_upload_parallel.bat`**。
 
 ## 包结构（保留文件）
 

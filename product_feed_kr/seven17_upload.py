@@ -11,6 +11,7 @@
 
 常用可选：`SEVEN17_CONFIG`、`SEVEN17_BASE_URL`、`SEVEN17_HEADLESS`、`SEVEN17_STOCK_QTY`、
 `SEVEN17_DEFAULT_PRICE`（货源无价格时兜底）、`SEVEN17_SC_TYPE`、`SEVEN17_MAX_IMAGES`、
+`SEVEN17_NO_PRICE_ALLOW_CATEGORIES`（无价格允许上传白名单分类，逗号分隔；仅匹配 map 的微猫分组/标签）、
 `WEGO_TITLE_PREFIX`、`WEGO_DESC_TEMPLATE`、
 `SEVEN17_CONVERT_CNY_TO_KRW`（默认 true：每条商品填表前拉汇率，把人民币售价换算为韩元填入 `it_price`）、
 `SEVEN17_CNY_KRW_RATE`（可选固定汇率，填则不走接口）、`SEVEN17_CNY_KRW_FALLBACK`（接口失败时的 1 CNY 兑多少 KRW）、
@@ -19,7 +20,7 @@
 `SEVEN17_UPLOAD_THREADS`（默认 1：上架工作线程数，每线程独立 Playwright 登录）。
 检测到 ``login.php``（会话失效）时自动 ``login_admin`` 并重试当前商品一次。
 
-上传模块不再调用 LLM：只读取 SQLite 已有的 ``listing_llm`` 结果（如 ``cny_price`` / ``name_ko`` / ``desc_ko``）。LLM 写回请用 ``python -m product_feed_kr.seven17_llm``（``llm_enrich_sqlite.bat``）。
+上传模块不再调用 LLM：只读取 SQLite 已有的 ``listing_llm`` 结果（如 ``cny_price`` / ``name_ko`` / ``desc_ko``）。LLM 写回请用 ``python -m product_feed_kr.seven17_llm``（``02_LLM补全上架信息.bat``）。
 
 真实上架：``SEVEN17_UPLOAD_THREADS`` >1 时同进程多线程（每线程独立 Playwright），每处理完一条后重新读库取下一条可上架记录。重复运行由进程锁拒绝（退出码 11）。
 
@@ -49,6 +50,7 @@ import json
 import logging
 import os
 import queue
+import re
 import sys
 import threading
 import tempfile
@@ -98,7 +100,6 @@ from product_feed_kr.process_singleton import EXIT_SINGLETON_CONFLICT, single_in
 # getLogger(__name__) 会落到 __main__，configure_pf_stderr 挂在 product_feed_kr.seven17_upload 上则永远打不出。
 _log = logging.getLogger("product_feed_kr.seven17_upload")
 _upload_logging_configured = False
-
 
 def _configure_upload_stderr_logging() -> None:
     """未在 main 中配置过文件日志时，仅挂 stderr（预览等子路径兜底）。"""
@@ -546,7 +547,7 @@ def itemform_preview_dict_from_store_record(
 
         if not listing_llm_name_ko_usable(llm_data):
             warnings.append(
-                "缺少韩文 name_ko：预览暂用原标题，实际上架会跳过；请运行 llm_enrich_sqlite.bat 补译",
+                "缺少韩文 name_ko：预览暂用原标题，实际上架会跳过；请运行 02_LLM补全上架信息.bat 补译",
             )
     if not urls:
         warnings.append("无 imgsSrc/imgs 可用 URL：上架时会因无主图跳过本条")
@@ -1113,6 +1114,23 @@ def _log_upload_pending(
     _log.info("%s", pf_kv(kv, zh="待上传商品数"))
 
 
+def _refresh_upload_runtime_caches() -> None:
+    """每轮上架前刷新分类相关缓存，避免长驻进程读到旧映射。"""
+    from product_feed_kr.seven17_path_ca_map import invalidate_path_ca_cache
+    from product_feed_kr.wecatalog_tag_mapping import invalidate_mapping_cache
+
+    invalidate_mapping_cache()
+    invalidate_path_ca_cache()
+    # seven17 分类目录是 lru_cache；运行时文件更新后需主动清理。
+    cache_clear = getattr(load_seven17_ca_catalog, "cache_clear", None)
+    if callable(cache_clear):
+        cache_clear()
+    _log.info(
+        "%s",
+        pf_kv([("event", "upload.cache.refresh")], zh="上架前已刷新分类映射缓存"),
+    )
+
+
 def upload_thread_count() -> int:
     """``SEVEN17_UPLOAD_THREADS``：上架工作线程数（默认 1）；每线程独立浏览器登录。"""
     raw = _cfg_get("SEVEN17_UPLOAD_THREADS")
@@ -1363,7 +1381,7 @@ def _process_upload_record(
             fx_log_rate = None
 
         if not str(listing_price).strip():
-            return "skip", None
+            return "skip", {"goods_id": gid, "error": "无法得到有效售价，已跳过"}
 
         rec["fx_krw_per_cny"] = krw_pc
         rec["price_krw"] = listing_price if (ctx.convert_fx and krw_pc is not None) else None
@@ -1907,6 +1925,7 @@ def upload_from_wecatalog_store(
     )
 
     try:
+        _refresh_upload_runtime_caches()
         _log_upload_pending(conn_db, upload_ctx, threads=upload_threads)
 
         if upload_threads > 1:
@@ -2082,7 +2101,7 @@ def main() -> int:
             "%s",
             pf_kv(
                 [("event", "llm_only.deprecated")],
-                zh="--llm-only 已移除，请改用 python -m product_feed_kr.seven17_llm 或 llm_enrich_sqlite.bat",
+                zh="--llm-only 已移除，请改用 python -m product_feed_kr.seven17_llm 或 02_LLM补全上架信息.bat",
             ),
         )
         from product_feed_kr import seven17_llm
