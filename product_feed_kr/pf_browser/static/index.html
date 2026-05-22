@@ -1,0 +1,560 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <title>商品库浏览 · product-feed-kr</title>
+  <style>
+    :root {
+      --bg: #0f1419;
+      --panel: #1a2332;
+      --border: #2d3a4f;
+      --text: #e7ecf3;
+      --muted: #8b9cb3;
+      --accent: #3d8bfd;
+      --ok: #3dd68c;
+      --warn: #f5a524;
+      --err: #f2555a;
+      --grp-status: #2a3548;
+      --grp-id: #263040;
+      --grp-scrape: #2a323f;
+      --grp-price: #2d3540;
+      --grp-spec: #2a3342;
+      --grp-llm: #2d3040;
+    }
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+      background: var(--bg);
+      color: var(--text);
+      font-size: 13px;
+      line-height: 1.45;
+    }
+    header {
+      padding: 14px 20px;
+      border-bottom: 1px solid var(--border);
+      background: var(--panel);
+      position: sticky;
+      top: 0;
+      z-index: 10;
+    }
+    h1 { margin: 0 0 6px; font-size: 18px; font-weight: 600; }
+    .sub { color: var(--muted); font-size: 12px; word-break: break-all; }
+    .toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+      margin-top: 12px;
+    }
+    label { color: var(--muted); font-size: 12px; }
+    input, select, button {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      color: var(--text);
+      border-radius: 6px;
+      padding: 6px 10px;
+      font-size: 13px;
+    }
+    button {
+      cursor: pointer;
+      background: var(--accent);
+      border-color: var(--accent);
+      color: #fff;
+    }
+    button.secondary {
+      background: transparent;
+      border-color: var(--border);
+      color: var(--text);
+    }
+    button:disabled { opacity: 0.45; cursor: not-allowed; }
+    main { padding: 12px 16px 24px; }
+    .stats {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 16px;
+      margin-bottom: 10px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .stats strong { color: var(--text); }
+    .legend {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 12px 20px;
+      margin-bottom: 8px;
+      font-size: 11px;
+      color: var(--muted);
+    }
+    .legend span::before {
+      content: "";
+      display: inline-block;
+      width: 10px;
+      height: 10px;
+      border-radius: 2px;
+      margin-right: 5px;
+      vertical-align: -1px;
+    }
+    .legend .g-status::before { background: var(--grp-status); }
+    .legend .g-id::before { background: var(--grp-id); }
+    .legend .g-scrape::before { background: var(--grp-scrape); }
+    .legend .g-price::before { background: var(--grp-price); }
+    .legend .g-spec::before { background: var(--grp-spec); }
+    .legend .g-llm::before { background: var(--grp-llm); }
+    .table-wrap {
+      overflow: auto;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--panel);
+      max-height: calc(100vh - 250px);
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      min-width: 1680px;
+    }
+    th, td {
+      padding: 7px 9px;
+      text-align: left;
+      border-bottom: 1px solid var(--border);
+      vertical-align: top;
+    }
+    th {
+      position: sticky;
+      top: 0;
+      background: #243044;
+      font-weight: 600;
+      font-size: 11px;
+      white-space: nowrap;
+      z-index: 1;
+    }
+    th.grp { border-left: 2px solid var(--border); }
+    th.grp-status { background: var(--grp-status); border-left: none; }
+    th.grp-id { background: var(--grp-id); }
+    th.grp-scrape { background: var(--grp-scrape); }
+    th.grp-price { background: var(--grp-price); }
+    th.grp-spec { background: var(--grp-spec); }
+    th.grp-llm { background: var(--grp-llm); }
+    td.grp { border-left: 2px solid rgba(45, 58, 79, 0.6); }
+    tr:hover td { background: rgba(61, 139, 253, 0.08); }
+    tr.clickable { cursor: pointer; }
+    .mono { font-family: ui-monospace, Consolas, monospace; font-size: 11px; }
+    .title-cell { max-width: 200px; }
+    .spec-cell { max-width: 140px; font-size: 12px; }
+    .badge {
+      display: inline-block;
+      padding: 1px 6px;
+      border-radius: 4px;
+      font-size: 11px;
+      margin: 0 3px 3px 0;
+    }
+    .badge.ok { background: rgba(61, 214, 140, 0.2); color: var(--ok); }
+    .badge.no { background: rgba(139, 156, 179, 0.15); color: var(--muted); }
+    .badge.warn { background: rgba(245, 165, 36, 0.2); color: var(--warn); }
+    .badge.up { background: rgba(61, 139, 253, 0.2); color: var(--accent); }
+    .pager {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px;
+      align-items: center;
+      margin-top: 12px;
+    }
+    .err { color: var(--err); padding: 12px; }
+    .loading { color: var(--muted); padding: 24px; text-align: center; }
+    dialog {
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      background: var(--panel);
+      color: var(--text);
+      max-width: 780px;
+      width: 94vw;
+      padding: 0;
+    }
+    dialog::backdrop { background: rgba(0,0,0,0.55); }
+    .modal-head {
+      padding: 12px 16px;
+      border-bottom: 1px solid var(--border);
+      display: flex;
+      justify-content: space-between;
+      align-items: center;
+      gap: 12px;
+    }
+    .modal-body {
+      padding: 12px 16px 16px;
+      max-height: 72vh;
+      overflow: auto;
+      font-size: 12px;
+    }
+    .section {
+      margin-bottom: 14px;
+      padding-bottom: 12px;
+      border-bottom: 1px solid var(--border);
+    }
+    .section:last-child { border-bottom: none; margin-bottom: 0; }
+    .section h3 {
+      margin: 0 0 8px;
+      font-size: 12px;
+      font-weight: 600;
+      color: var(--muted);
+      text-transform: none;
+      letter-spacing: 0.02em;
+    }
+    .kv {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+    .kv th {
+      position: static;
+      background: transparent;
+      font-weight: 500;
+      color: var(--muted);
+      width: 108px;
+      padding: 4px 8px 4px 0;
+      vertical-align: top;
+      border: none;
+    }
+    .kv td {
+      padding: 4px 0;
+      border: none;
+      word-break: break-word;
+    }
+    pre {
+      background: var(--bg);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      padding: 10px;
+      overflow: auto;
+      white-space: pre-wrap;
+      word-break: break-word;
+      margin: 4px 0 0;
+      max-height: 200px;
+      font-size: 12px;
+    }
+    a { color: var(--accent); }
+    .muted { color: var(--muted); }
+  </style>
+</head>
+<body>
+  <header>
+    <h1>商品库浏览</h1>
+    <div class="sub" id="dbPath">加载中…</div>
+    <div class="toolbar">
+      <div>
+        <label>店铺 album</label><br />
+        <select id="albumId" style="min-width:220px">
+          <option value="">全部</option>
+        </select>
+      </div>
+      <div>
+        <label>搜索</label><br />
+        <input id="q" type="search" placeholder="标题 / goods_id / 货号 / 中韩文名 / 描述 / 价格" style="width:280px" />
+      </div>
+      <div>
+        <label>排序</label><br />
+        <select id="sort">
+          <option value="llm">LLM 时间 ↓，再上传时间 ↓</option>
+          <option value="upload">上传时间 ↓，再 LLM 时间 ↓</option>
+          <option value="updated">更新时间 ↓</option>
+          <option value="created">创建时间 ↓</option>
+        </select>
+      </div>
+      <div>
+        <label>每页</label><br />
+        <select id="pageSize">
+          <option value="20">20</option>
+          <option value="50" selected>50</option>
+          <option value="100">100</option>
+        </select>
+      </div>
+      <div style="align-self:flex-end">
+        <button type="button" id="btnSearch">查询</button>
+        <button type="button" class="secondary" id="btnReload">刷新</button>
+      </div>
+    </div>
+  </header>
+  <main>
+    <div class="stats" id="stats"></div>
+    <div class="legend">
+      <span class="g-status">状态 / 时间</span>
+      <span class="g-id">标识</span>
+      <span class="g-scrape">微猫抓取</span>
+      <span class="g-price">价格</span>
+      <span class="g-spec">规格</span>
+      <span class="g-llm">LLM 文案</span>
+    </div>
+    <div class="table-wrap">
+      <div class="loading" id="loading">加载数据…</div>
+      <table id="tbl" hidden>
+        <thead>
+          <tr>
+            <th class="grp grp-status">ID</th>
+            <th class="grp grp-status">状态</th>
+            <th class="grp grp-status">LLM次</th>
+            <th class="grp grp-status">LLM 时间</th>
+            <th class="grp grp-status">上传时间</th>
+            <th class="grp grp-id">goods_id</th>
+            <th class="grp grp-id">分组 / 标签</th>
+            <th class="grp grp-scrape">原标题</th>
+            <th class="grp grp-scrape">货号</th>
+            <th class="grp grp-price">¥</th>
+            <th class="grp grp-price">₩</th>
+            <th class="grp grp-spec">中文尺码</th>
+            <th class="grp grp-spec">中文颜色</th>
+            <th class="grp grp-spec">韩文尺码</th>
+            <th class="grp grp-spec">韩文颜色</th>
+            <th class="grp grp-llm">中文商品名</th>
+            <th class="grp grp-llm">韩文商品名</th>
+            <th class="grp grp-llm">中文描述</th>
+            <th class="grp grp-llm">韩文描述</th>
+          </tr>
+        </thead>
+        <tbody id="tbody"></tbody>
+      </table>
+    </div>
+    <div class="pager">
+      <button type="button" class="secondary" id="btnPrev">上一页</button>
+      <span id="pageInfo">第 1 页</span>
+      <button type="button" class="secondary" id="btnNext">下一页</button>
+      <span style="color:var(--muted)" id="pageHint"></span>
+    </div>
+    <div class="err" id="err" hidden></div>
+  </main>
+
+  <dialog id="detailDlg">
+    <div class="modal-head">
+      <strong id="dlgTitle">详情</strong>
+      <button type="button" class="secondary" id="btnCloseDlg">关闭</button>
+    </div>
+    <div class="modal-body" id="dlgBody"></div>
+  </dialog>
+
+  <script>
+    const state = { page: 1, total: 0, pages: 1 };
+
+    const $ = (id) => document.getElementById(id);
+
+    function esc(s) {
+      if (s == null) return "";
+      return String(s)
+        .replace(/&/g, "&amp;")
+        .replace(/</g, "&lt;")
+        .replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;");
+    }
+
+    function badge(cls, text) {
+      return `<span class="badge ${cls}">${esc(text)}</span>`;
+    }
+
+    function statusBadges(row) {
+      const parts = [];
+      parts.push(row.can_process ? badge("ok", "可处理") : badge("no", "不可处理"));
+      if (row.can_upload) parts.push(badge("ok", "可上传"));
+      if (row.uploaded_to_platform) parts.push(badge("up", "已上传"));
+      return parts.join("") || "—";
+    }
+
+    function cellGrp(cls, html) {
+      return `<td class="grp ${cls}">${html}</td>`;
+    }
+
+    function listCell(preview) {
+      return esc(preview) || '<span class="muted">—</span>';
+    }
+
+    async function loadAlbums() {
+      const res = await fetch("/api/albums");
+      const data = await res.json();
+      const sel = $("albumId");
+      const cur = sel.value;
+      sel.innerHTML = '<option value="">全部</option>';
+      for (const a of data.albums || []) {
+        const opt = document.createElement("option");
+        opt.value = a.album_id;
+        opt.textContent = `${a.album_id} (${a.item_count} 条, LLM ${a.llm_count}, 已传 ${a.uploaded_count})`;
+        sel.appendChild(opt);
+      }
+      if (cur) sel.value = cur;
+    }
+
+    async function loadItems() {
+      $("loading").hidden = false;
+      $("tbl").hidden = true;
+      $("err").hidden = true;
+      const params = new URLSearchParams({
+        page: String(state.page),
+        page_size: $("pageSize").value,
+        sort: $("sort").value,
+      });
+      const album = $("albumId").value;
+      const q = $("q").value.trim();
+      if (album) params.set("album_id", album);
+      if (q) params.set("q", q);
+
+      try {
+        const res = await fetch("/api/items?" + params);
+        if (!res.ok) throw new Error(res.status + " " + res.statusText);
+        const data = await res.json();
+        $("dbPath").textContent = "数据库: " + data.db_path;
+        state.total = data.total;
+        state.pages = data.pages || 1;
+
+        $("stats").innerHTML =
+          `共 <strong>${data.total}</strong> 条 · 第 <strong>${data.page}</strong> / ${data.pages} 页 · ` +
+          `每页 ${data.page_size} · 排序 <strong>${data.sort}</strong>`;
+
+        const tbody = $("tbody");
+        tbody.innerHTML = "";
+        for (const row of data.items || []) {
+          const tr = document.createElement("tr");
+          tr.className = "clickable";
+          tr.dataset.id = row.id;
+          tr.innerHTML = [
+            cellGrp("", `<span class="mono">${row.id}</span>`),
+            cellGrp("", statusBadges(row)),
+            cellGrp("", `<span class="mono">${row.llm_attempt_count ?? 0}</span>`),
+            cellGrp("", `<span class="mono">${esc(row.llm_processed_at) || "—"}</span>`),
+            cellGrp("", `<span class="mono">${esc(row.seven17_uploaded_at) || "—"}</span>`),
+            cellGrp("", `<span class="mono">${esc(row.goods_id)}</span>`),
+            cellGrp("", esc(row.wecatalog_label)),
+            cellGrp("title-cell", `<span title="${esc(row.commodity_title)}">${esc(row.commodity_title_short)}</span>`),
+            cellGrp("", `<span class="mono">${esc(row.commodity_goods_num) || "—"}</span>`),
+            cellGrp("", esc(row.price_cny_display) || "—"),
+            cellGrp("", esc(row.price_krw_display) || "—"),
+            cellGrp("spec-cell", listCell(row.sizes_preview)),
+            cellGrp("spec-cell", listCell(row.colors_preview)),
+            cellGrp("spec-cell", listCell(row.sizes_ko_preview)),
+            cellGrp("spec-cell", listCell(row.colors_ko_preview)),
+            cellGrp("title-cell", `<span title="${esc(row.llm_name_zh)}">${esc(row.llm_name_zh_short) || "—"}</span>`),
+            cellGrp("title-cell", `<span title="${esc(row.llm_name_ko)}">${esc(row.llm_name_ko_short) || "—"}</span>`),
+            cellGrp("title-cell", `<span title="${esc(row.llm_desc_zh)}">${esc(row.llm_desc_zh_preview) || "—"}</span>`),
+            cellGrp("title-cell", `<span title="${esc(row.llm_desc_ko)}">${esc(row.llm_desc_ko_preview) || "—"}</span>`),
+          ].join("");
+          tr.addEventListener("click", () => openDetail(row.id));
+          tbody.appendChild(tr);
+        }
+
+        $("pageInfo").textContent = `第 ${data.page} / ${data.pages} 页`;
+        $("pageHint").textContent = `共 ${data.total} 条`;
+        $("btnPrev").disabled = data.page <= 1;
+        $("btnNext").disabled = data.page >= data.pages;
+        $("loading").hidden = true;
+        $("tbl").hidden = false;
+      } catch (e) {
+        $("loading").hidden = true;
+        $("err").hidden = false;
+        $("err").textContent = "加载失败: " + e.message;
+      }
+    }
+
+    function kvRow(label, value) {
+      return `<tr><th>${esc(label)}</th><td>${value}</td></tr>`;
+    }
+
+    function listDetail(items) {
+      if (!items || !items.length) return '<span class="muted">—</span>';
+      return esc(items.join("、"));
+    }
+
+    async function openDetail(id) {
+      const res = await fetch("/api/items/" + id);
+      if (!res.ok) {
+        alert("加载详情失败");
+        return;
+      }
+      const row = await res.json();
+      $("dlgTitle").textContent = `#${row.id} ${row.commodity_title || ""}`;
+      const link = row.goods_url
+        ? `<a href="${esc(row.goods_url)}" target="_blank" rel="noopener">打开微猫链接</a>`
+        : '<span class="muted">无链接</span>';
+      const path = Array.isArray(row.shop_category_path)
+        ? row.shop_category_path.join(" > ")
+        : (row.shop_category_path || "");
+
+      $("dlgBody").innerHTML = `
+        <div class="section">
+          <h3>标识</h3>
+          <table class="kv">
+            ${kvRow("微猫链接", link)}
+            ${kvRow("album_id", `<span class="mono">${esc(row.album_id)}</span>`)}
+            ${kvRow("goods_id", `<span class="mono">${esc(row.goods_id)}</span>`)}
+            ${kvRow("tag_id", `<span class="mono">${row.tag_id ?? 0}</span>`)}
+            ${kvRow("分组 / 标签", esc(row.wecatalog_label))}
+            ${kvRow("货号", esc(row.commodity_goods_num) || "—")}
+            ${kvRow("首图 hash", `<span class="mono">${esc(row.first_image_hash) || "—"}</span>`)}
+            ${kvRow("图片数", String(row.image_count || 0))}
+            ${kvRow("微猫标签", listDetail(row.tag_names))}
+          </table>
+        </div>
+        <div class="section">
+          <h3>状态与时间</h3>
+          <table class="kv">
+            ${kvRow("状态", statusBadges(row))}
+            ${kvRow("LLM 次数", String(row.llm_attempt_count ?? 0))}
+            ${kvRow("LLM 处理", esc(row.llm_processed_at) || "—")}
+            ${kvRow("已上传", row.uploaded_to_platform ? "是" : "否")}
+            ${kvRow("上传时间", esc(row.seven17_uploaded_at) || "—")}
+            ${kvRow("创建", esc(row.created_at) || "—")}
+            ${kvRow("更新", esc(row.updated_at) || "—")}
+          </table>
+        </div>
+        <div class="section">
+          <h3>价格</h3>
+          <table class="kv">
+            ${kvRow("人民币 ¥", esc(row.price_cny) || "—")}
+            ${kvRow("韩元 ₩", esc(row.price_krw) || "—")}
+          </table>
+        </div>
+        <div class="section">
+          <h3>规格</h3>
+          <table class="kv">
+            ${kvRow("中文尺码", listDetail(row.sizes))}
+            ${kvRow("中文颜色", listDetail(row.colors))}
+            ${kvRow("韩文尺码", listDetail(row.sizes_ko))}
+            ${kvRow("韩文颜色", listDetail(row.colors_ko))}
+          </table>
+        </div>
+        <div class="section">
+          <h3>LLM 文案</h3>
+          <table class="kv">
+            ${kvRow("source", esc(row.llm_source) || "—")}
+            ${kvRow("reason", esc(row.llm_reason) || "—")}
+            ${kvRow("中文商品名", esc(row.llm_name_zh) || "—")}
+            ${kvRow("韩文商品名", esc(row.llm_name_ko) || "—")}
+          </table>
+          <p class="muted" style="margin:8px 0 4px">中文描述</p>
+          <pre>${esc(row.llm_desc_zh) || "—"}</pre>
+          <p class="muted" style="margin:8px 0 4px">韩文描述</p>
+          <pre>${esc(row.llm_desc_ko) || "—"}</pre>
+        </div>
+        <div class="section">
+          <h3>上架 (seven17)</h3>
+          <table class="kv">
+            ${kvRow("ca_id", esc(row.seven17_ca_id) || "—")}
+            ${kvRow("韩文类目路径", esc(path) || "—")}
+          </table>
+        </div>
+        <div class="section">
+          <h3>微猫原标题</h3>
+          <pre>${esc(row.commodity_title) || "—"}</pre>
+        </div>
+      `;
+      $("detailDlg").showModal();
+    }
+
+    $("btnSearch").addEventListener("click", () => { state.page = 1; loadItems(); });
+    $("btnReload").addEventListener("click", () => { loadAlbums(); loadItems(); });
+    $("btnPrev").addEventListener("click", () => { if (state.page > 1) { state.page--; loadItems(); } });
+    $("btnNext").addEventListener("click", () => { if (state.page < state.pages) { state.page++; loadItems(); } });
+    $("q").addEventListener("keydown", (e) => { if (e.key === "Enter") { state.page = 1; loadItems(); } });
+    $("btnCloseDlg").addEventListener("click", () => $("detailDlg").close());
+
+    (async () => {
+      await loadAlbums();
+      await loadItems();
+    })();
+  </script>
+</body>
+</html>
