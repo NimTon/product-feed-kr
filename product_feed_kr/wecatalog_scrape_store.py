@@ -1,22 +1,22 @@
-"""微猫 wecatalog 店铺：先拉 **线上分类树**，再按其顺序遍历分组→标签拉商品详情，写入 **本地 SQLite**（``data/product_feed.db`` 或 ``PRODUCT_FEED_SQLITE``）。
+"""微猫 wecatalog 店铺：先拉 **线上分类树**，再按其顺序遍历分组→标签拉 **popUpsInfoV2**，写入 **本地 SQLite**（``data/product_feed.db`` 或 ``PRODUCT_FEED_SQLITE``）。
 
 1. **`commodity/tags`**：得到分组顺序与每个叶子 `tagId` / `tagName`，遍历顺序与相册后台一致。
-2. **`album/personal/all`**：分页拉全店列表；**每拉一页即按分类树匹配并（按需）拉详情**，不先攒齐全部列表再处理。
+2. **`album/personal/all`**：分页拉全店列表；**每拉一页即按分类树匹配并拉 popUps**，不先攒齐全部列表再处理。
 3. **分类映射（两份）**：每次抓取开始前
    - **`config/wecatalog_tag_category_map.txt`** → **`wecatalog_tag_category_map.json`**（微猫分组/标签 → 韩文路径，用户维护）；
    - **`data/seven17_path_ca_map.json`**（韩文路径 → seven17 ``ca_id``，从 itemform 自动同步，需配置 ``SEVEN17_MB_*``）。
    未映射的 `(分组, 标签)` 会自动追加到 txt（路径占位 ``（待补全）``）；``tag_id`` 由 commodity/tags API 写入 JSON ``meta``，勿写在路径行尾。
 
-每条 **`pf_store_item`** 写入 **`detail_response`**（详情接口整包），**不写**列表卡片对象 `list_item`。
+每条 **`pf_store_item`** 只写入结构化字段（title / 图 URL / 价 / 尺码 / 颜色），**不保存** ``detail_response`` / ``popups_response`` 原始 JSON。
 每条另有 **`uploaded_to_platform`**（布尔）：抓取时默认为 **`false`**。
 
-增量：库内已有 **`goods_id`** 本次跳过（不请求详情、不写库）。**仅在本 run 抓到有效详情后**才 upsert 对应商品行，不把启动时整表载入内存写回（避免覆盖并行 LLM 结果）。抓取与上架对同一 ``.db`` 使用 **文件锁**（``*.db.lock``）互斥写。
+增量：库内已有 **`goods_id`** 本次跳过（不请求 popUps、不写库）。**仅在本 run 抓到有效 title 后**才 upsert 对应商品行，不把启动时整表载入内存写回（避免覆盖并行 LLM 结果）。抓取与上架对同一 ``.db`` 使用 **文件锁**（``*.db.lock``）互斥写。
 
 列表：`POST .../album/personal/all`，分页用 `result.pagination.pageTimestamp` → 下一页 `timestamp`。
 
-详情：`GET .../commodity/view?targetAlbumId=...&itemId=...`（浏览器会话内 fetch）。
+商品数据：仅 ``GET .../popUpsInfoV2``（``result.commodity``：title / 图 / 价 / 尺码 / 颜色）。
 
-**节流：** `--detail-delay` 作用于任意相邻两次微猫 API（首次请求不休眠）。写单个数如 ``5`` 表示固定 5 秒；写区间如 ``3,8`` 或 ``3:8`` 表示每次在闭区间 **[A,B]** 内均匀随机秒数再休眠。详情命中本进程缓存则不发起请求。
+**节流：** `--detail-delay` 作用于任意相邻两次微猫 API（首次请求不休眠）。写单个数如 ``5`` 表示固定 5 秒；写区间如 ``3,8`` 或 ``3:8`` 表示每次在闭区间 **[A,B]** 内均匀随机秒数再休眠。同一 ``goods_id`` 在本 run 内命中 popUps 缓存则不重复请求。
 
 示例::
 
@@ -70,6 +70,11 @@ from product_feed_kr.seven17_config import (
 from product_feed_kr.wecatalog_tag_category_map_sync import (
     init_maps_at_scrape,
     sync_unmapped_tags_after_tags,
+)
+from product_feed_kr.wecatalog_popups import popups_response_ready
+from product_feed_kr.wecatalog_scrape_fields import (
+    attach_scrape_fields_to_record,
+    fields_from_popups_response,
 )
 from product_feed_kr.wecatalog_tag_mapping import resolve_category_path
 from product_feed_kr.pf_cli_loop import run_forever
@@ -172,10 +177,14 @@ async (apiUrl) => {
 }
 """
 
-FETCH_DETAIL_JS = """
-async ({ albumId, itemId }) => {
-  const qs = new URLSearchParams({ targetAlbumId: albumId, itemId: itemId });
-  const u = "https://www.wecatalog.cn/commodity/view?" + qs.toString();
+FETCH_POPUPS_JS = """
+async ({ sellerAlbumId, commodityId }) => {
+  const qs = new URLSearchParams({
+    sellerAlbumId,
+    commodityId,
+    popUpsType: "individualShopping",
+  });
+  const u = "https://www.wecatalog.cn/newOrder/api/v1/shoppingCart/popUpsInfoV2?" + qs.toString();
   const r = await fetch(u, { credentials: "include" });
   return await r.json();
 }
@@ -361,8 +370,8 @@ def scrape_store(
         "album_id": album_id,
         "list_pages": 0,
         "list_items_unique": 0,
-        "detail_ok": 0,
-        "detail_err": 0,
+        "popups_ok": 0,
+        "popups_err": 0,
         "records": 0,
         "records_prior": 0,
         "records_new": 0,
@@ -439,8 +448,8 @@ def scrape_store(
                     zh="开始按页遍历店铺商品列表",
                 ),
             )
-            seen_detail: dict[str, dict[str, Any] | None] = {}
-            detail_fetch_index = 0
+            seen_popups: dict[str, dict[str, Any] | None] = {}
+            popups_fetch_index = 0
 
             def write_checkpoint(*, meta_only: bool = False) -> None:
                 meta_extra = {
@@ -483,9 +492,9 @@ def scrape_store(
                     "%s",
                     pf_kv(
                         ck_kv,
-                        zh="写库：店铺进度 + 本 run 已抓到详情的商品"
+                        zh="写库：店铺进度 + 本 run 已抓到 popUps 的商品"
                         if not meta_only
-                        else "写库：店铺元信息（尚无新详情）",
+                        else "写库：店铺元信息（尚无新商品）",
                     ),
                 )
 
@@ -510,7 +519,7 @@ def scrape_store(
                 shop_path: tuple[str, ...] | None,
             ) -> bool:
                 """写入一条分组×标签×商品；返回 False 表示已达 max_records 应停止整次抓取。"""
-                nonlocal new_appended, detail_fetch_index
+                nonlocal new_appended, popups_fetch_index
                 gid = it.get("goods_id") or it.get("selfGoodsId") or ""
                 if not isinstance(gid, str) or not gid:
                     return True
@@ -525,7 +534,7 @@ def scrape_store(
                                     ("event", "scrape.skip_existing"),
                                     ("total", stats["skipped_existing"]),
                                 ],
-                                zh="跳过库内已有 goods_id（不抓详情、不写库）",
+                                zh="跳过库内已有 goods_id（不抓 popUps、不写库）",
                             ),
                         )
                     return True
@@ -533,56 +542,70 @@ def scrape_store(
                 if skip_detail:
                     return True
 
-                detail_payload: dict[str, Any] | None
-                if gid in seen_detail:
-                    detail_payload = seen_detail[gid]
-                    logger.debug(
-                        "%s",
-                        pf_kv(
-                            [("event", "scrape.detail.cache"), ("goods_id", gid)],
-                            zh="详情接口：复用本 run 已拉过的缓存",
-                        ),
-                    )
+                scrape_fields: dict[str, Any] | None = None
+                if gid in seen_popups:
+                    cached_pop = seen_popups[gid]
+                    if isinstance(cached_pop, dict) and popups_response_ready(cached_pop):
+                        scrape_fields = fields_from_popups_response(cached_pop)
+                        logger.debug(
+                            "%s",
+                            pf_kv(
+                                [("event", "scrape.popups.cache"), ("goods_id", gid)],
+                                zh="popUpsInfoV2：复用本 run 已拉过的缓存",
+                            ),
+                        )
                 else:
-                    gap.before(f"commodity/view 详情 #{detail_fetch_index + 1} goods_id={gid}")
-                    detail_fetch_index += 1
+                    gap.before(
+                        f"popUpsInfoV2 #{popups_fetch_index + 1} goods_id={gid}",
+                    )
+                    popups_fetch_index += 1
                     logger.debug(
                         "%s",
                         pf_kv(
                             [
-                                ("event", "scrape.detail.request"),
-                                ("n", detail_fetch_index),
+                                ("event", "scrape.popups.request"),
+                                ("n", popups_fetch_index),
                                 ("goods_id", gid),
                             ],
-                            zh="正在请求单条商品详情 commodity/view",
+                            zh="正在请求 popUpsInfoV2",
                         ),
                     )
-                    d_raw = page.evaluate(FETCH_DETAIL_JS, {"albumId": album_id, "itemId": gid})
-                    if isinstance(d_raw, dict) and d_raw.get("errcode") in (0, None):
-                        detail_payload = d_raw
-                        stats["detail_ok"] += 1
+                    p_raw = page.evaluate(
+                        FETCH_POPUPS_JS,
+                        {"sellerAlbumId": album_id, "commodityId": gid},
+                    )
+                    if isinstance(p_raw, dict) and popups_response_ready(p_raw):
+                        scrape_fields = fields_from_popups_response(p_raw)
+                        seen_popups[gid] = p_raw
+                        stats["popups_ok"] += 1
                     else:
-                        detail_payload = d_raw if isinstance(d_raw, dict) else {"error": str(d_raw)}
-                        stats["detail_err"] += 1
+                        seen_popups[gid] = p_raw if isinstance(p_raw, dict) else {"error": str(p_raw)}
+                        stats["popups_err"] += 1
                         logger.warning(
                             "%s",
                             pf_kv(
                                 [
-                                    ("event", "scrape.detail.err"),
+                                    ("event", "scrape.popups.err"),
                                     ("goods_id", gid),
                                     (
                                         "errcode",
-                                        d_raw.get("errcode") if isinstance(d_raw, dict) else None,
+                                        p_raw.get("errcode") if isinstance(p_raw, dict) else None
                                     ),
                                 ],
-                                zh="单条详情接口失败或 errcode 异常",
+                                zh="popUpsInfoV2 失败或登录过期",
                             ),
                         )
-                    seen_detail[gid] = detail_payload
 
-                if not scrape_detail_ready({"detail_response": detail_payload}):
+                merged = scrape_fields if scrape_fields is not None else fields_from_popups_response(None)
+                if not str(merged.get("commodity_title") or "").strip():
+                    logger.warning(
+                        "%s",
+                        pf_kv(
+                            [("event", "scrape.no_title"), ("goods_id", gid)],
+                            zh="无商品标题，跳过入库（popUps 未返回 title）",
+                        ),
+                    )
                     return True
-
                 rec = {
                     "wecatalog_group": gname,
                     "wecatalog_tag": tname,
@@ -591,8 +614,8 @@ def scrape_store(
                     "goods_id": gid,
                     "goods_url": goods_page_url(album_id, gid),
                     "uploaded_to_platform": False,
-                    "detail_response": detail_payload,
                 }
+                attach_scrape_fields_to_record(rec, merged)
                 records.append(rec)
                 skip_ids_prior.add(gid)
                 new_appended += 1
@@ -736,8 +759,8 @@ def scrape_store(
                         ("skipped", stats["skipped_existing"]),
                         ("skipped_uncategorized", skipped_uncategorized),
                         ("skip_uncategorized_enabled", skip_uncategorized),
-                        ("detail_ok", stats["detail_ok"]),
-                        ("detail_err", stats["detail_err"]),
+                        ("popups_ok", stats["popups_ok"]),
+                        ("popups_err", stats["popups_err"]),
                         ("album_id", album_id),
                     ],
                     zh="店铺抓取流程正常结束",
@@ -758,7 +781,7 @@ def scrape_store(
 
 def main() -> int:
     delay_default = (getenv("WECATALOG_DETAIL_DELAY", "5") or "5").strip()
-    ap = argparse.ArgumentParser(description="wecatalog 店铺分类遍历 + 详情 → 本地 SQLite")
+    ap = argparse.ArgumentParser(description="wecatalog 店铺分类遍历 + popUpsInfoV2 → 本地 SQLite")
     ap.add_argument(
         "--store-url",
         default="https://www.wecatalog.cn/weshop/store/_ddYqfVQW6mlRb5szWI5ni6txeRsQ5rZ3_QFVHeg",
@@ -773,7 +796,11 @@ def main() -> int:
         help="相邻微猫 API 间隔：固定秒数如 5；或闭区间随机如 3,8 / 3:8（每次在 [A,B] 内随机休眠）。未传本参数时默认读环境变量或 seven17.json 的 WECATALOG_DETAIL_DELAY。详情缓存命中不发起请求故不占间隔",
     )
     ap.add_argument("--max-list-pages", type=int, default=500, help="列表分页上限（每页约 32 条）")
-    ap.add_argument("--skip-detail", action="store_true", help="只拉列表匹配分类，不请求 commodity/view")
+    ap.add_argument(
+        "--skip-detail",
+        action="store_true",
+        help="只拉列表匹配分类，不请求 popUpsInfoV2",
+    )
     ap.add_argument(
         "--checkpoint-every",
         type=int,
