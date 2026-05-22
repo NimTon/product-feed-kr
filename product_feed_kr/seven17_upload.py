@@ -7,7 +7,7 @@
 必填：`SEVEN17_MB_ID`、`SEVEN17_MB_PASSWORD`。数据库：`PRODUCT_FEED_SQLITE`（默认 `data/product_feed.db`）。相册 ID：命令行 **`--album-id`**，或配置 / 环境变量 **`WECATALOG_ALBUM_ID`**（与店铺 URL 中 albumId 一致）。
 
 后台分类 **`ca_id`**：微猫 (分组, 标签) → 韩文路径（``wecatalog_tag_category_map``）→
-``data/seven17_path_ca_map.json``。爬取阶段默认跳过无分类商品，故 ``OPENAI_CATEGORY_FALLBACK`` 默认关闭。
+``data/seven17_path_ca_map.json``。爬取阶段默认跳过无分类商品；分类仅走路径映射，不用 LLM 兜底。
 
 常用可选：`SEVEN17_CONFIG`、`SEVEN17_BASE_URL`、`SEVEN17_HEADLESS`、`SEVEN17_STOCK_QTY`、
 `SEVEN17_DEFAULT_PRICE`（货源无价格时兜底）、`SEVEN17_SC_TYPE`、`SEVEN17_MAX_IMAGES`、
@@ -20,7 +20,7 @@
 `SEVEN17_UPLOAD_THREADS`（默认 1：上架工作线程数，每线程独立 Playwright 登录）。
 检测到 ``login.php``（会话失效）时自动 ``login_admin`` 并重试当前商品一次。
 
-上传模块不再调用 LLM：只读取 SQLite 已有的 ``listing_llm`` 结果（如 ``cny_price`` / ``name_ko`` / ``desc_ko``）。LLM 写回请用 ``python -m product_feed_kr.seven17_llm``（``02_LLM补全上架信息.bat``）。
+上传模块不再调用 LLM：只读取 SQLite 已有的 ``listing_llm``（``name_zh`` 作标题、``desc_ko``、``cny_price``、``attr_map_ko`` 等）。LLM 写回请用 ``python -m product_feed_kr.seven17_llm``（``02_LLM补全上架信息.bat``）。
 
 真实上架：``SEVEN17_UPLOAD_THREADS`` >1 时同进程多线程（每线程独立 Playwright），每处理完一条后重新读库取下一条可上架记录。重复运行由进程锁拒绝（退出码 11）。
 
@@ -76,7 +76,6 @@ from product_feed_kr.seven17_config import (
     restart_after_n,
 )
 from product_feed_kr.seven17_category_llm import (
-    category_llm_fallback_enabled,
     category_map_suggest_message,
     load_seven17_ca_catalog,
     resolve_ca_id_for_store_record,
@@ -411,9 +410,9 @@ def _llm_cny_usable(llm_data: dict[str, Any] | None) -> bool:
     return bool(str(llm_data.get("cny_price") or "").strip())
 
 
-def _commodity_price_raw_usable(rec: dict[str, Any]) -> str:
-    """从 DB 的 ``commodity_price_raw`` 提取可用人民币价格字符串；不可用返回空串。"""
-    raw = parse_price_str(rec.get("commodity_price_raw"), "")
+def _price_cny_usable(rec: dict[str, Any]) -> str:
+    """从 ``price_cny`` 提取可用人民币价格；不可用返回空串。"""
+    raw = parse_price_str(rec.get("price_cny"), "")
     return "" if raw in ("", "0", "0.0") else raw
 
 
@@ -424,17 +423,17 @@ def _resolve_upload_cny_price(
     llm_data: dict[str, Any],
     prod: dict[str, Any],
 ) -> tuple[str, str]:
-    """返回 (价格字符串, 来源标记)。LLM 价格缺失时回退 commodity_price_raw。"""
+    """返回 (人民币价格字符串, 来源标记)。"""
+    cny_db = _price_cny_usable(rec)
+    if cny_db:
+        return cny_db, "price_cny"
     if llm_on:
         cny_llm = str(llm_data.get("cny_price") or "").strip()
-        if cny_llm:
-            return cny_llm, "llm_cny_price"
-        cny_raw = _commodity_price_raw_usable(rec)
-        if cny_raw:
-            return cny_raw, "commodity_price_raw"
+        if cny_llm and cny_llm not in ("0", "0.0"):
+            return cny_llm, "listing_llm"
     cny_prod = str(prod.get("price") or "").strip()
     if cny_prod and cny_prod not in ("0", "0.0"):
-        return cny_prod, "commodity_price"
+        return cny_prod, "title_parse"
     return "", "none"
 
 
@@ -445,16 +444,13 @@ def _upload_title_from_record(
     llm_on: bool,
     title_prefix: str,
 ) -> str | None:
-    """上架标题：优先 ``name_ko``；LLM 开启时不用 ``name_zh`` 顶替，无韩文则返回 None。"""
+    """上架标题：LLM 开启时优先 ``name_zh``，否则用原标题。"""
     llm_data = rec.get("listing_llm") if isinstance(rec.get("listing_llm"), dict) else {}
     if llm_on:
-        from product_feed_kr.listing_llm_enrich import listing_llm_name_ko_usable
-
-        nk = str(llm_data.get("name_ko") or "").strip()
-        if listing_llm_name_ko_usable(llm_data):
-            base = nk
-        else:
-            return None
+        base = (
+            str(llm_data.get("name_zh") or "").strip()
+            or str(prod.get("title") or "").strip()
+        )
     else:
         base = str(prod.get("title") or "").strip()
     if not base:
@@ -514,7 +510,7 @@ def itemform_preview_dict_from_store_record(
     """根据一条店铺记录生成与 `_fill_itemform` 对应的字段预览（含说明）。"""
     com = commodity_from_wecatalog_record(record)
     if com is None:
-        raise ValueError("该记录无 detail_response.result.commodity，无法预览")
+        raise ValueError("该记录无商品标题/抓取字段，无法预览")
 
     prod = parse_wego_product(com, default_price_if_missing=default_price)
 
@@ -543,11 +539,9 @@ def itemform_preview_dict_from_store_record(
     warnings: list[str] = []
     llm_data = record.get("listing_llm") if isinstance(record.get("listing_llm"), dict) else {}
     if preview_title_fallback and llm_on:
-        from product_feed_kr.listing_llm_enrich import listing_llm_name_ko_usable
-
-        if not listing_llm_name_ko_usable(llm_data):
+        if not str(llm_data.get("name_zh") or "").strip():
             warnings.append(
-                "缺少韩文 name_ko：预览暂用原标题，实际上架会跳过；请运行 02_LLM补全上架信息.bat 补译",
+                "缺少 LLM name_zh：预览暂用原标题；请运行 02_LLM补全上架信息.bat",
             )
     if not urls:
         warnings.append("无 imgsSrc/imgs 可用 URL：上架时会因无主图跳过本条")
@@ -555,8 +549,8 @@ def itemform_preview_dict_from_store_record(
     gid_top = str(record.get("goods_id") or prod["goods_id"] or "").strip()
     gname = str(record.get("wecatalog_group") or "")
     tname = str(record.get("wecatalog_tag") or "")
-    resolved_ca, ca_src = resolve_ca_id_for_store_record(record, commodity=com, allow_llm=False)
-    effective_ca = (resolved_ca or "").strip() or "(未解析：可配置 map / 韩文路径匹配 / LLM 兜底)"
+    resolved_ca, ca_src = resolve_ca_id_for_store_record(record, commodity=com)
+    effective_ca = (resolved_ca or "").strip() or "(未解析：请补全 map / 韩文路径匹配)"
     if not resolve_seven17_ca_id(gname, tname):
         hint = category_map_suggest_message(
             record,
@@ -589,7 +583,7 @@ def itemform_preview_dict_from_store_record(
             **img_slots,
         },
         "form_fields_note": (
-            "ca_id：韩文路径→path_ca_map → DB 缓存 → LLM（OPENAI_CATEGORY_FALLBACK）。"
+            "ca_id：韩文路径→path_ca_map → DB 缓存（无 LLM 兜底）。"
             "shop_category_path 为韩文展示路径。图片先下载再填入 it_img1～。"
         ),
         "seven17_ca_source": ca_src if resolved_ca else "none",
@@ -1043,10 +1037,9 @@ def _upload_skip_reason(
         # 由 LLM 阶段统一计算写入的库内可上传标记（can_upload）。
         if not bool(rec.get("can_upload")):
             return "llm_not_uploadable"
-    ca_id, _ca_src = resolve_ca_id_for_store_record(rec, allow_llm=False)
+    ca_id, _ca_src = resolve_ca_id_for_store_record(rec)
     if not (ca_id or "").strip():
-        if not (category_llm_fallback_enabled() and load_seven17_ca_catalog()):
-            return "no_category"
+        return "no_category"
     if not prod["image_urls"]:
         return "no_images"
     return None
@@ -1257,7 +1250,7 @@ def _process_upload_record(
 
     com = commodity_from_wecatalog_record(rec)
     if com is None:
-        return "fail", {"goods_id": gid, "error": "无 detail_response.result.commodity"}
+        return "fail", {"goods_id": gid, "error": "无商品标题/抓取字段，无法上架"}
 
     llm_data = rec.get("listing_llm") if isinstance(rec.get("listing_llm"), dict) else {}
     try:
@@ -1267,14 +1260,14 @@ def _process_upload_record(
 
     gname = str(rec.get("wecatalog_group") or "")
     tname = str(rec.get("wecatalog_tag") or "")
-    ca_id, ca_src = resolve_ca_id_for_store_record(rec, commodity=com, allow_llm=True)
+    ca_id, ca_src = resolve_ca_id_for_store_record(rec, commodity=com)
     ca_id = (ca_id or "").strip()
     if not ca_id:
         return (
             "fail",
             {
                 "goods_id": gid,
-                "error": "无法解析 seven17 分类：请补全韩文路径映射、运行抓取同步 path_ca_map，或开启 OPENAI_CATEGORY_FALLBACK",
+                "error": "无法解析 seven17 分类：请补全 wecatalog_tag_category_map 韩文路径并同步 path_ca_map",
             },
         )
     _log.info(
@@ -1289,9 +1282,6 @@ def _process_upload_record(
             zh="本条上架分类来源",
         ),
     )
-    if ca_src == "llm" and (ctx.write_back or ctx.write_back_after_llm):
-        sqlite_update_upload_fields(conn, aid, rec)
-
     upload_title = _upload_title_from_record(
         rec,
         prod,
@@ -1303,7 +1293,7 @@ def _process_upload_record(
             "fail",
             {
                 "goods_id": gid,
-                "error": "缺少韩文商品名 name_ko：请运行 LLM 补译，勿用中文名上架",
+                "error": "缺少上架标题：请运行 LLM 补全（name_zh）或检查商品标题",
             },
         )
     desc_ko = str(llm_data.get("desc_ko") or "").strip()
@@ -1357,7 +1347,7 @@ def _process_upload_record(
             llm_data=llm_data,
             prod=prod,
         )
-        if ctx.llm_on and price_src == "commodity_price_raw":
+        if ctx.llm_on and price_src not in ("price_cny", "listing_llm"):
             _log.warning(
                 "%s",
                 pf_kv(
@@ -1365,10 +1355,10 @@ def _process_upload_record(
                         *th_kv,
                         ("event", "upload.price_fallback"),
                         *pf_store_row_id_kv(rec),
-                        ("fallback", "commodity_price_raw"),
+                        ("fallback", price_src),
                         ("price_cny", cny_src),
                     ],
-                    zh="LLM 价格缺失，已回退使用 commodity_price_raw",
+                    zh="使用标题解析等回退价格",
                 ),
             )
         if ctx.convert_fx and krw_pc is not None:
@@ -1383,9 +1373,7 @@ def _process_upload_record(
         if not str(listing_price).strip():
             return "skip", {"goods_id": gid, "error": "无法得到有效售价，已跳过"}
 
-        rec["fx_krw_per_cny"] = krw_pc
         rec["price_krw"] = listing_price if (ctx.convert_fx and krw_pc is not None) else None
-        rec["product_desc_html"] = desc_html
         if ctx.write_back_after_llm:
             sqlite_update_upload_fields(conn, aid, rec)
 
@@ -1857,8 +1845,8 @@ def upload_from_wecatalog_store(
 ) -> dict[str, Any]:
     """从 SQLite 逐条上架：每处理完一条（成功/失败/跳过）后重新读库，取下一条可上架记录。
 
-    字段来源：`detail_response.result.commodity` → `parse_wego_product`；
-    `ca_id`：map → 韩文路径匹配 → DB 缓存；map 为空时可 LLM 兜底（``OPENAI_CATEGORY_FALLBACK``）。
+    字段来源：结构化抓取字段组装的 ``commodity`` → `parse_wego_product`；
+    `ca_id`：map → 韩文路径匹配 → DB 缓存（无分类 LLM 兜底）。
     上传阶段不发起 listing LLM；分类 LLM 仅在 map/缓存均无时调用。
     **LLM 开关生效且 ``cny_price`` 为空** 时跳过。
     """
