@@ -11,7 +11,6 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
-import hashlib
 from pathlib import Path
 from typing import Any
 
@@ -60,22 +59,22 @@ CREATE TABLE pf_store_item (
   shop_category_path_json TEXT,
   goods_url TEXT NOT NULL,
   commodity_title TEXT NOT NULL DEFAULT '',
-  commodity_price_raw TEXT,
+  price_cny TEXT,
   commodity_goods_num TEXT,
   commodity_image_urls_json TEXT,
   commodity_tag_names_json TEXT,
+  commodity_sizes_json TEXT,
+  commodity_colors_json TEXT,
   first_image_hash TEXT,
-  fx_krw_per_cny REAL,
   price_krw TEXT,
-  attr_map_json TEXT,
-  attr_map_ko_json TEXT,
+  sizes_ko_json TEXT,
+  colors_ko_json TEXT,
   llm_name_zh TEXT,
   llm_name_ko TEXT,
   llm_desc_zh TEXT,
   llm_desc_ko TEXT,
-  product_desc_html TEXT,
-  detail_response_json TEXT,
-  listing_llm_json TEXT,
+  llm_source TEXT,
+  llm_reason TEXT,
   UNIQUE (album_id, goods_id, tag_id)
 )
 """
@@ -99,22 +98,22 @@ _PF_STORE_ITEM_COLS: tuple[str, ...] = (
     "shop_category_path_json",
     "goods_url",
     "commodity_title",
-    "commodity_price_raw",
+    "price_cny",
     "commodity_goods_num",
     "commodity_image_urls_json",
     "commodity_tag_names_json",
+    "commodity_sizes_json",
+    "commodity_colors_json",
     "first_image_hash",
-    "fx_krw_per_cny",
     "price_krw",
-    "attr_map_json",
-    "attr_map_ko_json",
+    "sizes_ko_json",
+    "colors_ko_json",
     "llm_name_zh",
     "llm_name_ko",
     "llm_desc_zh",
     "llm_desc_ko",
-    "product_desc_html",
-    "detail_response_json",
-    "listing_llm_json",
+    "llm_source",
+    "llm_reason",
 )
 
 
@@ -167,6 +166,20 @@ def _select_expr_from_old(col: str, old_names: set[str], *, table: str) -> str:
         return f"datetime('now', '+8 hours')"
     if col == "id" and "id" not in old_names:
         return "rowid"
+    if col == "price_cny":
+        parts: list[str] = []
+        if "llm_cny_price" in old_names:
+            parts.append(
+                "CASE WHEN trim(COALESCE(llm_cny_price,''))<>'' THEN trim(llm_cny_price) END",
+            )
+        if "commodity_price_raw" in old_names:
+            parts.append(
+                "CASE WHEN trim(COALESCE(commodity_price_raw,''))<>'' "
+                "THEN trim(commodity_price_raw) END",
+            )
+        if parts:
+            return f"COALESCE({', '.join(parts)})"
+        return "NULL"
     return "NULL"
 
 
@@ -250,6 +263,417 @@ def _migrate_sqlite_columns(conn: sqlite3.Connection) -> None:
         conn.execute("ALTER TABLE pf_store_item ADD COLUMN first_image_hash TEXT")
     if "seven17_ca_id" not in cols:
         conn.execute("ALTER TABLE pf_store_item ADD COLUMN seven17_ca_id TEXT")
+    if "commodity_sizes_json" not in cols:
+        conn.execute("ALTER TABLE pf_store_item ADD COLUMN commodity_sizes_json TEXT")
+    if "commodity_colors_json" not in cols:
+        conn.execute("ALTER TABLE pf_store_item ADD COLUMN commodity_colors_json TEXT")
+    if "sizes_ko_json" not in cols:
+        conn.execute("ALTER TABLE pf_store_item ADD COLUMN sizes_ko_json TEXT")
+    if "colors_ko_json" not in cols:
+        conn.execute("ALTER TABLE pf_store_item ADD COLUMN colors_ko_json TEXT")
+    if "llm_source" not in cols:
+        conn.execute("ALTER TABLE pf_store_item ADD COLUMN llm_source TEXT")
+    if "llm_reason" not in cols:
+        conn.execute("ALTER TABLE pf_store_item ADD COLUMN llm_reason TEXT")
+    _backfill_llm_spec_from_legacy(conn)
+    _backfill_flat_fields_from_listing_llm_json(conn)
+    _migrate_drop_legacy_attr_map_columns(conn)
+    _migrate_llm_prefixed_spec_columns(conn)
+    _migrate_drop_response_json_columns(conn)
+    _migrate_unify_price_columns(conn)
+    _migrate_merge_supplement_into_commodity(conn)
+
+
+def _backfill_llm_spec_from_legacy(conn: sqlite3.Connection) -> None:
+    """旧 ``attr_map_*`` / ``listing_llm_json`` → ``commodity_*``（中文）+ ``sizes_ko_json``。"""
+    import json as _json
+
+    from product_feed_kr.llm_spec_fields import parse_json_str_list, spec_columns_from_listing_llm
+
+    table_cols = set(_table_column_names(conn, "pf_store_item"))
+    if "llm_sizes_json" in table_cols:
+        return
+    if "listing_llm_json" not in table_cols and "attr_map_json" not in table_cols:
+        return
+
+    select_cols = [
+        "id",
+        "commodity_sizes_json",
+        "commodity_colors_json",
+        "sizes_ko_json",
+        "colors_ko_json",
+    ]
+    if "supplement_sizes_json" in table_cols:
+        select_cols.extend(["supplement_sizes_json", "supplement_colors_json"])
+    if "listing_llm_json" in table_cols:
+        select_cols.append("listing_llm_json")
+    if "attr_map_json" in table_cols:
+        select_cols.append("attr_map_json")
+    if "attr_map_ko_json" in table_cols:
+        select_cols.append("attr_map_ko_json")
+    cur = conn.execute(f"SELECT {', '.join(select_cols)} FROM pf_store_item")
+    updates: list[tuple[Any, ...]] = []
+    for row in cur:
+        row_d = dict(row)
+        if parse_json_str_list(row_d.get("sizes_ko_json")):
+            if parse_json_str_list(row_d.get("commodity_sizes_json")):
+                continue
+        ll: dict[str, Any] | None = None
+        raw = row_d.get("listing_llm_json")
+        if isinstance(raw, str) and raw.strip():
+            try:
+                parsed = _json.loads(raw)
+                ll = parsed if isinstance(parsed, dict) else None
+            except _json.JSONDecodeError:
+                ll = None
+        if ll is None and "attr_map_json" in row_d:
+            am = row_d.get("attr_map_json")
+            amk = row_d.get("attr_map_ko_json")
+            if isinstance(am, str) and am.strip():
+                try:
+                    ll = {"attr_map": _json.loads(am)}
+                    if isinstance(amk, str) and amk.strip():
+                        ll["attr_map_ko"] = _json.loads(amk)
+                except _json.JSONDecodeError:
+                    ll = None
+        if not isinstance(ll, dict):
+            continue
+        spec = spec_columns_from_listing_llm(ll, row_d)
+        if not any(spec.values()):
+            continue
+        updates.append(
+            (
+                spec["commodity_sizes_json"],
+                spec["commodity_colors_json"],
+                spec["sizes_ko_json"],
+                spec["colors_ko_json"],
+                int(row_d["id"]),
+            ),
+        )
+    if not updates:
+        return
+    conn.executemany(
+        """
+        UPDATE pf_store_item SET
+          commodity_sizes_json = COALESCE(?, commodity_sizes_json),
+          commodity_colors_json = COALESCE(?, commodity_colors_json),
+          sizes_ko_json = COALESCE(?, sizes_ko_json),
+          colors_ko_json = COALESCE(?, colors_ko_json),
+          updated_at = datetime('now', '+8 hours')
+        WHERE id = ?
+        """,
+        updates,
+    )
+
+
+def _backfill_flat_fields_from_listing_llm_json(conn: sqlite3.Connection) -> None:
+    """``listing_llm_json`` → 扁平行（文案 / 价 / source），迁移删列前执行。"""
+    import json as _json
+
+    from product_feed_kr.listing_llm_enrich import _cny_price_field_usable
+
+    table_cols = set(_table_column_names(conn, "pf_store_item"))
+    if "listing_llm_json" not in table_cols:
+        return
+
+    select_cols = [
+        "id",
+        "price_cny",
+        "llm_name_zh",
+        "llm_name_ko",
+        "llm_desc_zh",
+        "llm_desc_ko",
+        "llm_processed_at",
+        "llm_cny_price",
+        "commodity_price_raw",
+        "llm_source",
+        "llm_reason",
+        "listing_llm_json",
+    ]
+    cur = conn.execute(f"SELECT {', '.join(select_cols)} FROM pf_store_item")
+    updates: list[tuple[Any, ...]] = []
+    for row in cur:
+        row_d = dict(row)
+        raw = row_d.get("listing_llm_json")
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        try:
+            ll = _json.loads(raw)
+        except _json.JSONDecodeError:
+            continue
+        if not isinstance(ll, dict):
+            continue
+
+        def _pick_str(key: str, existing: Any) -> str | None:
+            if existing is not None and str(existing).strip():
+                return None
+            v = ll.get(key)
+            if v is None or not str(v).strip():
+                return None
+            return str(v).strip()
+
+        nzh = _pick_str("name_zh", row_d.get("llm_name_zh"))
+        nko = _pick_str("name_ko", row_d.get("llm_name_ko"))
+        dzh = _pick_str("desc_zh", row_d.get("llm_desc_zh"))
+        dko = _pick_str("desc_ko", row_d.get("llm_desc_ko"))
+        lpat = _pick_str("processed_at", row_d.get("llm_processed_at"))
+        cny: str | None = None
+        if not (row_d.get("price_cny") and str(row_d.get("price_cny")).strip()):
+            if not (row_d.get("llm_cny_price") and str(row_d.get("llm_cny_price")).strip()):
+                cp = ll.get("cny_price")
+                if _cny_price_field_usable(cp):
+                    cny = str(cp).strip()
+            elif row_d.get("llm_cny_price"):
+                cny = str(row_d.get("llm_cny_price")).strip() or None
+        src = _pick_str("source", row_d.get("llm_source"))
+        reason = _pick_str("reason", row_d.get("llm_reason"))
+        price_cny_fill: str | None = cny
+        if price_cny_fill is None and not (
+            row_d.get("price_cny") and str(row_d.get("price_cny")).strip()
+        ):
+            raw = row_d.get("commodity_price_raw")
+            if raw is not None and str(raw).strip():
+                price_cny_fill = str(raw).strip()
+
+        if not any((nzh, nko, dzh, dko, lpat, cny, src, reason, price_cny_fill)):
+            continue
+        updates.append(
+            (
+                nzh,
+                nko,
+                dzh,
+                dko,
+                lpat,
+                cny,
+                src,
+                reason,
+                price_cny_fill,
+                int(row_d["id"]),
+            ),
+        )
+    if not updates:
+        return
+    conn.executemany(
+        """
+        UPDATE pf_store_item SET
+          llm_name_zh = COALESCE(?, llm_name_zh),
+          llm_name_ko = COALESCE(?, llm_name_ko),
+          llm_desc_zh = COALESCE(?, llm_desc_zh),
+          llm_desc_ko = COALESCE(?, llm_desc_ko),
+          llm_processed_at = COALESCE(?, llm_processed_at),
+          price_cny = COALESCE(?, price_cny),
+          llm_source = COALESCE(?, llm_source),
+          llm_reason = COALESCE(?, llm_reason)
+        WHERE id = ?
+        """,
+        updates,
+    )
+
+
+def _migrate_drop_response_json_columns(conn: sqlite3.Connection) -> None:
+    """移除 ``detail_response_json`` / ``popups_response_json`` / ``listing_llm_json``（表重建）。"""
+    old_names = set(_table_column_names(conn, "pf_store_item"))
+    drop = {"detail_response_json", "popups_response_json", "listing_llm_json"}
+    if not drop & old_names:
+        return
+    conn.execute("ALTER TABLE pf_store_item RENAME TO pf_store_item__json_old")
+    conn.execute(_CREATE_PF_STORE_ITEM)
+    insert_cols = ", ".join(_PF_STORE_ITEM_COLS)
+    old_cols = set(_table_column_names(conn, "pf_store_item__json_old"))
+    select_list = ", ".join(
+        _select_expr_from_old(c, old_cols, table="item") for c in _PF_STORE_ITEM_COLS
+    )
+    conn.execute(
+        f"INSERT INTO pf_store_item ({insert_cols}) SELECT {select_list} FROM pf_store_item__json_old",
+    )
+    conn.execute("DROP TABLE pf_store_item__json_old")
+    for idx_sql in (
+        "CREATE INDEX IF NOT EXISTS idx_pf_item_upload ON pf_store_item (album_id, uploaded_to_platform)",
+        "CREATE INDEX IF NOT EXISTS idx_pf_item_goods ON pf_store_item (album_id, goods_id)",
+        "CREATE INDEX IF NOT EXISTS idx_pf_item_album ON pf_store_item (album_id)",
+        "CREATE INDEX IF NOT EXISTS idx_pf_item_img_hash ON pf_store_item (album_id, first_image_hash)",
+    ):
+        conn.execute(idx_sql)
+
+
+def _migrate_unify_price_columns(conn: sqlite3.Connection) -> None:
+    """合并 ``commodity_price_raw`` / ``llm_cny_price`` → ``price_cny``；移除汇率/HTML 冗余列。"""
+    old_names = set(_table_column_names(conn, "pf_store_item"))
+    extra = {"commodity_price_raw", "llm_cny_price", "fx_krw_per_cny", "product_desc_html"}
+    if "price_cny" in old_names and not (extra & old_names):
+        return
+    if "price_cny" not in old_names and not (
+        "commodity_price_raw" in old_names or "llm_cny_price" in old_names
+    ):
+        return
+    conn.execute("ALTER TABLE pf_store_item RENAME TO pf_store_item__price_old")
+    conn.execute(_CREATE_PF_STORE_ITEM)
+    insert_cols = ", ".join(_PF_STORE_ITEM_COLS)
+    old_cols = set(_table_column_names(conn, "pf_store_item__price_old"))
+    select_list = ", ".join(
+        _select_expr_from_old(c, old_cols, table="item") for c in _PF_STORE_ITEM_COLS
+    )
+    conn.execute(
+        f"INSERT INTO pf_store_item ({insert_cols}) SELECT {select_list} "
+        "FROM pf_store_item__price_old",
+    )
+    conn.execute("DROP TABLE pf_store_item__price_old")
+    for idx_sql in (
+        "CREATE INDEX IF NOT EXISTS idx_pf_item_upload ON pf_store_item (album_id, uploaded_to_platform)",
+        "CREATE INDEX IF NOT EXISTS idx_pf_item_goods ON pf_store_item (album_id, goods_id)",
+        "CREATE INDEX IF NOT EXISTS idx_pf_item_album ON pf_store_item (album_id)",
+        "CREATE INDEX IF NOT EXISTS idx_pf_item_img_hash ON pf_store_item (album_id, first_image_hash)",
+    ):
+        conn.execute(idx_sql)
+
+
+def _migrate_llm_prefixed_spec_columns(conn: sqlite3.Connection) -> None:
+    """``llm_sizes_json`` 等 → ``commodity_*``（仅爬取为空时）+ ``sizes_ko_json`` / ``colors_ko_json``。"""
+    from product_feed_kr.llm_spec_fields import dumps_json_list, parse_json_str_list
+
+    table_cols = set(_table_column_names(conn, "pf_store_item"))
+    if "llm_sizes_json" not in table_cols:
+        return
+
+    select = [
+        "id",
+        "commodity_sizes_json",
+        "commodity_colors_json",
+        "llm_sizes_json",
+        "llm_colors_json",
+        "llm_sizes_ko_json",
+        "llm_colors_ko_json",
+    ]
+    cur = conn.execute(f"SELECT {', '.join(select)} FROM pf_store_item")
+    updates: list[tuple[Any, ...]] = []
+    for row in cur:
+        row_d = dict(row)
+        scrape_sz = parse_json_str_list(row_d.get("commodity_sizes_json"))
+        scrape_cl = parse_json_str_list(row_d.get("commodity_colors_json"))
+        ll_sz = parse_json_str_list(row_d.get("llm_sizes_json"))
+        ll_cl = parse_json_str_list(row_d.get("llm_colors_json"))
+        fill_sz = ll_sz if ll_sz and not scrape_sz else []
+        fill_cl = ll_cl if ll_cl and not scrape_cl else []
+        sz_ko = parse_json_str_list(row_d.get("llm_sizes_ko_json"))
+        cl_ko = parse_json_str_list(row_d.get("llm_colors_ko_json"))
+        if not (fill_sz or fill_cl or sz_ko or cl_ko):
+            continue
+        updates.append(
+            (
+                dumps_json_list(fill_sz),
+                dumps_json_list(fill_cl),
+                dumps_json_list(sz_ko),
+                dumps_json_list(cl_ko),
+                int(row_d["id"]),
+            ),
+        )
+    if updates:
+        conn.executemany(
+            """
+            UPDATE pf_store_item SET
+              commodity_sizes_json = COALESCE(?, commodity_sizes_json),
+              commodity_colors_json = COALESCE(?, commodity_colors_json),
+              sizes_ko_json = COALESCE(?, sizes_ko_json),
+              colors_ko_json = COALESCE(?, colors_ko_json)
+            WHERE id = ?
+            """,
+            updates,
+        )
+
+    old_names = set(_table_column_names(conn, "pf_store_item"))
+    if "llm_sizes_json" not in old_names:
+        return
+    conn.execute("ALTER TABLE pf_store_item RENAME TO pf_store_item__llm_spec_old")
+    conn.execute(_CREATE_PF_STORE_ITEM)
+    insert_cols = ", ".join(_PF_STORE_ITEM_COLS)
+    old_cols = set(_table_column_names(conn, "pf_store_item__llm_spec_old"))
+    select_list = ", ".join(
+        _select_expr_from_old(c, old_cols, table="item") for c in _PF_STORE_ITEM_COLS
+    )
+    conn.execute(
+        f"INSERT INTO pf_store_item ({insert_cols}) SELECT {select_list} FROM pf_store_item__llm_spec_old",
+    )
+    conn.execute("DROP TABLE pf_store_item__llm_spec_old")
+    for idx_sql in (
+        "CREATE INDEX IF NOT EXISTS idx_pf_item_upload ON pf_store_item (album_id, uploaded_to_platform)",
+        "CREATE INDEX IF NOT EXISTS idx_pf_item_goods ON pf_store_item (album_id, goods_id)",
+        "CREATE INDEX IF NOT EXISTS idx_pf_item_album ON pf_store_item (album_id)",
+        "CREATE INDEX IF NOT EXISTS idx_pf_item_img_hash ON pf_store_item (album_id, first_image_hash)",
+    ):
+        conn.execute(idx_sql)
+
+
+def _migrate_merge_supplement_into_commodity(conn: sqlite3.Connection) -> None:
+    """``supplement_*`` 合并进 ``commodity_sizes_json`` / ``commodity_colors_json`` 后删列。"""
+    old_names = set(_table_column_names(conn, "pf_store_item"))
+    if "supplement_sizes_json" not in old_names:
+        return
+    conn.execute(
+        """
+        UPDATE pf_store_item SET
+          commodity_sizes_json = CASE
+            WHEN trim(COALESCE(commodity_sizes_json, '')) <> '' THEN commodity_sizes_json
+            ELSE supplement_sizes_json
+          END,
+          commodity_colors_json = CASE
+            WHEN trim(COALESCE(commodity_colors_json, '')) <> '' THEN commodity_colors_json
+            ELSE supplement_colors_json
+          END
+        """,
+    )
+    conn.execute("ALTER TABLE pf_store_item RENAME TO pf_store_item__supp_old")
+    conn.execute(_CREATE_PF_STORE_ITEM)
+    insert_cols = ", ".join(_PF_STORE_ITEM_COLS)
+    old_cols = set(_table_column_names(conn, "pf_store_item__supp_old"))
+    select_list = ", ".join(
+        _select_expr_from_old(c, old_cols, table="item") for c in _PF_STORE_ITEM_COLS
+    )
+    conn.execute(
+        f"INSERT INTO pf_store_item ({insert_cols}) SELECT {select_list} "
+        "FROM pf_store_item__supp_old",
+    )
+    conn.execute("DROP TABLE pf_store_item__supp_old")
+    for idx_sql in (
+        "CREATE INDEX IF NOT EXISTS idx_pf_item_upload ON pf_store_item (album_id, uploaded_to_platform)",
+        "CREATE INDEX IF NOT EXISTS idx_pf_item_goods ON pf_store_item (album_id, goods_id)",
+        "CREATE INDEX IF NOT EXISTS idx_pf_item_album ON pf_store_item (album_id)",
+        "CREATE INDEX IF NOT EXISTS idx_pf_item_img_hash ON pf_store_item (album_id, first_image_hash)",
+    ):
+        conn.execute(idx_sql)
+
+
+def _migrate_drop_legacy_attr_map_columns(conn: sqlite3.Connection) -> None:
+    """移除 ``attr_map_json`` / ``attr_map_ko_json`` 列（表重建）。"""
+    old_names = set(_table_column_names(conn, "pf_store_item"))
+    if "attr_map_json" not in old_names and "attr_map_ko_json" not in old_names:
+        return
+    if "llm_sizes_json" in old_names:
+        return
+    if "commodity_sizes_json" not in old_names:
+        return
+    conn.execute("ALTER TABLE pf_store_item RENAME TO pf_store_item__attr_old")
+    conn.execute(_CREATE_PF_STORE_ITEM)
+    insert_cols = ", ".join(_PF_STORE_ITEM_COLS)
+    old_cols = set(_table_column_names(conn, "pf_store_item__attr_old"))
+    select_list = ", ".join(
+        _select_expr_from_old(c, old_cols, table="item") for c in _PF_STORE_ITEM_COLS
+    )
+    conn.execute(
+        f"INSERT INTO pf_store_item ({insert_cols}) SELECT {select_list} FROM pf_store_item__attr_old",
+    )
+    conn.execute("DROP TABLE pf_store_item__attr_old")
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pf_item_upload ON pf_store_item (album_id, uploaded_to_platform)",
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pf_item_goods ON pf_store_item (album_id, goods_id)",
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pf_item_album ON pf_store_item (album_id)",
+    )
+    conn.execute(
+        "CREATE INDEX IF NOT EXISTS idx_pf_item_img_hash ON pf_store_item (album_id, first_image_hash)",
+    )
 
 
 def _migrate_store_info_to_int_pk(conn: sqlite3.Connection) -> None:
@@ -340,79 +764,9 @@ def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     return {k: row[k] for k in row.keys()}
 
 
-def _extract_min_fields_from_detail(detail_response: dict[str, Any] | None) -> dict[str, Any]:
-    """从 detail_response.result.commodity 提取上架最小必需字段。"""
-    empty = {
-        "commodity_title": "",
-        "commodity_price_raw": None,
-        "commodity_goods_num": None,
-        "commodity_image_urls_json": None,
-        "commodity_tag_names_json": None,
-        "first_image_hash": None,
-    }
-    if not isinstance(detail_response, dict):
-        return empty
-    result = detail_response.get("result")
-    if not isinstance(result, dict):
-        return empty
-    commodity = result.get("commodity")
-    if not isinstance(commodity, dict):
-        return empty
-
-    title = str(commodity.get("title") or "").strip()
-    raw_price = commodity.get("optimaPrice")
-    if raw_price is not None and str(raw_price).strip() in ("", "-1"):
-        raw_price = None
-    if raw_price is None:
-        arr = commodity.get("priceArr") or []
-        if isinstance(arr, list) and arr:
-            first = arr[0]
-            if isinstance(first, dict):
-                v = first.get("value")
-                if v is not None and str(v).strip() not in ("", "-1"):
-                    raw_price = v
-    goods_num = str(commodity.get("goodsNum") or "").strip() or None
-
-    urls_raw = commodity.get("imgsSrc") or commodity.get("imgs") or []
-    image_urls: list[str] = []
-    if isinstance(urls_raw, list):
-        for u in urls_raw:
-            if not isinstance(u, str):
-                continue
-            s = u.strip().split("|")[0].strip()
-            if s.startswith(("http://", "https://")):
-                image_urls.append(s)
-    first_image_hash: str | None = None
-    if image_urls:
-        first = image_urls[0]
-        first_image_hash = hashlib.sha1(first.encode("utf-8", errors="ignore")).hexdigest()
-
-    tags_raw = commodity.get("tags") or []
-    tag_names: list[str] = []
-    if isinstance(tags_raw, list):
-        for t in tags_raw:
-            if isinstance(t, dict) and t.get("tagName"):
-                tag_names.append(str(t["tagName"]).strip())
-
-    return {
-        "commodity_title": title,
-        "commodity_price_raw": (str(raw_price).strip() if raw_price is not None else None),
-        "commodity_goods_num": goods_num,
-        "commodity_image_urls_json": json.dumps(image_urls, ensure_ascii=False) if image_urls else None,
-        "commodity_tag_names_json": json.dumps(tag_names, ensure_ascii=False) if tag_names else None,
-        "first_image_hash": first_image_hash,
-    }
-
-
 def _extract_enriched_fields(rec: dict[str, Any]) -> dict[str, Any]:
-    """从记录中提取上架 enrich 衍生字段（汇率/韩元价/attr_map/中韩文名称与描述/商品描述HTML）。"""
-    fx_raw = rec.get("fx_krw_per_cny")
-    fx_val: float | None = None
-    try:
-        if fx_raw is not None and str(fx_raw).strip() != "":
-            fx_val = float(str(fx_raw).strip())
-    except (TypeError, ValueError):
-        fx_val = None
+    """从记录提取 LLM/上架写库字段（价、规格拆列、中韩文文案）。"""
+    from product_feed_kr.llm_spec_fields import spec_columns_from_listing_llm
 
     price_krw_raw = rec.get("price_krw")
     price_krw = str(price_krw_raw).strip() if price_krw_raw is not None else None
@@ -420,17 +774,15 @@ def _extract_enriched_fields(rec: dict[str, Any]) -> dict[str, Any]:
         price_krw = None
 
     ll = rec.get("listing_llm")
-    attr_map_json: str | None = None
-    attr_map_ko_json: str | None = None
+    spec_cols = spec_columns_from_listing_llm(
+        ll if isinstance(ll, dict) else None,
+        rec,
+    )
     llm_name_zh: str | None = None
     llm_name_ko: str | None = None
     llm_desc_zh: str | None = None
     llm_desc_ko: str | None = None
     llm_processed_at: str | None = None
-    if isinstance(ll, dict) and isinstance(ll.get("attr_map"), dict):
-        attr_map_json = json.dumps(ll["attr_map"], ensure_ascii=False)
-    if isinstance(ll, dict) and isinstance(ll.get("attr_map_ko"), dict):
-        attr_map_ko_json = json.dumps(ll["attr_map_ko"], ensure_ascii=False)
     if isinstance(ll, dict):
         nzh = ll.get("name_zh")
         nko = ll.get("name_ko")
@@ -446,32 +798,39 @@ def _extract_enriched_fields(rec: dict[str, Any]) -> dict[str, Any]:
         raw_lp = rec.get("llm_processed_at")
         llm_processed_at = str(raw_lp).strip() if raw_lp is not None and str(raw_lp).strip() else None
 
-    desc_raw = rec.get("product_desc_html")
-    desc_html = str(desc_raw) if isinstance(desc_raw, str) and desc_raw.strip() else None
+    price_cny: str | None = None
+    llm_source: str | None = None
+    llm_reason: str | None = None
+    if isinstance(ll, dict):
+        from product_feed_kr.listing_llm_enrich import _cny_price_field_usable
+
+        cp = ll.get("cny_price")
+        if _cny_price_field_usable(cp):
+            price_cny = str(cp).strip()
+        src = ll.get("source")
+        if src is not None and str(src).strip():
+            llm_source = str(src).strip()
+        rsn = ll.get("reason")
+        if rsn is not None and str(rsn).strip():
+            llm_reason = str(rsn).strip()
 
     return {
-        "fx_krw_per_cny": fx_val,
         "price_krw": price_krw,
-        "attr_map_json": attr_map_json,
-        "attr_map_ko_json": attr_map_ko_json,
+        **spec_cols,
         "llm_name_zh": llm_name_zh,
         "llm_name_ko": llm_name_ko,
         "llm_desc_zh": llm_desc_zh,
         "llm_desc_ko": llm_desc_ko,
         "llm_processed_at": llm_processed_at,
-        "product_desc_html": desc_html,
+        "price_cny": price_cny,
+        "llm_source": llm_source,
+        "llm_reason": llm_reason,
     }
 
 
 def row_to_product_record(row: dict[str, Any]) -> dict[str, Any]:
-    drj = row.get("detail_response_json")
-    if isinstance(drj, str) and drj.strip():
-        try:
-            detail_response = json.loads(drj)
-        except json.JSONDecodeError:
-            detail_response = None
-    else:
-        detail_response = None
+    from product_feed_kr.llm_spec_fields import listing_llm_from_row
+
     rec: dict[str, Any] = {
         "wecatalog_group": row["wecatalog_group"],
         "wecatalog_tag": row["wecatalog_tag"],
@@ -492,20 +851,18 @@ def row_to_product_record(row: dict[str, Any]) -> dict[str, Any]:
         "seven17_uploaded_at": (str(row.get("seven17_uploaded_at")).strip() if row.get("seven17_uploaded_at") is not None else None),
         "seven17_ca_id": (str(ca_raw).strip() if ca_raw is not None and str(ca_raw).strip() else None),
         "first_image_hash": (str(row.get("first_image_hash")).strip() if row.get("first_image_hash") is not None and str(row.get("first_image_hash")).strip() else None),
-        "detail_response": detail_response,
     })
+    rec["commodity_sizes_json"] = row.get("commodity_sizes_json")
+    rec["commodity_colors_json"] = row.get("commodity_colors_json")
     scp = row.get("shop_category_path_json")
     if isinstance(scp, str) and scp.strip():
         try:
             rec["shop_category_path"] = json.loads(scp)
         except json.JSONDecodeError:
             rec["shop_category_path"] = None
-    ll = row.get("listing_llm_json")
-    if isinstance(ll, str) and ll.strip():
-        try:
-            rec["listing_llm"] = json.loads(ll)
-        except json.JSONDecodeError:
-            pass
+    ll_mem = listing_llm_from_row(row)
+    if ll_mem:
+        rec["listing_llm"] = ll_mem
     # 最小必需字段（独立列）也回填到内存记录，供调试/导出查看。
     image_urls: list[str] = []
     if isinstance(row.get("commodity_image_urls_json"), str) and str(row.get("commodity_image_urls_json") or "").strip():
@@ -525,28 +882,37 @@ def row_to_product_record(row: dict[str, Any]) -> dict[str, Any]:
         except json.JSONDecodeError:
             tag_names = []
 
+    from product_feed_kr.llm_spec_fields import listing_llm_attr_maps_from_row
+    from product_feed_kr.wecatalog_scrape_fields import parse_colors_json, parse_sizes_json
+
+    scrape_sizes = parse_sizes_json(row.get("commodity_sizes_json"))
+    scrape_colors = parse_colors_json(row.get("commodity_colors_json"))
+    rec["commodity_sizes"] = scrape_sizes
+    rec["commodity_colors"] = scrape_colors
+    rec["sizes_ko_json"] = row.get("sizes_ko_json")
+    rec["colors_ko_json"] = row.get("colors_ko_json")
+
+    attr_zh, attr_ko = listing_llm_attr_maps_from_row(row)
+
     rec["commodity_min"] = {
         "title": str(row.get("commodity_title") or "").strip(),
-        "price_raw": (str(row.get("commodity_price_raw")).strip() if row.get("commodity_price_raw") is not None else None),
+        "price_raw": (str(row.get("price_cny")).strip() if row.get("price_cny") is not None else None),
         "goods_num": (str(row.get("commodity_goods_num") or "").strip() or None),
         "image_urls": image_urls,
         "tag_names": tag_names,
-        "fx_krw_per_cny": row.get("fx_krw_per_cny"),
+        "scrape_sizes": scrape_sizes,
+        "scrape_colors": scrape_colors,
         "price_krw": (str(row.get("price_krw")).strip() if row.get("price_krw") is not None else None),
-        "attr_map": json.loads(row["attr_map_json"])
-        if isinstance(row.get("attr_map_json"), str) and str(row.get("attr_map_json") or "").strip()
-        else {},
-        "attr_map_ko": json.loads(row["attr_map_ko_json"])
-        if isinstance(row.get("attr_map_ko_json"), str) and str(row.get("attr_map_ko_json") or "").strip()
-        else {},
+        "attr_map": attr_zh,
+        "attr_map_ko": attr_ko,
         "llm_name_zh": (str(row.get("llm_name_zh")).strip() if row.get("llm_name_zh") is not None else None),
         "llm_name_ko": (str(row.get("llm_name_ko")).strip() if row.get("llm_name_ko") is not None else None),
         "llm_desc_zh": (str(row.get("llm_desc_zh")).strip() if row.get("llm_desc_zh") is not None else None),
         "llm_desc_ko": (str(row.get("llm_desc_ko")).strip() if row.get("llm_desc_ko") is not None else None),
         "llm_processed_at": (str(row.get("llm_processed_at")).strip() if row.get("llm_processed_at") is not None else None),
         "seven17_uploaded_at": (str(row.get("seven17_uploaded_at")).strip() if row.get("seven17_uploaded_at") is not None else None),
-        "product_desc_html": (str(row.get("product_desc_html")) if row.get("product_desc_html") is not None else None),
     }
+    rec["price_cny"] = row.get("price_cny")
     rec["llm_processed_at"] = rec["commodity_min"]["llm_processed_at"]
     try:
         raw_ac = row.get("llm_attempt_count")
@@ -569,16 +935,8 @@ def _llm_attempt_count_for_db(rec: dict[str, Any]) -> int:
 
 
 def scrape_detail_ready(rec: dict[str, Any]) -> bool:
-    """抓取入库：仅当 ``detail_response`` 含有效 ``result.commodity`` 时写 ``pf_store_item``。"""
-    dr = rec.get("detail_response")
-    if not isinstance(dr, dict):
-        return False
-    if dr.get("errcode") not in (0, None):
-        return False
-    res = dr.get("result")
-    if not isinstance(res, dict):
-        return False
-    return isinstance(res.get("commodity"), dict)
+    """抓取入库：至少有非空 ``commodity_title``（结构化字段）。"""
+    return bool(str(rec.get("commodity_title") or "").strip())
 
 
 def sqlite_count_store_items(conn: sqlite3.Connection, album_id: str) -> int:
@@ -757,11 +1115,11 @@ def sqlite_upsert_scrape_items(
             INSERT INTO pf_store_item (
               album_id, goods_id, tag_id, wecatalog_group, wecatalog_tag,
               shop_category_path_json, goods_url, can_process, uploaded_to_platform,
-              commodity_title, commodity_price_raw, commodity_goods_num,
+              commodity_title, price_cny, commodity_goods_num,
               commodity_image_urls_json, commodity_tag_names_json,
-              first_image_hash,
-              detail_response_json
-            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?)
+              commodity_sizes_json, commodity_colors_json,
+              first_image_hash
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?, ?, ?, ?, ?, ?, ?)
             ON CONFLICT(album_id, goods_id, tag_id) DO UPDATE SET
               wecatalog_group = excluded.wecatalog_group,
               wecatalog_tag = excluded.wecatalog_tag,
@@ -769,20 +1127,28 @@ def sqlite_upsert_scrape_items(
               goods_url = excluded.goods_url,
               can_process = excluded.can_process,
               commodity_title = excluded.commodity_title,
-              commodity_price_raw = excluded.commodity_price_raw,
+              price_cny = excluded.price_cny,
               commodity_goods_num = excluded.commodity_goods_num,
               commodity_image_urls_json = excluded.commodity_image_urls_json,
               commodity_tag_names_json = excluded.commodity_tag_names_json,
+              commodity_sizes_json = CASE
+                WHEN trim(COALESCE(excluded.commodity_sizes_json, '')) <> ''
+                THEN excluded.commodity_sizes_json
+                ELSE pf_store_item.commodity_sizes_json
+              END,
+              commodity_colors_json = CASE
+                WHEN trim(COALESCE(excluded.commodity_colors_json, '')) <> ''
+                THEN excluded.commodity_colors_json
+                ELSE pf_store_item.commodity_colors_json
+              END,
               first_image_hash = excluded.first_image_hash,
-              detail_response_json = excluded.detail_response_json,
               updated_at = {SQLITE_NOW_CST8}
             """
         batch_seen_hash: set[str] = set()
         for rec in to_write:
-            dr = rec.get("detail_response")
-            assert isinstance(dr, dict)
-            dr_json = json.dumps(dr, ensure_ascii=False)
-            mins = _extract_min_fields_from_detail(dr)
+            from product_feed_kr.wecatalog_scrape_fields import scrape_fields_to_db_columns
+
+            mins = scrape_fields_to_db_columns(rec)
             scp = rec.get("shop_category_path")
             scp_json = json.dumps(scp, ensure_ascii=False) if isinstance(scp, list) else None
             tid = rec.get("tag_id")
@@ -825,12 +1191,13 @@ def sqlite_upsert_scrape_items(
                     str(rec.get("goods_url") or ""),
                     can_process,
                     mins["commodity_title"],
-                    mins["commodity_price_raw"],
+                    mins["price_cny"],
                     mins["commodity_goods_num"],
                     mins["commodity_image_urls_json"],
                     mins["commodity_tag_names_json"],
+                    mins.get("commodity_sizes_json"),
+                    mins.get("commodity_colors_json"),
                     first_image_hash,
-                    dr_json,
                 ),
             )
             item_id = _lookup_item_id(conn, album_id, gid, tag_id)
@@ -888,194 +1255,6 @@ def sqlite_checkpoint(
     return sqlite_upsert_scrape_items(conn, album_id, records)
 
 
-def _sqlite_update_product_row_DEPRECATED(conn: sqlite3.Connection, album_id: str, rec: dict[str, Any]) -> None:
-    """已废弃，不再有调用方。保留仅供参考，后续可删除。"""
-    return
-    dr = rec.get("detail_response")
-    ll = rec.get("listing_llm")
-    ll_json = json.dumps(ll, ensure_ascii=False) if isinstance(ll, dict) else None
-    enrich = _extract_enriched_fields(rec)
-    tid = rec.get("tag_id")
-    try:
-        tag_id = int(tid) if tid is not None else 0
-    except (TypeError, ValueError):
-        tag_id = 0
-    # 防并发回退：LLM/其它线程拿到旧快照时，不应把已上架状态覆写回未上架。
-    # 仅当调用方显式携带“已上架”信息时才更新这两个字段。
-    uploaded: int | None = 1 if rec.get("uploaded_to_platform") is True else None
-    uploaded_at = (str(rec.get("seven17_uploaded_at")).strip() if rec.get("seven17_uploaded_at") else None)
-    gid = str(rec.get("goods_id") or "")
-    attempt_count = _llm_attempt_count_for_db(rec)
-    ca_id_store = (str(rec.get("seven17_ca_id")).strip() if rec.get("seven17_ca_id") else None)
-    db_path = sqlite_db_path()
-    with _write_lock(db_path):
-        if isinstance(dr, dict):
-            mins = _extract_min_fields_from_detail(dr)
-            conn.execute(
-                f"""
-                UPDATE pf_store_item SET
-                  commodity_title = ?,
-                  commodity_price_raw = ?,
-                  commodity_goods_num = ?,
-                  commodity_image_urls_json = ?,
-                  commodity_tag_names_json = ?,
-                  fx_krw_per_cny = COALESCE(?, fx_krw_per_cny),
-                  price_krw = COALESCE(?, price_krw),
-                  attr_map_json = COALESCE(?, attr_map_json),
-                  attr_map_ko_json = COALESCE(?, attr_map_ko_json),
-                  llm_name_zh = COALESCE(?, llm_name_zh),
-                  llm_name_ko = COALESCE(?, llm_name_ko),
-                  llm_desc_zh = COALESCE(?, llm_desc_zh),
-                  llm_desc_ko = COALESCE(?, llm_desc_ko),
-                  llm_processed_at = COALESCE(?, llm_processed_at),
-                  llm_attempt_count = ?,
-                  product_desc_html = COALESCE(?, product_desc_html),
-                  detail_response_json = ?,
-                  listing_llm_json = COALESCE(?, listing_llm_json),
-                  uploaded_to_platform = CASE
-                    WHEN ? IS NULL THEN uploaded_to_platform
-                    ELSE ?
-                  END,
-                  seven17_uploaded_at = COALESCE(?, seven17_uploaded_at),
-                  seven17_ca_id = COALESCE(?, seven17_ca_id),
-                  updated_at = {SQLITE_NOW_CST8}
-                WHERE album_id = ? AND goods_id = ? AND tag_id = ?
-                """,
-                (
-                    mins["commodity_title"],
-                    mins["commodity_price_raw"],
-                    mins["commodity_goods_num"],
-                    mins["commodity_image_urls_json"],
-                    mins["commodity_tag_names_json"],
-                    enrich["fx_krw_per_cny"],
-                    enrich["price_krw"],
-                    enrich["attr_map_json"],
-                    enrich["attr_map_ko_json"],
-                    enrich["llm_name_zh"],
-                    enrich["llm_name_ko"],
-                    enrich["llm_desc_zh"],
-                    enrich["llm_desc_ko"],
-                    enrich["llm_processed_at"],
-                    attempt_count,
-                    enrich["product_desc_html"],
-                    json.dumps(dr, ensure_ascii=False),
-                    ll_json,
-                    uploaded,
-                    uploaded,
-                    uploaded_at,
-                    ca_id_store,
-                    album_id,
-                    gid,
-                    tag_id,
-                ),
-            )
-        elif ll_json is not None:
-            conn.execute(
-                f"""
-                UPDATE pf_store_item SET
-                  listing_llm_json = ?,
-                  fx_krw_per_cny = COALESCE(?, fx_krw_per_cny),
-                  price_krw = COALESCE(?, price_krw),
-                  attr_map_json = COALESCE(?, attr_map_json),
-                  attr_map_ko_json = COALESCE(?, attr_map_ko_json),
-                  llm_name_zh = COALESCE(?, llm_name_zh),
-                  llm_name_ko = COALESCE(?, llm_name_ko),
-                  llm_desc_zh = COALESCE(?, llm_desc_zh),
-                  llm_desc_ko = COALESCE(?, llm_desc_ko),
-                  llm_processed_at = COALESCE(?, llm_processed_at),
-                  llm_attempt_count = ?,
-                  product_desc_html = COALESCE(?, product_desc_html),
-                  uploaded_to_platform = CASE
-                    WHEN ? IS NULL THEN uploaded_to_platform
-                    ELSE ?
-                  END,
-                  seven17_uploaded_at = COALESCE(?, seven17_uploaded_at),
-                  seven17_ca_id = COALESCE(?, seven17_ca_id),
-                  updated_at = {SQLITE_NOW_CST8}
-                WHERE album_id = ? AND goods_id = ? AND tag_id = ?
-                """,
-                (
-                    ll_json,
-                    enrich["fx_krw_per_cny"],
-                    enrich["price_krw"],
-                    enrich["attr_map_json"],
-                    enrich["attr_map_ko_json"],
-                    enrich["llm_name_zh"],
-                    enrich["llm_name_ko"],
-                    enrich["llm_desc_zh"],
-                    enrich["llm_desc_ko"],
-                    enrich["llm_processed_at"],
-                    attempt_count,
-                    enrich["product_desc_html"],
-                    uploaded,
-                    uploaded,
-                    uploaded_at,
-                    ca_id_store,
-                    album_id,
-                    gid,
-                    tag_id,
-                ),
-            )
-        else:
-            conn.execute(
-                f"""
-                UPDATE pf_store_item SET
-                  fx_krw_per_cny = COALESCE(?, fx_krw_per_cny),
-                  price_krw = COALESCE(?, price_krw),
-                  llm_name_zh = COALESCE(?, llm_name_zh),
-                  llm_name_ko = COALESCE(?, llm_name_ko),
-                  llm_desc_zh = COALESCE(?, llm_desc_zh),
-                  llm_desc_ko = COALESCE(?, llm_desc_ko),
-                  llm_processed_at = COALESCE(?, llm_processed_at),
-                  llm_attempt_count = ?,
-                  product_desc_html = COALESCE(?, product_desc_html),
-                  uploaded_to_platform = CASE
-                    WHEN ? IS NULL THEN uploaded_to_platform
-                    ELSE ?
-                  END,
-                  seven17_uploaded_at = COALESCE(?, seven17_uploaded_at),
-                  seven17_ca_id = COALESCE(?, seven17_ca_id),
-                  updated_at = {SQLITE_NOW_CST8}
-                WHERE album_id = ? AND goods_id = ? AND tag_id = ?
-                """,
-                (
-                    enrich["fx_krw_per_cny"],
-                    enrich["price_krw"],
-                    enrich["llm_name_zh"],
-                    enrich["llm_name_ko"],
-                    enrich["llm_desc_zh"],
-                    enrich["llm_desc_ko"],
-                    enrich["llm_processed_at"],
-                    attempt_count,
-                    enrich["product_desc_html"],
-                    uploaded,
-                    uploaded,
-                    uploaded_at,
-                    ca_id_store,
-                    album_id,
-                    gid,
-                    tag_id,
-                ),
-            )
-        conn.commit()
-    item_id = rec.get("id")
-    if item_id is None:
-        item_id = _lookup_item_id(conn, album_id, gid, tag_id)
-        if item_id is not None:
-            rec["id"] = item_id
-    _log.info(
-        "%s",
-        pf_kv(
-            [
-                ("event", "db.write"),
-                ("op", "update_product_row"),
-                *pf_db_row_id_kv(rec, row_id=item_id if isinstance(item_id, int) else None),
-            ],
-            zh="写库：更新商品行",
-        ),
-    )
-
-
 def sqlite_mark_uploaded(conn: sqlite3.Connection, album_id: str, rec: dict[str, Any]) -> None:
     tid = rec.get("tag_id")
     try:
@@ -1114,9 +1293,7 @@ def sqlite_mark_uploaded(conn: sqlite3.Connection, album_id: str, rec: dict[str,
 
 
 def sqlite_update_llm_result(conn: sqlite3.Connection, album_id: str, rec: dict[str, Any]) -> None:
-    """LLM 专用写回：只更新 LLM 相关字段，不碰上架状态。"""
-    ll = rec.get("listing_llm")
-    ll_json = json.dumps(ll, ensure_ascii=False) if isinstance(ll, dict) else None
+    """LLM 专用写回：只更新 LLM 相关字段，不碰上架状态（不落库原始 JSON）。"""
     enrich = _extract_enriched_fields(rec)
     tid = rec.get("tag_id")
     try:
@@ -1136,28 +1313,36 @@ def sqlite_update_llm_result(conn: sqlite3.Connection, album_id: str, rec: dict[
         conn.execute(
             f"""
             UPDATE pf_store_item SET
-              listing_llm_json = COALESCE(?, listing_llm_json),
-              attr_map_json = COALESCE(?, attr_map_json),
-              attr_map_ko_json = COALESCE(?, attr_map_ko_json),
+              commodity_sizes_json = COALESCE(?, commodity_sizes_json),
+              commodity_colors_json = COALESCE(?, commodity_colors_json),
+              sizes_ko_json = COALESCE(?, sizes_ko_json),
+              colors_ko_json = COALESCE(?, colors_ko_json),
               llm_name_zh = COALESCE(?, llm_name_zh),
               llm_name_ko = COALESCE(?, llm_name_ko),
               llm_desc_zh = COALESCE(?, llm_desc_zh),
               llm_desc_ko = COALESCE(?, llm_desc_ko),
               llm_processed_at = COALESCE(?, llm_processed_at),
+              price_cny = COALESCE(?, price_cny),
+              llm_source = COALESCE(?, llm_source),
+              llm_reason = COALESCE(?, llm_reason),
               llm_attempt_count = ?,
               can_upload = COALESCE(?, can_upload),
               updated_at = {SQLITE_NOW_CST8}
             WHERE album_id = ? AND goods_id = ? AND tag_id = ?
             """,
             (
-                ll_json,
-                enrich["attr_map_json"],
-                enrich["attr_map_ko_json"],
+                enrich["commodity_sizes_json"],
+                enrich["commodity_colors_json"],
+                enrich["sizes_ko_json"],
+                enrich["colors_ko_json"],
                 enrich["llm_name_zh"],
                 enrich["llm_name_ko"],
                 enrich["llm_desc_zh"],
                 enrich["llm_desc_ko"],
                 enrich["llm_processed_at"],
+                enrich["price_cny"],
+                enrich["llm_source"],
+                enrich["llm_reason"],
                 attempt_count,
                 can_upload_db,
                 album_id,
@@ -1171,6 +1356,13 @@ def sqlite_update_llm_result(conn: sqlite3.Connection, album_id: str, rec: dict[
         item_id = _lookup_item_id(conn, album_id, gid, tag_id)
         if item_id is not None:
             rec["id"] = item_id
+    for key in ("commodity_sizes_json", "commodity_colors_json", "sizes_ko_json", "colors_ko_json"):
+        if enrich.get(key):
+            rec[key] = enrich[key]
+    from product_feed_kr.wecatalog_scrape_fields import parse_colors_json, parse_sizes_json
+
+    rec["commodity_sizes"] = parse_sizes_json(rec.get("commodity_sizes_json"))
+    rec["commodity_colors"] = parse_colors_json(rec.get("commodity_colors_json"))
     _log.info(
         "%s",
         pf_kv(
@@ -1199,17 +1391,13 @@ def sqlite_update_upload_fields(conn: sqlite3.Connection, album_id: str, rec: di
         conn.execute(
             f"""
             UPDATE pf_store_item SET
-              fx_krw_per_cny = COALESCE(?, fx_krw_per_cny),
               price_krw = COALESCE(?, price_krw),
-              product_desc_html = COALESCE(?, product_desc_html),
               seven17_ca_id = COALESCE(?, seven17_ca_id),
               updated_at = {SQLITE_NOW_CST8}
             WHERE album_id = ? AND goods_id = ? AND tag_id = ?
             """,
             (
-                enrich["fx_krw_per_cny"],
                 enrich["price_krw"],
-                enrich["product_desc_html"],
                 ca_id_store,
                 album_id,
                 gid,
