@@ -1,4 +1,4 @@
-"""商品规格：中文 ``commodity_sizes_json`` / ``commodity_colors_json``（爬取 + 缺时 LLM 写入同列）；韩文 ``*_ko_json``。"""
+"""商品规格：中文 ``commodity_sizes_json`` / ``commodity_colors_json``；LLM 纠错后回写同列；韩文 ``*_ko_json``。"""
 
 from __future__ import annotations
 
@@ -79,7 +79,10 @@ def effective_sizes_colors_ko(row: dict[str, Any]) -> tuple[list[str], list[str]
 
 def listing_llm_from_row(row: dict[str, Any]) -> dict[str, Any] | None:
     """从扁平行组装内存 ``listing_llm``。"""
-    from product_feed_kr.listing_llm_enrich import _cny_price_field_usable
+    from product_feed_kr.listing_llm_enrich import (
+        _cny_price_field_usable,
+        _krw_price_field_usable,
+    )
 
     lp = str(row.get("llm_processed_at") or "").strip()
     nzh = str(row.get("llm_name_zh") or "").strip()
@@ -88,9 +91,9 @@ def listing_llm_from_row(row: dict[str, Any]) -> dict[str, Any] | None:
     dko = str(row.get("llm_desc_ko") or "").strip()
     src0 = str(row.get("llm_source") or "").strip()
     rsn0 = str(row.get("llm_reason") or "").strip()
-    if not any((lp, nzh, nko, dzh, dko, src0, rsn0)) and not _cny_price_field_usable(
-        row.get("price_cny"),
-    ):
+    if not any((lp, nzh, nko, dzh, dko, src0, rsn0)) and not _krw_price_field_usable(
+        row.get("price_krw"),
+    ) and not _cny_price_field_usable(row.get("price_cny")):
         return None
 
     ll: dict[str, Any] = {}
@@ -108,6 +111,9 @@ def listing_llm_from_row(row: dict[str, Any]) -> dict[str, Any] | None:
     cp = row.get("price_cny")
     if _cny_price_field_usable(cp):
         ll["cny_price"] = str(cp).strip()
+    pk = row.get("price_krw")
+    if _krw_price_field_usable(pk):
+        ll["price_krw"] = str(pk).strip().replace(",", "")
 
     src = str(row.get("llm_source") or "").strip()
     if src:
@@ -149,7 +155,8 @@ def spec_columns_from_listing_llm(
     ll: dict[str, Any] | None,
     record: dict[str, Any] | None = None,
 ) -> dict[str, str | None]:
-    """LLM 写库：缺中文尺码/颜色时写入 ``commodity_*``（与爬取同列）；韩文写 ``*_ko_json``。"""
+    """LLM 写库：``attr_map`` 纠错结果回写 ``commodity_*``；韩文规格写 ``*_ko_json``。"""
+
     empty = {
         "commodity_sizes_json": None,
         "commodity_colors_json": None,
@@ -159,8 +166,6 @@ def spec_columns_from_listing_llm(
     if not isinstance(ll, dict):
         return empty
 
-    row = record if isinstance(record, dict) else {}
-    zh_sizes, zh_colors = zh_sizes_colors_from_row(row)
     ll_sizes, ll_colors = lists_from_attr_map(
         ll.get("attr_map") if isinstance(ll.get("attr_map"), dict) else None,
     )
@@ -168,18 +173,11 @@ def spec_columns_from_listing_llm(
         ll.get("attr_map_ko") if isinstance(ll.get("attr_map_ko"), dict) else None,
     )
 
-    fill_sizes: list[str] = []
-    fill_colors: list[str] = []
-    if not zh_sizes and ll_sizes:
-        fill_sizes = ll_sizes
-    if not zh_colors and ll_colors:
-        fill_colors = ll_colors
-
     return {
-        "commodity_sizes_json": dumps_json_list(fill_sizes),
-        "commodity_colors_json": dumps_json_list(fill_colors),
-        "sizes_ko_json": dumps_json_list(ll_sizes_ko),
-        "colors_ko_json": dumps_json_list(ll_colors_ko),
+        "commodity_sizes_json": dumps_json_list(ll_sizes) if ll_sizes else None,
+        "commodity_colors_json": dumps_json_list(ll_colors) if ll_colors else None,
+        "sizes_ko_json": dumps_json_list(ll_sizes_ko) if ll_sizes_ko else None,
+        "colors_ko_json": dumps_json_list(ll_colors_ko) if ll_colors_ko else None,
     }
 
 

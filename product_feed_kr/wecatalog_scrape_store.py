@@ -71,7 +71,13 @@ from product_feed_kr.wecatalog_tag_category_map_sync import (
     init_maps_at_scrape,
     sync_unmapped_tags_after_tags,
 )
-from product_feed_kr.wecatalog_popups import popups_response_ready
+from product_feed_kr.wecatalog_popups import (
+    POPUPS_ERR_COMMODITY_INVALID,
+    POPUPS_ERR_LOGIN_EXPIRED,
+    popups_errcode,
+    popups_errmsg,
+    popups_response_ready,
+)
 from product_feed_kr.wecatalog_scrape_fields import (
     attach_scrape_fields_to_record,
     fields_from_popups_response,
@@ -185,7 +191,10 @@ async ({ sellerAlbumId, commodityId }) => {
     popUpsType: "individualShopping",
   });
   const u = "https://www.wecatalog.cn/newOrder/api/v1/shoppingCart/popUpsInfoV2?" + qs.toString();
-  const r = await fetch(u, { credentials: "include" });
+  const r = await fetch(u, {
+    credentials: "include",
+    headers: { Accept: "application/json, text/plain, */*" },
+  });
   return await r.json();
 }
 """
@@ -372,6 +381,7 @@ def scrape_store(
         "list_items_unique": 0,
         "popups_ok": 0,
         "popups_err": 0,
+        "popups_expired": 0,
         "records": 0,
         "records_prior": 0,
         "records_new": 0,
@@ -449,7 +459,6 @@ def scrape_store(
                 ),
             )
             seen_popups: dict[str, dict[str, Any] | None] = {}
-            popups_fetch_index = 0
 
             def write_checkpoint(*, meta_only: bool = False) -> None:
                 meta_extra = {
@@ -486,17 +495,29 @@ def scrape_store(
                     ("album_id", album_id),
                 ]
                 ready = [r for r in records if scrape_detail_ready(r)]
+                not_ready = len(records) - len(ready)
+                if not_ready:
+                    ck_kv.append(("not_ready_in_memory", not_ready))
                 if ready:
                     ck_kv.extend(pf_store_row_id_kv(ready[-1], album_id=album_id))
-                logger.info(
-                    "%s",
-                    pf_kv(
-                        ck_kv,
-                        zh="写库：店铺进度 + 本 run 已抓到 popUps 的商品"
-                        if not meta_only
-                        else "写库：店铺元信息（尚无新商品）",
-                    ),
+                zh_ck = (
+                    "写库：店铺元信息（尚无新商品）"
+                    if meta_only
+                    else (
+                        "写库：店铺进度 + 本 run 已抓到 popUps 的商品"
+                        if written > 0 and not_ready == 0
+                        else (
+                            f"写库：内存 {len(records)} 条，"
+                            f"其中 {written} 条已入库"
+                            + (
+                                f"（{not_ready} 条无 commodity_title，未写入 pf_store_item）"
+                                if not_ready
+                                else ""
+                            )
+                        )
+                    )
                 )
+                logger.info("%s", pf_kv(ck_kv, zh=zh_ck))
 
             # 进入详情循环前只写店铺元信息，不把旧商品行载入内存写回
             write_checkpoint(meta_only=True)
@@ -509,7 +530,9 @@ def scrape_store(
             )
 
             new_appended = 0
+            popups_fetch_n = 0
             log_every = 50
+            krw_per_cny_page: float | None = None
 
             def append_product_row(
                 it: dict[str, Any],
@@ -519,7 +542,7 @@ def scrape_store(
                 shop_path: tuple[str, ...] | None,
             ) -> bool:
                 """写入一条分组×标签×商品；返回 False 表示已达 max_records 应停止整次抓取。"""
-                nonlocal new_appended, popups_fetch_index
+                nonlocal new_appended, popups_fetch_n
                 gid = it.get("goods_id") or it.get("selfGoodsId") or ""
                 if not isinstance(gid, str) or not gid:
                     return True
@@ -543,28 +566,31 @@ def scrape_store(
                     return True
 
                 scrape_fields: dict[str, Any] | None = None
+                pop_resp: dict[str, Any] | None = None
                 if gid in seen_popups:
                     cached_pop = seen_popups[gid]
-                    if isinstance(cached_pop, dict) and popups_response_ready(cached_pop):
-                        scrape_fields = fields_from_popups_response(cached_pop)
-                        logger.debug(
-                            "%s",
-                            pf_kv(
-                                [("event", "scrape.popups.cache"), ("goods_id", gid)],
-                                zh="popUpsInfoV2：复用本 run 已拉过的缓存",
-                            ),
-                        )
+                    if isinstance(cached_pop, dict):
+                        pop_resp = cached_pop
+                        if popups_response_ready(cached_pop):
+                            scrape_fields = fields_from_popups_response(cached_pop)
+                            logger.debug(
+                                "%s",
+                                pf_kv(
+                                    [("event", "scrape.popups.cache"), ("goods_id", gid)],
+                                    zh="popUpsInfoV2：复用本 run 已拉过的缓存",
+                                ),
+                            )
                 else:
+                    popups_fetch_n += 1
                     gap.before(
-                        f"popUpsInfoV2 #{popups_fetch_index + 1} goods_id={gid}",
+                        f"popUpsInfoV2 #{popups_fetch_n} goods_id={gid}",
                     )
-                    popups_fetch_index += 1
                     logger.debug(
                         "%s",
                         pf_kv(
                             [
                                 ("event", "scrape.popups.request"),
-                                ("n", popups_fetch_index),
+                                ("n", popups_fetch_n),
                                 ("goods_id", gid),
                             ],
                             zh="正在请求 popUpsInfoV2",
@@ -574,38 +600,77 @@ def scrape_store(
                         FETCH_POPUPS_JS,
                         {"sellerAlbumId": album_id, "commodityId": gid},
                     )
-                    if isinstance(p_raw, dict) and popups_response_ready(p_raw):
-                        scrape_fields = fields_from_popups_response(p_raw)
-                        seen_popups[gid] = p_raw
+                    pop_resp = p_raw if isinstance(p_raw, dict) else {"error": str(p_raw)}
+                    seen_popups[gid] = pop_resp
+                    if popups_response_ready(pop_resp):
+                        scrape_fields = fields_from_popups_response(pop_resp)
                         stats["popups_ok"] += 1
                     else:
-                        seen_popups[gid] = p_raw if isinstance(p_raw, dict) else {"error": str(p_raw)}
                         stats["popups_err"] += 1
+
+                if scrape_fields is None:
+                    ec = popups_errcode(pop_resp)
+                    em = popups_errmsg(pop_resp)
+                    if ec == POPUPS_ERR_COMMODITY_INVALID:
+                        stats["popups_expired"] += 1
+                        skip_ids_prior.add(gid)
+                        g_url = goods_page_url(album_id, gid)
+                        logger.info(
+                            "%s",
+                            pf_kv(
+                                [
+                                    ("event", "scrape.popups.skip_invalid"),
+                                    ("goods_id", gid),
+                                    ("goods_url", g_url),
+                                    ("errcode", ec),
+                                    ("errmsg", em or None),
+                                ],
+                                zh=f"popUpsInfoV2：商品已失效，跳过 goods_url={g_url}",
+                            ),
+                        )
+                    elif ec == POPUPS_ERR_LOGIN_EXPIRED:
+                        logger.warning(
+                            "%s",
+                            pf_kv(
+                                [
+                                    ("event", "scrape.popups.login_expired"),
+                                    ("goods_id", gid),
+                                    ("errcode", ec),
+                                    ("errmsg", em or None),
+                                ],
+                                zh="popUpsInfoV2：登录已过期，请用 --headed 在浏览器内登录微猫后重试",
+                            ),
+                        )
+                    else:
                         logger.warning(
                             "%s",
                             pf_kv(
                                 [
                                     ("event", "scrape.popups.err"),
                                     ("goods_id", gid),
-                                    (
-                                        "errcode",
-                                        p_raw.get("errcode") if isinstance(p_raw, dict) else None
-                                    ),
+                                    ("errcode", ec),
+                                    ("errmsg", em or None),
                                 ],
-                                zh="popUpsInfoV2 失败或登录过期",
+                                zh="popUpsInfoV2 未返回商品数据"
+                                + (f"：{em}" if em else ""),
                             ),
                         )
+                    return True
 
-                merged = scrape_fields if scrape_fields is not None else fields_from_popups_response(None)
-                if not str(merged.get("commodity_title") or "").strip():
+                if not str(scrape_fields.get("commodity_title") or "").strip():
                     logger.warning(
                         "%s",
                         pf_kv(
-                            [("event", "scrape.no_title"), ("goods_id", gid)],
-                            zh="无商品标题，跳过入库（popUps 未返回 title）",
+                            [
+                                ("event", "scrape.popups.no_title"),
+                                ("goods_id", gid),
+                                ("goods_url", goods_page_url(album_id, gid)),
+                            ],
+                            zh="popUpsInfoV2 成功但无商品标题（commodityName/title 均为空），跳过入库",
                         ),
                     )
                     return True
+
                 rec = {
                     "wecatalog_group": gname,
                     "wecatalog_tag": tname,
@@ -615,7 +680,11 @@ def scrape_store(
                     "goods_url": goods_page_url(album_id, gid),
                     "uploaded_to_platform": False,
                 }
-                attach_scrape_fields_to_record(rec, merged)
+                attach_scrape_fields_to_record(
+                    rec,
+                    scrape_fields,
+                    krw_per_cny=krw_per_cny_page,
+                )
                 records.append(rec)
                 skip_ids_prior.add(gid)
                 new_appended += 1
@@ -682,6 +751,38 @@ def scrape_store(
             ):
                 stats["list_pages"] = page_num
                 stats["list_items_unique"] += len(new_items)
+                from product_feed_kr.cny_krw_rate import resolve_krw_per_cny
+
+                krw_per_cny_page = None
+                stats["fx_source"] = None
+                try:
+                    krw_per_cny_page, fx_src = resolve_krw_per_cny()
+                    stats["krw_per_cny"] = krw_per_cny_page
+                    stats["fx_source"] = fx_src
+                    logger.info(
+                        "%s",
+                        pf_kv(
+                            [
+                                ("event", "scrape.fx"),
+                                ("page", page_num),
+                                ("krw_per_cny", round(krw_per_cny_page, 4)),
+                                ("fx_source", fx_src),
+                            ],
+                            zh="本页抓取使用 CNY→KRW 汇率（韩元价在入库时按千韩元取整）",
+                        ),
+                    )
+                except Exception as e:
+                    logger.warning(
+                        "%s",
+                        pf_kv(
+                            [
+                                ("event", "scrape.fx.err"),
+                                ("page", page_num),
+                                ("err", str(e)[:300]),
+                            ],
+                            zh="本页无法获取汇率，商品仍将写入人民币价，韩元价留空",
+                        ),
+                    )
 
                 def _iter_groups_tags(*, categorized_only: bool):
                     """遍历 groups×tags 处理 new_items；categorized_only=True 时只处理有分类的。"""
@@ -761,6 +862,7 @@ def scrape_store(
                         ("skip_uncategorized_enabled", skip_uncategorized),
                         ("popups_ok", stats["popups_ok"]),
                         ("popups_err", stats["popups_err"]),
+                        ("popups_expired", stats["popups_expired"] or None),
                         ("album_id", album_id),
                     ],
                     zh="店铺抓取流程正常结束",

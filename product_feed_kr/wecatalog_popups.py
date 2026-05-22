@@ -7,6 +7,10 @@ from urllib.parse import urlencode
 
 POPUPS_INFO_V2_PATH = "/newOrder/api/v1/shoppingCart/popUpsInfoV2"
 
+# 微猫业务 errcode（非 HTTP 状态）
+POPUPS_ERR_LOGIN_EXPIRED = 9
+POPUPS_ERR_COMMODITY_INVALID = 2530002
+
 
 def popups_info_v2_url(*, seller_album_id: str, commodity_id: str) -> str:
     qs = urlencode(
@@ -25,6 +29,26 @@ def popups_response_ready(resp: Any) -> bool:
         and resp.get("success") is True
         and resp.get("errcode") in (0, None)
     )
+
+
+def popups_errcode(resp: Any) -> int | None:
+    if not isinstance(resp, dict):
+        return None
+    try:
+        return int(resp["errcode"])
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def popups_errmsg(resp: Any) -> str:
+    if not isinstance(resp, dict):
+        return ""
+    return str(resp.get("errmsg") or "").strip()
+
+
+def popups_skip_permanent(errcode: int | None) -> bool:
+    """该 errcode 表示商品侧无效，后续 run 可不再请求 popUps。"""
+    return errcode == POPUPS_ERR_COMMODITY_INVALID
 
 
 def popups_commodity(resp: dict[str, Any] | None) -> dict[str, Any] | None:

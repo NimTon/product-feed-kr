@@ -9,7 +9,7 @@ import argparse
 import json
 from typing import Any
 
-from product_feed_kr.listing_llm_enrich import _shoe_sizes_to_kr_mm, _text_suggests_footwear
+from product_feed_kr.wecatalog_size_fix import shoe_sizes_to_kr_mm
 from product_feed_kr.llm_spec_fields import (
     COLOR_ZH,
     SIZE_KO,
@@ -81,7 +81,7 @@ def _mm_sizes_from_zh(attr_map: dict[str, Any]) -> list[str] | None:
     zh_sizes = _as_size_list(attr_map.get(_SIZE_ZH))
     if not zh_sizes or not any(_token_is_convertible_eu(s) for s in zh_sizes):
         return None
-    mm = _shoe_sizes_to_kr_mm(zh_sizes)
+    mm = shoe_sizes_to_kr_mm(zh_sizes)
     if not mm or mm == zh_sizes:
         return None
     return mm
@@ -90,12 +90,7 @@ def _mm_sizes_from_zh(attr_map: dict[str, Any]) -> list[str] | None:
 def _needs_fix(
     attr_map: dict[str, Any],
     attr_map_ko: dict[str, Any],
-    *,
-    footwear_only: bool,
-    context_text: str,
 ) -> tuple[bool, list[str] | None]:
-    if footwear_only and not _text_suggests_footwear(context_text):
-        return False, None
     mm = _mm_sizes_from_zh(attr_map)
     if not mm:
         return False, None
@@ -105,24 +100,11 @@ def _needs_fix(
     return True, mm
 
 
-def _context_text(row: dict[str, Any], attr_map: dict[str, Any]) -> str:
-    parts = [
-        str(row.get("commodity_title") or ""),
-        str(row.get("llm_name_zh") or ""),
-    ]
-    for k in ("llm_name_ko", "llm_desc_zh"):
-        v = row.get(k)
-        if isinstance(v, str) and v.strip():
-            parts.append(v.strip()[:300])
-    return "\n".join(p for p in parts if p)
-
-
 def _scan_rows(
     conn: Any,
     *,
     album_id: str | None,
     limit: int | None,
-    footwear_only: bool,
 ) -> list[dict[str, Any]]:
     sql = """
         SELECT id, album_id, goods_id, tag_id, commodity_title,
@@ -145,10 +127,7 @@ def _scan_rows(
         row_d = dict(row)
         attr_map = _attr_map_from_row(row_d)
         attr_map_ko = _attr_map_ko_from_row(row_d)
-        ctx = _context_text(row_d, attr_map)
-        ok, mm = _needs_fix(
-            attr_map, attr_map_ko, footwear_only=footwear_only, context_text=ctx
-        )
+        ok, mm = _needs_fix(attr_map, attr_map_ko)
         if not ok or not mm:
             continue
         zh_sizes = _as_size_list(attr_map.get(_SIZE_ZH))
@@ -196,7 +175,7 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument(
         "--all-numeric",
         action="store_true",
-        help="不校验鞋类标题/名称（默认仅处理鞋靴类语境）",
+        help="凡中文尺码为可换算欧码数字即转毫米（不依赖 LLM；慎用，可能误伤服装）",
     )
     args = ap.parse_args(argv)
 
@@ -206,13 +185,15 @@ def main(argv: list[str] | None = None) -> int:
     conn = connect_sqlite()
     try:
         ensure_sqlite_schema(conn)
-        footwear_only = not bool(args.all_numeric)
-        hits = _scan_rows(
-            conn,
-            album_id=album_filter,
-            limit=scan_limit,
-            footwear_only=footwear_only,
-        )
+        if not args.all_numeric:
+            print("未加 --all-numeric：本脚本不猜鞋类，请用 02 LLM 标注 size_spec_kind 后写库。")
+            hits = []
+        else:
+            hits = _scan_rows(
+                conn,
+                album_id=album_filter,
+                limit=scan_limit,
+            )
         print(f"db: {sqlite_db_path()}")
         print(f"待修复（中文尺码已换算，韩文 사이즈 未对齐）: {len(hits)} 条")
         for h in hits:

@@ -84,3 +84,21 @@ def record_price_cny(record: dict[str, Any]) -> str | None:
 def record_scrape_price_raw(record: dict[str, Any]) -> str | None:
     """兼容旧名，等同 ``record_price_cny``。"""
     return record_price_cny(record)
+
+
+def record_price_krw(record: dict[str, Any]) -> str | None:
+    """当前条可用韩元售价（``price_krw`` 列或 ``commodity_min``）。"""
+    raw = record.get("price_krw")
+    if raw is None and isinstance(record.get("commodity_min"), dict):
+        raw = record["commodity_min"].get("price_krw")
+    if raw is None:
+        return None
+    s = str(raw).strip().replace(",", "")
+    if not s or s in ("0", "0.0", "-1"):
+        return None
+    try:
+        if float(s) <= 0:
+            return None
+    except ValueError:
+        return None
+    return s

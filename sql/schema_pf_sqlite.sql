@@ -23,6 +23,7 @@ CREATE TABLE IF NOT EXISTS pf_store_item (
   llm_attempt_count INTEGER NOT NULL DEFAULT 0,
   can_process INTEGER NOT NULL DEFAULT 1,
   can_upload INTEGER NOT NULL DEFAULT 0,
+  rescrape_pending INTEGER NOT NULL DEFAULT 0,
   uploaded_to_platform INTEGER NOT NULL DEFAULT 0,
   created_at TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),
   updated_at TEXT NOT NULL DEFAULT (datetime('now', '+8 hours')),

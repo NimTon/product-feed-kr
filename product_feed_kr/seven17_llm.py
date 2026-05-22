@@ -1,6 +1,7 @@
 """对 SQLite 店铺商品执行 LLM enrich 并写回（不登录 seven17、不上架）。
 
-``OPENAI_PROFILES`` 总线程数 > 1（多 api_key 或单 key ``"threads": 1~3``）时同进程多线程；每完成一次 API 响应后重新读库取下一条待处理记录。
+``OPENAI_PROFILES`` 总线程数 > 1（多 api_key 或单 key ``"threads": 1~3``）时同进程多线程：
+主线程（dispatcher）读库分配任务，worker 线程调用 LLM；每完成一次 API 响应后释放 claim 并继续调度。
 
 运行示例::
 
@@ -148,7 +149,11 @@ def _run_llm_multithread_claim_loop(
     restart_after: int,
     active_profiles: list | None = None,
 ) -> tuple[int, bool]:
-    from product_feed_kr.listing_llm_enrich import enrich_record_listing_llm, listing_llm_api_profiles
+    from product_feed_kr.listing_llm_enrich import (
+        enrich_record_listing_llm,
+        listing_llm_api_profiles,
+        llm_token_usage_kv_pairs,
+    )
     from product_feed_kr.store_sqlite import connect_sqlite, sqlite_update_llm_result
 
     profiles = active_profiles if active_profiles is not None else listing_llm_api_profiles()
@@ -174,7 +179,7 @@ def _run_llm_multithread_claim_loop(
         pf_kv(
             [
                 ("event", "llm.threads.start"),
-                ("mode", "claim_next"),
+                ("mode", "dispatcher_queue"),
                 ("threads", total_threads),
                 ("labels", ",".join(f"{p['label']}x{p.get('threads',1)}" for p in profiles)),
                 (
@@ -185,7 +190,7 @@ def _run_llm_multithread_claim_loop(
                     ),
                 ),
             ],
-            zh="多线程 LLM：每次 API 响应后重新读库取下一条",
+            zh="多线程 LLM：主线程分配任务，worker 调用 API",
         ),
     )
 
@@ -292,6 +297,8 @@ def _run_llm_multithread_claim_loop(
                     in_flight=in_flight,
                 )
                 if item is None:
+                    if in_flight:
+                        continue
                     break
                 while not stop_event.is_set():
                     try:
@@ -307,8 +314,6 @@ def _run_llm_multithread_claim_loop(
                         work_q.put(None, timeout=0.5)
                         break
                     except queue.Full:
-                        if stop_event.is_set():
-                            continue
                         continue
 
     threads: list[threading.Thread] = []
@@ -353,6 +358,7 @@ def _run_llm_multithread_claim_loop(
                 ("rows_updated", updated_total),
                 ("restart_fresh", restart_fresh),
                 ("fused", len(fused_profiles)),
+                *llm_token_usage_kv_pairs(),
             ],
             zh="多线程 LLM 本 run 结束",
         ),
@@ -372,9 +378,14 @@ def enrich_llm_for_sqlite_records(
         listing_llm_api_profiles,
         listing_llm_color_vision_enabled,
         listing_llm_enabled,
+        llm_token_usage_kv_pairs,
+        llm_token_usage_run_snapshot,
         probe_all_profiles,
         record_after_llm_attempt,
+        reset_llm_token_usage_run,
     )
+
+    reset_llm_token_usage_run()
 
     aid = album_id.strip()
     if not aid:
@@ -452,56 +463,76 @@ def enrich_llm_for_sqlite_records(
                 limit=limit if isinstance(limit, int) and limit > 0 else None,
             )
             rows_eligible = len(pending_rows)
-            updated_total = 0
-            restart_fresh = False
             if not pending_rows:
                 _log.info(
                     "%s",
                     pf_kv([("event", "llm.empty")], zh="无待 LLM 处理的记录"),
                 )
-            profile = api_profiles[0] if api_profiles else None
-            for rec, com in pending_rows:
-                try:
-                    ok = enrich_record_listing_llm(
+            else:
+                profile = api_profiles[0] if api_profiles else None
+                _log.info(
+                    "%s",
+                    pf_kv(
+                        [
+                            ("event", "llm.run.start"),
+                            ("pending", rows_eligible),
+                            ("profile", profile.get("label") if profile else ""),
+                        ],
+                        zh="逐条 LLM 处理",
+                    ),
+                )
+                for rec, com in pending_rows:
+                    try:
+                        ok = enrich_record_listing_llm(
+                            rec,
+                            com,
+                            api_profile=profile,
+                            register_attempt=False,
+                        )
+                    except Exception as e:
+                        record_after_llm_attempt(rec, com, ok=False, error=str(e))
+                        sqlite_update_llm_result(conn, aid, rec)
+                        continue
+                    record_after_llm_attempt(
                         rec,
                         com,
-                        api_profile=profile,
-                        register_attempt=False,
+                        ok=ok,
+                        error=None if ok else "enrich_returned_false",
                     )
-                except Exception as e:
-                    record_after_llm_attempt(rec, com, ok=False, error=str(e))
                     sqlite_update_llm_result(conn, aid, rec)
-                    continue
-                record_after_llm_attempt(
-                    rec,
-                    com,
-                    ok=ok,
-                    error=None if ok else "enrich_returned_false",
-                )
-                sqlite_update_llm_result(conn, aid, rec)
-                ll = rec.get("listing_llm")
-                if (
-                    isinstance(ll, dict)
-                    and str(ll.get("source") or "") != "llm_skipped"
-                    and rec.get("llm_processed_at")
-                    and ok
-                ):
-                    updated_total += 1
-                if restart_after_llm > 0 and updated_total >= restart_after_llm:
-                    restart_fresh = True
-                    _log.info(
-                        "%s",
-                        pf_kv(
-                            [
-                                ("event", "llm.restart_after"),
-                                ("rows_updated", updated_total),
-                                ("restart_after", restart_after_llm),
-                                ("exit", EXIT_RESTART_FRESH_DATA),
-                            ],
-                            zh="已达配置的 LLM 写回条数阈值，结束本进程以便外层重跑",
-                        ),
-                    )
-                    break
+                    ll = rec.get("listing_llm")
+                    if (
+                        isinstance(ll, dict)
+                        and str(ll.get("source") or "") != "llm_skipped"
+                        and rec.get("llm_processed_at")
+                        and ok
+                    ):
+                        updated_total += 1
+                    if restart_after_llm > 0 and updated_total >= restart_after_llm:
+                        restart_fresh = True
+                        _log.info(
+                            "%s",
+                            pf_kv(
+                                [
+                                    ("event", "llm.restart_after"),
+                                    ("rows_updated", updated_total),
+                                    ("restart_after", restart_after_llm),
+                                    ("exit", EXIT_RESTART_FRESH_DATA),
+                                ],
+                                zh="已达配置的 LLM 写回条数阈值，结束本进程以便外层重跑",
+                            ),
+                        )
+                        break
+
+        usage = llm_token_usage_run_snapshot()
+        if usage.get("requests"):
+            _log.info(
+                "%s",
+                pf_kv(
+                    [("event", "llm.usage.run"), *llm_token_usage_kv_pairs()],
+                    zh="本轮 LLM API 累计 token 用量",
+                ),
+            )
 
         return {
             "ok": True,
@@ -511,6 +542,7 @@ def enrich_llm_for_sqlite_records(
             "rows_updated": updated_total,
             "rows_skipped_no_detail": skipped_no_detail,
             "restart_fresh": restart_fresh,
+            "token_usage": usage,
         }
     finally:
         conn.close()

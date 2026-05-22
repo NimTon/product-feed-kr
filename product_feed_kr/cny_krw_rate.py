@@ -1,10 +1,16 @@
-"""查询 1 CNY 兑多少 KRW（韩元），用于 seven17 后台 판매가격（韩元）填报。"""
+"""查询 1 CNY 兑多少 KRW（韩元），用于抓取写库与 seven17 上架填价。"""
 
 from __future__ import annotations
 
 import json
+import logging
 import urllib.error
 import urllib.request
+
+from product_feed_kr.pf_log import pf_kv
+from product_feed_kr.seven17_config import getenv as _cfg_get
+
+_log = logging.getLogger("product_feed_kr.cny_krw_rate")
 
 # fawazahmed0/currency-api（jsDelivr）；失败时由 seven17 配置 SEVEN17_CNY_KRW_FALLBACK 兜底
 _CNY_KRW_URLS: tuple[str, ...] = (
@@ -42,6 +48,47 @@ def fetch_krw_per_cny(*, timeout: float = 20.0) -> float:
             last_err = e
             continue
     raise RuntimeError(f"无法拉取 CNY→KRW 汇率（已尝试 {len(_CNY_KRW_URLS)} 个地址）：{last_err!s}") from last_err
+
+
+def resolve_krw_per_cny() -> tuple[float, str]:
+    """1 CNY 兑 KRW：优先 ``SEVEN17_CNY_KRW_RATE``，其次实时接口，失败用 ``SEVEN17_CNY_KRW_FALLBACK``。
+
+    返回 ``(汇率, 来源标记)``，来源为 ``manual`` / ``live`` / ``fallback``。
+    """
+    manual = _cfg_get("SEVEN17_CNY_KRW_RATE")
+    if manual and str(manual).strip():
+        v = float(str(manual).strip().replace(",", ""))
+        if v <= 0:
+            raise RuntimeError("SEVEN17_CNY_KRW_RATE 须为正数")
+        return v, "manual"
+    try:
+        return fetch_krw_per_cny(), "live"
+    except Exception as e:
+        fb = _cfg_get("SEVEN17_CNY_KRW_FALLBACK")
+        if fb and str(fb).strip():
+            v = float(str(fb).strip().replace(",", ""))
+            if v <= 0:
+                raise RuntimeError("SEVEN17_CNY_KRW_FALLBACK 须为正数")
+            _log.warning(
+                "%s",
+                pf_kv(
+                    [("event", "fx.warn"), ("reason", "live_failed_use_fallback"), ("err", str(e))],
+                    zh="实时 CNY→KRW 失败，已改用配置兜底汇率",
+                ),
+            )
+            return v, "fallback"
+        raise RuntimeError(
+            "CNY→KRW 实时汇率不可用：请设置 SEVEN17_CNY_KRW_FALLBACK 或 SEVEN17_CNY_KRW_RATE"
+        ) from e
+
+
+def cny_amount_to_krw_won_str(amount_cny: str, krw_per_cny: float) -> str | None:
+    """人民币售价 → 韩元整数（千韩元取整）；无效输入返回 None。"""
+    s = str(amount_cny).strip().replace(",", "")
+    if not s or s in ("0", "-1"):
+        return None
+    krw = cny_listing_amount_to_krw_won_str(s, krw_per_cny)
+    return krw if krw and krw != "0" else None
 
 
 def cny_listing_amount_to_krw_won_str(amount_cny: str, krw_per_cny: float) -> str:

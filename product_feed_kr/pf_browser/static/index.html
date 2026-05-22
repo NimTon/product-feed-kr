@@ -23,8 +23,17 @@
       --grp-llm: #2d3040;
     }
     * { box-sizing: border-box; }
+    html {
+      height: 100%;
+    }
     body {
       margin: 0;
+      height: 100%;
+      min-height: 100vh;
+      min-height: 100dvh;
+      overflow: hidden;
+      display: flex;
+      flex-direction: column;
       font-family: "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
       background: var(--bg);
       color: var(--text);
@@ -32,12 +41,10 @@
       line-height: 1.45;
     }
     header {
+      flex: 0 0 auto;
       padding: 14px 20px;
       border-bottom: 1px solid var(--border);
       background: var(--panel);
-      position: sticky;
-      top: 0;
-      z-index: 10;
     }
     h1 { margin: 0 0 6px; font-size: 18px; font-weight: 600; }
     .sub { color: var(--muted); font-size: 12px; word-break: break-all; }
@@ -69,7 +76,32 @@
       color: var(--text);
     }
     button:disabled { opacity: 0.45; cursor: not-allowed; }
-    main { padding: 12px 16px 24px; }
+    button.btn-xs {
+      padding: 3px 7px;
+      font-size: 11px;
+      border-radius: 4px;
+      margin: 0 3px 3px 0;
+      white-space: nowrap;
+    }
+    button.btn-warn {
+      background: transparent;
+      border-color: var(--warn);
+      color: var(--warn);
+    }
+    button.btn-warn:hover:not(:disabled) { background: rgba(245, 165, 36, 0.12); }
+    .actions-cell { min-width: 200px; }
+    .actions-cell .btn-row { display: flex; flex-wrap: wrap; gap: 2px; }
+    main {
+      flex: 1 1 auto;
+      min-height: 0;
+      display: flex;
+      flex-direction: column;
+      padding: 12px 16px;
+      overflow: hidden;
+    }
+    .main-top {
+      flex: 0 0 auto;
+    }
     .stats {
       display: flex;
       flex-wrap: wrap;
@@ -103,11 +135,12 @@
     .legend .g-spec::before { background: var(--grp-spec); }
     .legend .g-llm::before { background: var(--grp-llm); }
     .table-wrap {
+      flex: 1 1 auto;
+      min-height: 0;
       overflow: auto;
       border: 1px solid var(--border);
       border-radius: 8px;
       background: var(--panel);
-      max-height: calc(100vh - 250px);
     }
     table {
       width: 100%;
@@ -153,14 +186,21 @@
     .badge.no { background: rgba(139, 156, 179, 0.15); color: var(--muted); }
     .badge.warn { background: rgba(245, 165, 36, 0.2); color: var(--warn); }
     .badge.up { background: rgba(61, 139, 253, 0.2); color: var(--accent); }
+    .badge[title] { cursor: help; }
     .pager {
+      flex: 0 0 auto;
       display: flex;
       flex-wrap: wrap;
       gap: 10px;
       align-items: center;
-      margin-top: 12px;
+      margin-top: 10px;
+      padding-bottom: 2px;
     }
-    .err { color: var(--err); padding: 12px; }
+    .err {
+      flex: 0 0 auto;
+      color: var(--err);
+      padding: 8px 0 0;
+    }
     .loading { color: var(--muted); padding: 24px; text-align: center; }
     dialog {
       border: 1px solid var(--border);
@@ -179,6 +219,11 @@
       justify-content: space-between;
       align-items: center;
       gap: 12px;
+    }
+    .modal-actions {
+      display: flex;
+      gap: 8px;
+      flex-shrink: 0;
     }
     .modal-body {
       padding: 12px 16px 16px;
@@ -233,6 +278,13 @@
       font-size: 12px;
     }
     a { color: var(--accent); }
+    a.ext-link {
+      word-break: break-all;
+      text-decoration: underline;
+      text-underline-offset: 2px;
+    }
+    a.ext-link:hover { color: #6ba8ff; }
+    .url-hint { font-size: 11px; color: var(--muted); margin-top: 4px; }
     .muted { color: var(--muted); }
   </style>
 </head>
@@ -249,7 +301,7 @@
       </div>
       <div>
         <label>搜索</label><br />
-        <input id="q" type="search" placeholder="标题 / goods_id / 货号 / 中韩文名 / 描述 / 价格" style="width:280px" />
+        <input id="q" type="search" placeholder="id / 货号 / 首图hash / goods_id / 标题 / 中韩文名 / 描述" style="width:340px" />
       </div>
       <div>
         <label>排序</label><br />
@@ -275,14 +327,16 @@
     </div>
   </header>
   <main>
-    <div class="stats" id="stats"></div>
-    <div class="legend">
-      <span class="g-status">状态 / 时间</span>
-      <span class="g-id">标识</span>
-      <span class="g-scrape">微猫抓取</span>
-      <span class="g-price">价格</span>
-      <span class="g-spec">规格</span>
-      <span class="g-llm">LLM 文案</span>
+    <div class="main-top">
+      <div class="stats" id="stats"></div>
+      <div class="legend">
+        <span class="g-status">状态 / 时间</span>
+        <span class="g-id">标识</span>
+        <span class="g-scrape">微猫抓取</span>
+        <span class="g-price">价格</span>
+        <span class="g-spec">规格</span>
+        <span class="g-llm">LLM 文案</span>
+      </div>
     </div>
     <div class="table-wrap">
       <div class="loading" id="loading">加载数据…</div>
@@ -290,8 +344,10 @@
         <thead>
           <tr>
             <th class="grp grp-status">ID</th>
+            <th class="grp grp-status">操作</th>
             <th class="grp grp-status">状态</th>
             <th class="grp grp-status">LLM次</th>
+            <th class="grp grp-status">创建时间</th>
             <th class="grp grp-status">LLM 时间</th>
             <th class="grp grp-status">上传时间</th>
             <th class="grp grp-id">goods_id</th>
@@ -325,13 +381,16 @@
   <dialog id="detailDlg">
     <div class="modal-head">
       <strong id="dlgTitle">详情</strong>
-      <button type="button" class="secondary" id="btnCloseDlg">关闭</button>
+      <div class="modal-actions">
+        <button type="button" class="secondary" id="btnCopyDetail" disabled>复制信息</button>
+        <button type="button" class="secondary" id="btnCloseDlg">关闭</button>
+      </div>
     </div>
     <div class="modal-body" id="dlgBody"></div>
   </dialog>
 
   <script>
-    const state = { page: 1, total: 0, pages: 1 };
+    const state = { page: 1, total: 0, pages: 1, detailRow: null };
 
     const $ = (id) => document.getElementById(id);
 
@@ -344,16 +403,120 @@
         .replace(/"/g, "&quot;");
     }
 
-    function badge(cls, text) {
-      return `<span class="badge ${cls}">${esc(text)}</span>`;
+    /** 仅展示日期时间本体，去掉 +08:00 / Z 等时区后缀 */
+    function formatDisplayTime(raw) {
+      if (raw == null) return "";
+      const s = String(raw).trim();
+      if (!s) return "";
+      const m = s.match(/^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})/);
+      if (m) return `${m[1]} ${m[2]}`;
+      const cut = s.split(/[Z+]/)[0].trim().replace("T", " ");
+      return cut.replace(/\.\d+$/, "").trim();
+    }
+
+    function displayTimeOrDash(v) {
+      return formatDisplayTime(v) || "—";
+    }
+
+    function badge(cls, text, title) {
+      const tip = title ? ` title="${esc(title)}"` : "";
+      return `<span class="badge ${cls}"${tip}>${esc(text)}</span>`;
+    }
+
+    function isLlmProcessed(row) {
+      if (row && row.llm_processed === true) return true;
+      if (row && row.llm_processed === false) return false;
+      return !!(row && row.llm_processed_at && String(row.llm_processed_at).trim());
     }
 
     function statusBadges(row) {
       const parts = [];
-      parts.push(row.can_process ? badge("ok", "可处理") : badge("no", "不可处理"));
-      if (row.can_upload) parts.push(badge("ok", "可上传"));
-      if (row.uploaded_to_platform) parts.push(badge("up", "已上传"));
+      if (row.rescrape_pending) parts.push(badge("warn", "待重爬"));
+
+      if (isLlmProcessed(row)) {
+        parts.push(badge("up", "已处理"));
+      } else if (row.can_process) {
+        parts.push(badge("no", "未处理"));
+      } else {
+        parts.push(
+          badge("no", "不可处理", row.process_block_reason || "已标记为不可处理"),
+        );
+      }
+
+      if (row.uploaded_to_platform) {
+        parts.push(badge("up", "已上传"));
+      } else if (row.upload_eligible) {
+        parts.push(badge("ok", "可上传"));
+      } else {
+        parts.push(
+          badge("no", "不可上传", row.upload_block_reason || "当前不满足上传条件"),
+        );
+      }
+
       return parts.join("") || "—";
+    }
+
+    const RERUN_HINTS = {
+      rescrape:
+        "将标记「待重爬」，并清空 LLM/上架状态。需运行 01 采集；之后必须再跑 02、03。\n" +
+        "同一 goods_id 下的所有标签行都会受影响。",
+      reprocess:
+        "将清空 LLM/上架状态，保留已爬取的微猫字段。需运行 02；之后必须再跑 03。",
+      reupload:
+        "仅清除上架标记，保留爬取与 LLM 结果。需运行 03 重新上传。",
+    };
+
+    function actionButtons(row) {
+      const id = row.id;
+      const hasScrape = !!(row.commodity_title && String(row.commodity_title).trim());
+      const hasLlm = isLlmProcessed(row);
+      const canReprocess = hasScrape && hasLlm;
+      const canReupload = hasLlm || row.uploaded_to_platform;
+      return (
+        `<div class="btn-row">` +
+        `<button type="button" class="btn-xs btn-warn" data-rerun="rescrape" data-id="${id}" title="${esc(RERUN_HINTS.rescrape)}">重爬</button>` +
+        `<button type="button" class="btn-xs secondary" data-rerun="reprocess" data-id="${id}" ${canReprocess ? "" : "disabled"} title="${esc(RERUN_HINTS.reprocess)}">重处理</button>` +
+        `<button type="button" class="btn-xs secondary" data-rerun="reupload" data-id="${id}" ${canReupload ? "" : "disabled"} title="${esc(RERUN_HINTS.reupload)}">重传</button>` +
+        `</div>`
+      );
+    }
+
+    async function rerunItem(id, action) {
+      const hint = RERUN_HINTS[action];
+      if (!hint || !confirm(hint + "\n\n确定继续？")) return;
+      const btn = document.querySelector(`button[data-rerun="${action}"][data-id="${id}"]`);
+      if (btn) btn.disabled = true;
+      try {
+        const res = await fetch(`/api/items/${id}/rerun`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ action }),
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) {
+          throw new Error(data.error || res.statusText);
+        }
+        await loadItems();
+        if ($("detailDlg").open && String($("dlgTitle").dataset.itemId) === String(id)) {
+          await openDetail(id);
+        }
+      } catch (e) {
+        alert("操作失败: " + e.message);
+      } finally {
+        if (btn) btn.disabled = false;
+      }
+    }
+
+    function bindRerunButtons(root) {
+      if (!root) return;
+      root.querySelectorAll("button[data-rerun]").forEach((btn) => {
+        btn.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          const id = btn.dataset.id;
+          const action = btn.dataset.rerun;
+          if (id && action) rerunItem(id, action);
+        });
+      });
     }
 
     function cellGrp(cls, html) {
@@ -413,10 +576,12 @@
           tr.dataset.id = row.id;
           tr.innerHTML = [
             cellGrp("", `<span class="mono">${row.id}</span>`),
+            `<td class="grp actions-cell">${actionButtons(row)}</td>`,
             cellGrp("", statusBadges(row)),
             cellGrp("", `<span class="mono">${row.llm_attempt_count ?? 0}</span>`),
-            cellGrp("", `<span class="mono">${esc(row.llm_processed_at) || "—"}</span>`),
-            cellGrp("", `<span class="mono">${esc(row.seven17_uploaded_at) || "—"}</span>`),
+            cellGrp("", `<span class="mono">${esc(formatDisplayTime(row.created_at)) || "—"}</span>`),
+            cellGrp("", `<span class="mono">${esc(formatDisplayTime(row.llm_processed_at)) || "—"}</span>`),
+            cellGrp("", `<span class="mono">${esc(formatDisplayTime(row.seven17_uploaded_at)) || "—"}</span>`),
             cellGrp("", `<span class="mono">${esc(row.goods_id)}</span>`),
             cellGrp("", esc(row.wecatalog_label)),
             cellGrp("title-cell", `<span title="${esc(row.commodity_title)}">${esc(row.commodity_title_short)}</span>`),
@@ -435,6 +600,7 @@
           tr.addEventListener("click", () => openDetail(row.id));
           tbody.appendChild(tr);
         }
+        bindRerunButtons(tbody);
 
         $("pageInfo").textContent = `第 ${data.page} / ${data.pages} 页`;
         $("pageHint").textContent = `共 ${data.total} 条`;
@@ -458,6 +624,151 @@
       return esc(items.join("、"));
     }
 
+    function textOrDash(v) {
+      const s = v == null ? "" : String(v).trim();
+      return s || "—";
+    }
+
+    function listPlain(items) {
+      if (!items || !items.length) return "—";
+      return items.join("、");
+    }
+
+    function llmProcessStatusText(row) {
+      if (isLlmProcessed(row)) return `已处理 (${displayTimeOrDash(row.llm_processed_at)})`;
+      if (row.can_process) return "未处理";
+      return "不可处理";
+    }
+
+    function uploadStatusText(row) {
+      if (row.uploaded_to_platform) return `已上传 (${displayTimeOrDash(row.seven17_uploaded_at)})`;
+      if (row.can_upload) return "可上传";
+      return "未上传";
+    }
+
+    function formatItemClipboardText(row) {
+      const path = Array.isArray(row.shop_category_path)
+        ? row.shop_category_path.join(" > ")
+        : textOrDash(row.shop_category_path);
+      const lines = [
+        `#${row.id} ${textOrDash(row.commodity_title)}`,
+        "",
+        "【标识】",
+        `商品 URL: ${textOrDash(row.goods_url)}`,
+        `album_id: ${textOrDash(row.album_id)}`,
+        `goods_id: ${textOrDash(row.goods_id)}`,
+        `tag_id: ${row.tag_id ?? 0}`,
+        `分组 / 标签: ${textOrDash(row.wecatalog_label)}`,
+        `货号: ${textOrDash(row.commodity_goods_num)}`,
+        `首图 hash: ${textOrDash(row.first_image_hash)}`,
+        `图片数: ${row.image_count || 0}`,
+        `微猫标签: ${listPlain(row.tag_names)}`,
+        "",
+        "【状态与时间】",
+        `LLM 处理: ${llmProcessStatusText(row)}`,
+        `LLM 次数: ${row.llm_attempt_count ?? 0}`,
+        `上传: ${uploadStatusText(row)}`,
+        `创建: ${displayTimeOrDash(row.created_at)}`,
+        `更新: ${displayTimeOrDash(row.updated_at)}`,
+        "",
+        "【价格】",
+        `人民币 ¥: ${textOrDash(row.price_cny)}`,
+        `韩元 ₩: ${textOrDash(row.price_krw)}`,
+        "",
+        "【规格】",
+        `中文尺码: ${listPlain(row.sizes)}`,
+        `中文颜色: ${listPlain(row.colors)}`,
+        `韩文尺码: ${listPlain(row.sizes_ko)}`,
+        `韩文颜色: ${listPlain(row.colors_ko)}`,
+        "",
+        "【LLM 文案】",
+        `source: ${textOrDash(row.llm_source)}`,
+        `reason: ${textOrDash(row.llm_reason)}`,
+        `中文商品名: ${textOrDash(row.llm_name_zh)}`,
+        `韩文商品名: ${textOrDash(row.llm_name_ko)}`,
+        "",
+        "中文描述:",
+        textOrDash(row.llm_desc_zh),
+        "",
+        "韩文描述:",
+        textOrDash(row.llm_desc_ko),
+        "",
+        "【上架 seven17】",
+        `ca_id: ${textOrDash(row.seven17_ca_id)}`,
+        `韩文类目路径: ${path}`,
+        "",
+        "【微猫原标题】",
+        textOrDash(row.commodity_title),
+      ];
+      if (row.image_urls && row.image_urls.length) {
+        lines.push("", "【图片 URL】");
+        for (const url of row.image_urls) {
+          lines.push(String(url));
+        }
+      }
+      return lines.join("\n");
+    }
+
+    async function copyTextToClipboard(text) {
+      if (navigator.clipboard && window.isSecureContext) {
+        await navigator.clipboard.writeText(text);
+        return;
+      }
+      const ta = document.createElement("textarea");
+      ta.value = text;
+      ta.setAttribute("readonly", "");
+      ta.style.position = "fixed";
+      ta.style.left = "-9999px";
+      document.body.appendChild(ta);
+      ta.select();
+      const ok = document.execCommand("copy");
+      document.body.removeChild(ta);
+      if (!ok) throw new Error("浏览器不支持剪贴板");
+    }
+
+    async function copyDetailToClipboard() {
+      const row = state.detailRow;
+      if (!row) return;
+      const btn = $("btnCopyDetail");
+      try {
+        await copyTextToClipboard(formatItemClipboardText(row));
+        const old = btn.textContent;
+        btn.textContent = "已复制";
+        setTimeout(() => {
+          if (state.detailRow === row) btn.textContent = old;
+        }, 1500);
+      } catch (e) {
+        alert("复制失败: " + e.message);
+      }
+    }
+
+    /** 新标签页打开外链，当前商品库页面不跳转 */
+    function goodsUrlLink(url) {
+      if (!url || !String(url).trim()) {
+        return '<span class="muted">无链接</span>';
+      }
+      const u = esc(String(url).trim());
+      return (
+        `<a class="ext-link" href="${u}" target="_blank" rel="noopener noreferrer" ` +
+        `title="在新标签页打开微猫商品页">` +
+        `${u}</a>` +
+        `<div class="url-hint">点击链接将在新标签页打开，本页不跳转</div>`
+      );
+    }
+
+    function bindExternalLinks(root) {
+      if (!root) return;
+      root.querySelectorAll("a.ext-link").forEach((a) => {
+        a.addEventListener("click", (ev) => {
+          ev.stopPropagation();
+          const href = a.getAttribute("href");
+          if (!href) return;
+          ev.preventDefault();
+          window.open(href, "_blank", "noopener,noreferrer");
+        });
+      });
+    }
+
     async function openDetail(id) {
       const res = await fetch("/api/items/" + id);
       if (!res.ok) {
@@ -465,10 +776,10 @@
         return;
       }
       const row = await res.json();
+      state.detailRow = row;
+      $("btnCopyDetail").disabled = false;
       $("dlgTitle").textContent = `#${row.id} ${row.commodity_title || ""}`;
-      const link = row.goods_url
-        ? `<a href="${esc(row.goods_url)}" target="_blank" rel="noopener">打开微猫链接</a>`
-        : '<span class="muted">无链接</span>';
+      $("dlgTitle").dataset.itemId = String(row.id);
       const path = Array.isArray(row.shop_category_path)
         ? row.shop_category_path.join(" > ")
         : (row.shop_category_path || "");
@@ -477,7 +788,7 @@
         <div class="section">
           <h3>标识</h3>
           <table class="kv">
-            ${kvRow("微猫链接", link)}
+            ${kvRow("商品 URL", goodsUrlLink(row.goods_url))}
             ${kvRow("album_id", `<span class="mono">${esc(row.album_id)}</span>`)}
             ${kvRow("goods_id", `<span class="mono">${esc(row.goods_id)}</span>`)}
             ${kvRow("tag_id", `<span class="mono">${row.tag_id ?? 0}</span>`)}
@@ -489,15 +800,33 @@
           </table>
         </div>
         <div class="section">
+          <h3>重跑</h3>
+          <p class="muted" style="margin:0 0 8px">流程单向：重爬 → 须重处理 → 须重上传</p>
+          <div class="btn-row">${actionButtons(row)}</div>
+        </div>
+        <div class="section">
           <h3>状态与时间</h3>
           <table class="kv">
             ${kvRow("状态", statusBadges(row))}
             ${kvRow("LLM 次数", String(row.llm_attempt_count ?? 0))}
-            ${kvRow("LLM 处理", esc(row.llm_processed_at) || "—")}
-            ${kvRow("已上传", row.uploaded_to_platform ? "是" : "否")}
-            ${kvRow("上传时间", esc(row.seven17_uploaded_at) || "—")}
-            ${kvRow("创建", esc(row.created_at) || "—")}
-            ${kvRow("更新", esc(row.updated_at) || "—")}
+            ${kvRow(
+              "LLM 处理",
+              isLlmProcessed(row)
+                ? `${badge("up", "已处理")} <span class="mono">${esc(formatDisplayTime(row.llm_processed_at))}</span>`
+                : row.can_process
+                  ? badge("no", "未处理")
+                  : badge("no", "不可处理", row.process_block_reason || "已标记为不可处理"),
+            )}
+            ${kvRow(
+              "上传",
+              row.uploaded_to_platform
+                ? `${badge("up", "已上传")} <span class="mono">${esc(formatDisplayTime(row.seven17_uploaded_at))}</span>`
+                : row.upload_eligible
+                  ? badge("ok", "可上传")
+                  : badge("no", "不可上传", row.upload_block_reason || "当前不满足上传条件"),
+            )}
+            ${kvRow("创建", esc(formatDisplayTime(row.created_at)) || "—")}
+            ${kvRow("更新", esc(formatDisplayTime(row.updated_at)) || "—")}
           </table>
         </div>
         <div class="section">
@@ -541,6 +870,8 @@
           <pre>${esc(row.commodity_title) || "—"}</pre>
         </div>
       `;
+      bindExternalLinks($("dlgBody"));
+      bindRerunButtons($("dlgBody"));
       $("detailDlg").showModal();
     }
 
@@ -549,7 +880,12 @@
     $("btnPrev").addEventListener("click", () => { if (state.page > 1) { state.page--; loadItems(); } });
     $("btnNext").addEventListener("click", () => { if (state.page < state.pages) { state.page++; loadItems(); } });
     $("q").addEventListener("keydown", (e) => { if (e.key === "Enter") { state.page = 1; loadItems(); } });
-    $("btnCloseDlg").addEventListener("click", () => $("detailDlg").close());
+    $("btnCloseDlg").addEventListener("click", () => {
+      state.detailRow = null;
+      $("btnCopyDetail").disabled = true;
+      $("detailDlg").close();
+    });
+    $("btnCopyDetail").addEventListener("click", () => copyDetailToClipboard());
 
     (async () => {
       await loadAlbums();

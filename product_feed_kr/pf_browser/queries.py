@@ -10,6 +10,7 @@ from product_feed_kr.llm_spec_fields import (
     effective_sizes_colors_zh,
     parse_json_str_list,
 )
+from product_feed_kr.pf_browser.status_reasons import enrich_status_reasons
 from product_feed_kr.store_sqlite import connect_sqlite, sqlite_db_path
 
 _MAX_PAGE_SIZE = 200
@@ -40,6 +41,7 @@ _LIST_COLS: tuple[str, ...] = (
     "id",
     "can_process",
     "can_upload",
+    "rescrape_pending",
     "uploaded_to_platform",
     "llm_attempt_count",
     "llm_processed_at",
@@ -53,6 +55,8 @@ _LIST_COLS: tuple[str, ...] = (
     "commodity_title",
     "commodity_goods_num",
     "goods_url",
+    "first_image_hash",
+    "commodity_image_urls_json",
     # 价格
     "price_cny",
     "price_krw",
@@ -113,6 +117,12 @@ def _sort_key(sort: str | None) -> str:
     return k if k in _SORT_SQL else "llm"
 
 
+def _looks_like_image_hash(qs: str) -> bool:
+    """首图 hash 为 SHA1 hex（40 位）；允许粘贴完整或较长前缀。"""
+    s = qs.strip()
+    return 8 <= len(s) <= 64 and all(c in "0123456789abcdefABCDEF" for c in s)
+
+
 def _where_clause(
     *,
     album_id: str | None,
@@ -124,14 +134,31 @@ def _where_clause(
         parts.append("album_id = ?")
         params.append(str(album_id).strip())
     if q and str(q).strip():
-        like = f"%{str(q).strip()}%"
-        parts.append(
-            "(commodity_title LIKE ? OR goods_id LIKE ? OR commodity_goods_num LIKE ?"
+        qs = str(q).strip()
+        like = f"%{qs}%"
+        text_conds = (
+            "commodity_title LIKE ? OR goods_id LIKE ? OR commodity_goods_num LIKE ?"
             " OR llm_name_zh LIKE ? OR llm_name_ko LIKE ?"
             " OR llm_desc_zh LIKE ? OR llm_desc_ko LIKE ?"
-            " OR price_cny LIKE ?)",
+            " OR price_cny LIKE ? OR CAST(id AS TEXT) LIKE ?"
+            " OR first_image_hash LIKE ?"
         )
-        params.extend([like] * 8)
+        like_params = [like] * 10
+        exact_conds: list[str] = []
+        exact_params: list[Any] = []
+        if qs.isdigit():
+            exact_conds.extend(["id = ?", "TRIM(commodity_goods_num) = ?"])
+            exact_params.extend([int(qs), qs])
+        elif _looks_like_image_hash(qs):
+            exact_conds.append("LOWER(TRIM(first_image_hash)) = LOWER(?)")
+            exact_params.append(qs)
+        if exact_conds:
+            parts.append(f"({' OR '.join(exact_conds)} OR ({text_conds}))")
+            params.extend(exact_params)
+            params.extend(like_params)
+        else:
+            parts.append(f"({text_conds})")
+            params.extend(like_params)
     if not parts:
         return "", params
     return " WHERE " + " AND ".join(parts), params
@@ -196,14 +223,20 @@ def _apply_display_fields(d: dict[str, Any]) -> None:
 
 def _row_to_item(row: Any) -> dict[str, Any]:
     d = dict(row)
-    for flag in ("can_process", "can_upload", "uploaded_to_platform"):
+    for flag in ("can_process", "can_upload", "uploaded_to_platform", "rescrape_pending"):
         d[flag] = bool(d.get(flag))
     try:
         d["llm_attempt_count"] = int(d.get("llm_attempt_count") or 0)
     except (TypeError, ValueError):
         d["llm_attempt_count"] = 0
+    d["llm_processed"] = bool(str(d.get("llm_processed_at") or "").strip())
     _apply_display_fields(d)
     return d
+
+
+def _finalize_items(conn, items: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    enrich_status_reasons(conn, items)
+    return items
 
 
 def list_albums() -> list[dict[str, Any]]:
@@ -259,6 +292,7 @@ def list_items(
             [*params, page_size, offset],
         )
         items = [_row_to_item(r) for r in cur.fetchall()]
+        _finalize_items(conn, items)
     finally:
         conn.close()
 
@@ -291,6 +325,7 @@ def get_item(item_id: int) -> dict[str, Any] | None:
         if row is None:
             return None
         item = _row_to_item(row)
+        _finalize_items(conn, [item])
         raw_path = row["shop_category_path_json"] if "shop_category_path_json" in row.keys() else None
         if isinstance(raw_path, str) and raw_path.strip():
             try:

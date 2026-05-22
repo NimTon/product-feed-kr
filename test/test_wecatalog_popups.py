@@ -2,9 +2,14 @@
 from __future__ import annotations
 
 from product_feed_kr.wecatalog_popups import (
+    POPUPS_ERR_COMMODITY_INVALID,
+    POPUPS_ERR_LOGIN_EXPIRED,
     extract_format_options,
+    popups_errcode,
+    popups_errmsg,
     popups_optima_price_cny,
     popups_response_ready,
+    popups_skip_permanent,
 )
 
 
@@ -25,6 +30,13 @@ def _sample() -> dict:
             }
         },
     }
+
+
+def test_popups_errcodes():
+    assert popups_errcode({"errcode": 2530002, "errmsg": "商品已失效"}) == POPUPS_ERR_COMMODITY_INVALID
+    assert popups_errmsg({"errcode": 9, "errmsg": "登录已过期，请重新登录。"}) == "登录已过期，请重新登录。"
+    assert popups_skip_permanent(POPUPS_ERR_COMMODITY_INVALID)
+    assert not popups_skip_permanent(POPUPS_ERR_LOGIN_EXPIRED)
 
 
 def test_popups_sizes_and_price():
