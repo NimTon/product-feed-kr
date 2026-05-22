@@ -34,14 +34,9 @@ from product_feed_kr.wego_commodity import commodity_image_urls
 
 
 def _commodity_from_record(record: dict[str, Any]) -> dict[str, Any] | None:
-    dr = record.get("detail_response")
-    if not isinstance(dr, dict):
-        return None
-    res = dr.get("result")
-    if not isinstance(res, dict):
-        return None
-    com = res.get("commodity")
-    return com if isinstance(com, dict) else None
+    from product_feed_kr.wecatalog_store_record import commodity_from_wecatalog_record
+
+    return commodity_from_wecatalog_record(record)
 
 
 def _load_store_record(
@@ -136,7 +131,7 @@ def run_compare(
     profiles = profiles if profiles is not None else listing_llm_all_profile_slots()
     commodity = _commodity_from_record(record)
     if commodity is None:
-        raise ValueError("该条无 detail_response.result.commodity，无法做 LLM 对比")
+        raise ValueError("该条无 commodity_title（结构化抓取字段），无法做 LLM 对比")
 
     base_input = _input_summary(record, commodity)
     report: dict[str, Any] = {

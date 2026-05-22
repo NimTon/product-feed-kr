@@ -368,12 +368,12 @@ def enrich_llm_for_sqlite_records(
 ) -> dict[str, Any]:
     """对 SQLite 现有记录执行 LLM enrich 并写回。"""
     from product_feed_kr.listing_llm_enrich import (
-        enrich_records_listing_llm_batch,
+        enrich_record_listing_llm,
         listing_llm_api_profiles,
-        listing_llm_batch_size,
         listing_llm_color_vision_enabled,
         listing_llm_enabled,
         probe_all_profiles,
+        record_after_llm_attempt,
     )
 
     aid = album_id.strip()
@@ -396,7 +396,6 @@ def enrich_llm_for_sqlite_records(
     conn = connect_sqlite()
     try:
         ensure_sqlite_schema(conn)
-        batch_size = listing_llm_batch_size()
         restart_after_llm = restart_after_n("LISTING_LLM_RESTART_AFTER_ITEMS", 1000)
         api_profiles = probe_all_profiles(
             listing_llm_api_profiles(),
@@ -461,24 +460,33 @@ def enrich_llm_for_sqlite_records(
                     pf_kv([("event", "llm.empty")], zh="无待 LLM 处理的记录"),
                 )
             profile = api_profiles[0] if api_profiles else None
-            for i in range(0, len(pending_rows), batch_size):
-                chunk = pending_rows[i : i + batch_size]
-                changed = enrich_records_listing_llm_batch(
-                    chunk,
-                    batch_size=batch_size,
-                    api_profile=profile,
-                )
-                success_n = 0
-                for rec in changed:
+            for rec, com in pending_rows:
+                try:
+                    ok = enrich_record_listing_llm(
+                        rec,
+                        com,
+                        api_profile=profile,
+                        register_attempt=False,
+                    )
+                except Exception as e:
+                    record_after_llm_attempt(rec, com, ok=False, error=str(e))
                     sqlite_update_llm_result(conn, aid, rec)
-                    ll = rec.get("listing_llm")
-                    if (
-                        isinstance(ll, dict)
-                        and str(ll.get("source") or "") != "llm_skipped"
-                        and rec.get("llm_processed_at")
-                    ):
-                        success_n += 1
-                updated_total += success_n
+                    continue
+                record_after_llm_attempt(
+                    rec,
+                    com,
+                    ok=ok,
+                    error=None if ok else "enrich_returned_false",
+                )
+                sqlite_update_llm_result(conn, aid, rec)
+                ll = rec.get("listing_llm")
+                if (
+                    isinstance(ll, dict)
+                    and str(ll.get("source") or "") != "llm_skipped"
+                    and rec.get("llm_processed_at")
+                    and ok
+                ):
+                    updated_total += 1
                 if restart_after_llm > 0 and updated_total >= restart_after_llm:
                     restart_fresh = True
                     _log.info(

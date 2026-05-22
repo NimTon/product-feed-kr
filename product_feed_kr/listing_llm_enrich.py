@@ -1,6 +1,9 @@
-"""上架前：根据货源 ``commodity.title``（可选附带缩略图）调用 OpenAI 兼容接口，抽取结构化字段写入 ``record['listing_llm']``，
-并把识别到的人民币价写入 ``commodity.optimaPrice``；未识别时 ``listing_llm.cny_price`` 为 JSON ``null``（Python ``None``），
-``optimaPrice`` 置空字符串，上架脚本按 ``null`` 跳过。
+"""上架前 LLM（每条商品最多 **两次** Chat）：
+
+1. **补缺**（仅当抓取缺价/缺尺码）：只补**中文**——``cny_price``、``attr_map``（颜色/尺码）。
+2. **文案+翻译**（必跑）：``name_zh``、``desc_zh``、``desc_ko``、``attr_map_ko`` 等韩文由本阶段统一产出。
+
+抓取阶段已结构化入库 title/图/价/尺码，不依赖 ``detail_response`` 原始包。
 """
 
 from __future__ import annotations
@@ -135,48 +138,399 @@ def _shoe_size_token_to_kr_mm(tok: str) -> str:
     return tok
 
 
-def _shoe_sizes_to_kr_mm(tokens: list[str]) -> list[str]:
+def _dedupe_str_list(values: list[str]) -> list[str]:
+    """按首次出现顺序去重（尺码映射后多个欧码可能落到同一毫米值）。"""
     out: list[str] = []
     seen: set[str] = set()
-    for x in tokens:
-        y = _shoe_size_token_to_kr_mm(x)
-        if y not in seen:
-            seen.add(y)
-            out.append(y)
+    for v in values:
+        if v not in seen:
+            seen.add(v)
+            out.append(v)
     return out
 
 
-_SYSTEM = """你是电商商品信息抽取助手。只输出一个 JSON 对象，不要 Markdown 围栏，不要多余说明。
-总原则（必须遵守）：
-- 只允许基于输入做“高置信度提取”，不要脑补、不要扩写背景信息。
-- 置信度门槛：只有你对某条信息把握 >=90% 才可输出；低于 90% 则留空（"" / {} / null）。
-- 描述只做“轻润色”：允许去 emoji、去重复口号、调顺语序；不允许新增原文没有的卖点。
+def _shoe_sizes_to_kr_mm(tokens: list[str]) -> list[str]:
+    mapped: list[str] = []
+    for x in tokens:
+        mapped.append(_shoe_size_token_to_kr_mm(x))
+    return _dedupe_str_list(mapped)
 
-字段要求：
-- cny_price：字符串或 null。能确定人民币售价时填数字字符串（如 "340"）；**完全无法判断时请填 null**（不要猜价）。
-  - 价格优先级：标题里出现 `Pxxx` / `pxxx`（如 `P260`、`p318`）时，优先将其中数字视为实际售价。
-  - 若同时出现“原价/专柜价/吊牌价/划线价/市场价”等字样，对应数字视为营销参考价，**不要当作 cny_price**。
-  - 出现多个价格冲突且无法高置信判断真实成交价时，返回 null。
-- attr_map：对象，**下单必选项**，仅含 **颜色**、**尺码** 两类 key（中文名）：`颜色`、`尺码`。
-  - `颜色`：value 为颜色字符串数组（如 ["灰","黑"]）；标题或图中无法佐证的色不要写。若提供了图片，**只允许输出图片里实际可见的颜色**。
-  - `尺码`：value 为尺码字符串数组。非鞋类以字母规格为主（S/M/L/XL…）；「012码」「0123码」表示多档（0=S、1=M、2=L、3=XL…），优先直接输出展开后的数组。
-  - **鞋类**（标题含鞋/靴/运动鞋 등）：`尺码` 只输出 **欧码数字**（如 36、37、40.5、EU42），不要换算成毫米脚长，不要输出 S/M/L。
-  - 无可抽取项时对应 key 可省略或填 []；两者皆无时 attr_map 为 {}。
-- attr_map_ko：对象，与 attr_map 对齐，key 仅用韩文 **`색상`**、**`사이즈`**，value 为韩文色名或与 attr_map 尺码 **相同的欧码数字**（색상 값尽量用韩文色名；鞋类 `사이즈` 勿换算毫米，后处理自动换算）。
-  - 无对应项时填 {} 或省略 key。
-- name_zh：字符串，必须精简为核心中文商品名（尽量 8~20 字），去掉营销词、emoji、口号、重复品牌/型号堆砌。
-- name_ko：字符串，韩文精简商品名（尽量 8~24 字），同样去掉营销冗余。**只要输出了非空的 name_zh，就必须同时给出对应的韩文 name_ko（不得留空）**；仅当整段标题无法提炼中文名时才允许 name_ko 为 ""。
-- desc_zh：字符串，来自标题原文的中文描述提取与轻润色（建议 2~5 句，约 80~220 字）。
-  - 尽量保留原文里的核心信息：款式/设计/搭配/赠品等；颜色若已在 attr_map 中列出，描述里不必重复罗列色表。
-  - 不确定或原文缺失的信息不要补写。
-- desc_ko：字符串，基于 desc_zh 的韩文等价表达（建议 2~5 句，约 90~260 字），仅翻译与轻润色，不新增信息。
-"""
+
+def _dedupe_attr_map_size_lists(payload: dict[str, Any]) -> None:
+    """LLM 后处理末尾：``尺码`` / ``사이즈`` 列表去重（含鞋码欧码→毫米映射之后）。"""
+    am = payload.get("attr_map")
+    if isinstance(am, dict):
+        raw = am.get("尺码")
+        if isinstance(raw, list):
+            am["尺码"] = _dedupe_str_list(
+                [str(x).strip() for x in raw if str(x).strip()]
+            )
+    ko = payload.get("attr_map_ko")
+    if isinstance(ko, dict):
+        raw = ko.get("사이즈")
+        if isinstance(raw, list):
+            ko["사이즈"] = _dedupe_str_list(
+                [str(x).strip() for x in raw if str(x).strip()]
+            )
+
+
+_SYSTEM_GAPS = """你是电商规格/价格补全助手（仅中文）。只输出一个 JSON 对象，不要 Markdown。
+仅根据商品标题（及用户消息中已给出的已知字段）补全缺失项，不要脑补。
+
+**只输出以下中文字段**（不要输出 name_zh、desc_*、name_ko、attr_map_ko 等）：
+- cny_price：字符串或 null。标题含 `Pxxx`/`pxxx` 时优先取 P 后数字为售价；原价/吊牌价等勿当作 cny_price。
+- attr_map：仅中文 key `颜色`、`尺码`。鞋类尺码只写欧码数字，不要 S/M/L，不要换算毫米。
+未列出的字段不要输出。"""
+
+_SYSTEM_COPY = """你是电商上架文案与韩文翻译助手。只输出一个 JSON 对象，不要 Markdown。
+总原则：高置信度（>=90%），不脑补；描述仅轻润色。
+
+**本阶段负责中文文案 + 全部韩文翻译**（第一阶段已补好的价/中文选项见用户消息，勿改）：
+- name_zh：精简中文商品名（8~20 字），上架标题用。
+- desc_zh：中文描述轻润色（2~5 句）。
+- desc_ko：基于 desc_zh 的韩文描述，仅翻译不增信息。
+- attr_map_ko：**必须**根据用户消息中的中文 attr_map 翻译：`색상`←`颜色`，`사이즈`←`尺码`（鞋类 사이즈 仍写与尺码相同的欧码数字，勿换算毫米）。
+- name_ko：可选，韩文商品名。
+- cny_price：若用户消息已给出价格，原样带回。
+
+不要修改用户消息中已固定的 `attr_map` 中文尺码/颜色；`attr_map_ko` 必须与中文选项一一对应。"""
 
 _USER_TMPL = """请根据以下相册/微商商品标题抽取信息：
 
 ---
 {title}
 ---
+"""
+
+def _scrape_known_fields_hint(record: dict[str, Any]) -> str:
+    """抓取已确定的价/尺码/颜色（中文，阶段 2 勿改）。"""
+    from product_feed_kr.wecatalog_store_record import (
+        record_scrape_colors,
+        record_scrape_price_raw,
+        record_scrape_sizes,
+    )
+
+    parts: list[str] = []
+    price = record_scrape_price_raw(record)
+    if price:
+        parts.append(f"【抓取已确定人民币价】{price}（cny_price 原样带回，勿改）")
+    sizes = record_scrape_sizes(record)
+    if sizes:
+        parts.append(
+            f"【抓取已确定尺码】{'、'.join(sizes)}（attr_map.尺码 中文原样，阶段2 译成 attr_map_ko.사이즈）",
+        )
+    colors = record_scrape_colors(record)
+    if colors:
+        parts.append(f"【抓取已确定颜色】{'、'.join(colors)}（attr_map.颜色 中文原样，阶段2 译成 attr_map_ko.색상）")
+    if not parts:
+        return ""
+    return "\n\n" + "\n".join(parts) + "\n"
+
+
+def _listing_llm_chinese_context_hint(ll: dict[str, Any] | None) -> str:
+    """阶段 1 已写入的中文字段，供阶段 2 翻译时引用。"""
+    if not isinstance(ll, dict):
+        return ""
+    parts: list[str] = []
+    cp = ll.get("cny_price")
+    if _cny_price_field_usable(cp):
+        parts.append(f"【已定 cny_price】{cp}（勿改）")
+    am = ll.get("attr_map")
+    if isinstance(am, dict):
+        sizes = am.get("尺码") or []
+        if isinstance(sizes, list) and sizes:
+            parts.append(f"【已定 attr_map.尺码】{'、'.join(str(x) for x in sizes)}（勿改中文；请译 attr_map_ko.사이즈）")
+        colors = am.get("颜色") or []
+        if isinstance(colors, list) and colors:
+            parts.append(f"【已定 attr_map.颜色】{'、'.join(str(x) for x in colors)}（勿改中文；请译 attr_map_ko.색상）")
+    nz = str(ll.get("name_zh") or "").strip()
+    if nz:
+        parts.append(f"【已有 name_zh】{nz}")
+    dz = str(ll.get("desc_zh") or "").strip()
+    if dz:
+        parts.append(f"【已有 desc_zh】{dz[:200]}")
+    if not parts:
+        return ""
+    return "\n\n" + "；".join(parts) + "\n"
+
+
+def _listing_llm_has_sizes(ll: dict[str, Any] | None) -> bool:
+    if not isinstance(ll, dict):
+        return False
+    am = ll.get("attr_map")
+    if not isinstance(am, dict):
+        return False
+    sizes = am.get("尺码")
+    return isinstance(sizes, list) and any(str(x).strip() for x in sizes)
+
+
+def scrape_gaps_need_llm(record: dict[str, Any], listing_llm: dict[str, Any] | None = None) -> bool:
+    """抓取价或尺码缺失时需要补缺 LLM。"""
+    from product_feed_kr.wecatalog_store_record import record_scrape_price_raw, record_scrape_sizes
+
+    ll = listing_llm if isinstance(listing_llm, dict) else {}
+    need_price = not record_scrape_price_raw(record) and not _cny_price_field_usable(ll.get("cny_price"))
+    need_sizes = not record_scrape_sizes(record) and not _listing_llm_has_sizes(ll)
+    return need_price or need_sizes
+
+
+def _patch_gaps_chinese_only(patch: dict[str, Any]) -> dict[str, Any]:
+    """阶段 1 LLM 返回值：只保留中文价与 attr_map。"""
+    out: dict[str, Any] = {}
+    cp = patch.get("cny_price")
+    if cp is not None:
+        out["cny_price"] = cp
+    am = patch.get("attr_map")
+    if isinstance(am, dict):
+        zh: dict[str, Any] = {}
+        for key in ("颜色", "尺码"):
+            if key in am:
+                zh[key] = am[key]
+        if zh:
+            out["attr_map"] = zh
+    return out
+
+
+def _apply_scrape_fields_to_listing_llm(
+    record: dict[str, Any],
+    payload: dict[str, Any],
+    *,
+    listing_hint: str | None = None,
+) -> bool:
+    """把抓取入库的价/尺码/颜色写入 ``listing_llm``（仅中文 attr_map，不写 attr_map_ko）。"""
+    from product_feed_kr.wecatalog_store_record import (
+        record_scrape_colors,
+        record_scrape_price_raw,
+        record_scrape_sizes,
+    )
+
+    sizes = record_scrape_sizes(record)
+    colors = record_scrape_colors(record)
+    changed = False
+    am = dict(payload.get("attr_map") or {})
+    if sizes:
+        am["尺码"] = list(sizes)
+        changed = True
+    if colors and not am.get("颜色"):
+        am["颜色"] = list(colors)
+        changed = True
+    if changed:
+        payload["attr_map"] = am
+        payload["formats_source"] = "scrape"
+        _dedupe_attr_map_size_lists(payload)
+    pop_price = record_scrape_price_raw(record)
+    if pop_price and not _cny_price_field_usable(payload.get("cny_price")):
+        payload["cny_price"] = pop_price
+        changed = True
+    return changed
+
+
+def _finalize_attr_map_ko_from_chinese(
+    payload: dict[str, Any],
+    *,
+    listing_hint: str | None = None,
+) -> None:
+    """阶段 2 后：按中文 attr_map 补全/校正 attr_map_ko（鞋码→毫米由后处理完成）。"""
+    am = payload.get("attr_map")
+    if not isinstance(am, dict):
+        return
+    ko = dict(payload.get("attr_map_ko") or {})
+    zh_sizes = am.get("尺码") or []
+    if isinstance(zh_sizes, list) and zh_sizes:
+        size_src = [str(x).strip() for x in zh_sizes if str(x).strip()]
+        hint_bits: list[str] = []
+        if listing_hint:
+            hint_bits.append(str(listing_hint).strip())
+        if _text_suggests_footwear(" ".join(hint_bits + size_src)):
+            mm = _shoe_sizes_to_kr_mm(size_src)
+            ko["사이즈"] = mm if mm else size_src
+        elif not ko.get("사이즈"):
+            ko["사이즈"] = size_src
+    if ko:
+        payload["attr_map_ko"] = ko
+        _dedupe_attr_map_size_lists(payload)
+
+
+def _merge_listing_llm_payload(base: dict[str, Any], patch: dict[str, Any]) -> dict[str, Any]:
+    out = dict(base)
+    for k, v in patch.items():
+        if k in ("attr_map", "attr_map_ko") and isinstance(v, dict) and isinstance(out.get(k), dict):
+            merged = dict(out[k])
+            merged.update(v)
+            out[k] = merged
+        else:
+            out[k] = v
+    return out
+
+
+def enrich_listing_scrape_gaps(
+    record: dict[str, Any],
+    commodity: dict[str, Any],
+    *,
+    timeout: float | None = None,
+    api_profile: ListingLlmApiProfile | None = None,
+    listing_llm_base: dict[str, Any] | None = None,
+) -> bool:
+    """阶段 1：仅补全缺失的价/中文尺码颜色（抓取没有时）。"""
+    title = str(commodity.get("title") or "").strip()
+    if not title:
+        return False
+    ll = dict(listing_llm_base) if isinstance(listing_llm_base, dict) else {}
+    if not scrape_gaps_need_llm(record, ll):
+        return True
+
+    client, model, host = _openai_client(timeout, api_profile=api_profile)
+    use_response_format = "dashscope.aliyuncs.com" not in host.lower()
+    user = _USER_TMPL.format(title=title) + _scrape_known_fields_hint(record)
+    _log.info(
+        "%s",
+        pf_kv(
+            [
+                ("event", "llm.gaps.request"),
+                *pf_store_row_id_kv(record),
+                ("model", model),
+            ],
+            zh="LLM 补缺：价/中文尺码",
+        ),
+    )
+    content, elapsed_ms = _chat_once_json(
+        client,
+        model=model,
+        messages=[
+            {"role": "system", "content": _SYSTEM_GAPS},
+            {"role": "user", "content": user},
+        ],
+        use_response_format=use_response_format,
+    )
+    patch = _patch_gaps_chinese_only(
+        parse_listing_llm_response(content, listing_hint=title),
+    )
+    merged = _merge_listing_llm_payload(ll, patch)
+    _apply_scrape_fields_to_listing_llm(record, merged, listing_hint=title)
+    record["listing_llm"] = merged
+    _log.info(
+        "%s",
+        pf_kv(
+            [
+                ("event", "llm.gaps.response"),
+                *pf_store_row_id_kv(record),
+                ("elapsed_ms", elapsed_ms),
+                ("cny_price", merged.get("cny_price")),
+            ],
+            zh="LLM 补缺完成",
+        ),
+    )
+    return True
+
+
+def enrich_listing_copy(
+    record: dict[str, Any],
+    commodity: dict[str, Any],
+    *,
+    timeout: float | None = None,
+    api_profile: ListingLlmApiProfile | None = None,
+    listing_llm_base: dict[str, Any] | None = None,
+) -> bool:
+    """阶段 2：中文文案 + 韩文翻译（desc_ko、attr_map_ko 等）。"""
+    title = str(commodity.get("title") or "").strip()
+    if not title:
+        return False
+    ll = dict(listing_llm_base) if isinstance(listing_llm_base, dict) else {}
+    _apply_scrape_fields_to_listing_llm(record, ll, listing_hint=title)
+
+    client, model, host = _openai_client(timeout, api_profile=api_profile)
+    use_response_format = "dashscope.aliyuncs.com" not in host.lower()
+    want_vision = listing_llm_color_vision_enabled()
+    user_msg = (
+        _USER_TMPL.format(title=title)
+        + _scrape_known_fields_hint(record)
+        + _listing_llm_chinese_context_hint(ll)
+    )
+
+    data_urls: list[str] = []
+    if want_vision:
+        from product_feed_kr.wego_commodity import commodity_image_urls
+
+        urls = commodity_image_urls(commodity)
+        data_urls = _download_resize_jpeg_data_urls(
+            urls,
+            max_images=listing_llm_color_vision_max_images(),
+            max_px=listing_llm_color_vision_max_px(),
+        )
+        if not data_urls:
+            want_vision = False
+
+    if want_vision and data_urls:
+        system_text = _SYSTEM_COPY + _VISION_COLOR_SUPPLEMENT
+        user_parts: list[dict[str, Any]] = [
+            {
+                "type": "text",
+                "text": user_msg.rstrip() + "\n\n（附：商品参考缩略图。）",
+            },
+        ]
+        for durl in data_urls:
+            user_parts.append({"type": "image_url", "image_url": {"url": durl}})
+        messages: list[dict[str, Any]] = [
+            {"role": "system", "content": system_text},
+            {"role": "user", "content": user_parts},
+        ]
+        log_zh = "LLM 文案+翻译（含缩略图）"
+        vision = 1
+    else:
+        messages = [
+            {"role": "system", "content": _SYSTEM_COPY + _TITLE_COLOR_SUPPLEMENT},
+            {"role": "user", "content": user_msg},
+        ]
+        log_zh = "LLM 文案+翻译（纯文本）"
+        vision = 0
+
+    _log.info(
+        "%s",
+        pf_kv(
+            [
+                ("event", "llm.copy.request"),
+                *pf_store_row_id_kv(record),
+                ("model", model),
+                ("vision", vision),
+            ],
+            zh=log_zh,
+        ),
+    )
+    content, elapsed_ms = _chat_once_json(
+        client,
+        model=model,
+        messages=messages,
+        use_response_format=use_response_format,
+    )
+    patch = parse_listing_llm_response(content, listing_hint=title)
+    merged = _merge_listing_llm_payload(ll, patch)
+    _apply_scrape_fields_to_listing_llm(record, merged, listing_hint=title)
+    _finalize_attr_map_ko_from_chinese(merged, listing_hint=title)
+    merged = _normalize_llm_payload(merged, listing_hint=title)
+    merged["source"] = "openai"
+    merged["model"] = model
+    record["listing_llm"] = merged
+    _log.info(
+        "%s",
+        pf_kv(
+            [
+                ("event", "llm.copy.response"),
+                *pf_store_row_id_kv(record),
+                ("elapsed_ms", elapsed_ms),
+                ("name_zh_len", len(merged.get("name_zh") or "")),
+                ("desc_ko_len", len(merged.get("desc_ko") or "")),
+            ],
+            zh="LLM 文案与韩文翻译完成",
+        ),
+    )
+    return True
+
+
+_TITLE_COLOR_SUPPLEMENT = """
+【颜色仅从标题提取】未附带商品图片，attr_map「颜色」与 attr_map_ko「색상」须**只依据上方标题文本**：
+- 只写标题中明确出现或可高置信推断的颜色；标题未提及或含糊时置空（[] 或省略键），不要猜。
+- 不要为了凑选项而脑补颜色；仍须 >=90% 把握才写。
+- 尺码、价格、名称与描述规则仍按上文；鞋类只提取欧码数字，不做毫米换算。
 """
 
 _VISION_COLOR_SUPPLEMENT = """
@@ -187,25 +541,6 @@ _VISION_COLOR_SUPPLEMENT = """
 - 若图与标题在颜色上冲突，以**图为准**（仍须 >=90% 把握才写）。
 - 尺码、价格、名称与描述规则仍按上文；鞋类只提取欧码数字，不做毫米换算。
 """
-
-_SYSTEM_BATCH = """你是电商商品信息抽取助手。输入是一个 JSON 数组，每项含 idx、goods_id、title。
-请输出一个 JSON 对象，格式固定为：
-{"items":[{"idx":1,"cny_price":"340","attr_map":{"颜色":["黑"],"尺码":["M","L"]},"attr_map_ko":{"색상":["블랙"],"사이즈":["M","L"]},"name_zh":"...","name_ko":"...","desc_zh":"...","desc_ko":"..."}]}
-
-要求：
-- 只允许基于输入 title 做提取；不要脑补。
-- 置信度 <90% 的字段不要填（按类型返回空值）。
-- items 必须是数组，且每个 idx 必须对应输入的 idx。
-- cny_price：字符串或 null。能确定人民币售价时填数字字符串；完全无法判断填 null，不要猜价。
-  - 价格优先级：若 title 含 `Pxxx` / `pxxx`，优先取 `P` 后数字作为实际售价。
-  - “原价/专柜价/吊牌价/划线价/市场价”等数字是参考价，不要作为 cny_price。
-  - 多个价格冲突且无法高置信判定时，cny_price 必须为 null。
-- attr_map：仅 **颜色**、**尺码** 两个中文 key；无则 {} 或省略键。尺码值不要带「码」字后缀；「012码」类可写 ["S","M","L"] 或数字串（后处理按位展开）。
-- attr_map_ko：仅 **색상**、**사이즈**；与 attr_map 颜色/尺码一一对应（顺序一致）。鞋类 `사이즈` 与 `尺码` 相同，只写欧码数字，勿换算毫米。
-- name_zh / name_ko / desc_zh / desc_ko 同单条模式；有 name_zh 时 name_ko 必填韩文译名。
-- 只输出 JSON，不要 Markdown、不要额外解释。
-"""
-
 
 def _strip_json_fence(s: str) -> str:
     t = s.strip()
@@ -426,6 +761,8 @@ def _normalize_llm_payload(data: dict[str, Any], *, listing_hint: str | None = N
                 ko_map["사이즈"] = mm_sizes
                 out["attr_map_ko"] = ko_map
 
+    _dedupe_attr_map_size_lists(out)
+
     name_zh = data.get("name_zh")
     out["name_zh"] = _norm_text(name_zh, 24)
 
@@ -441,8 +778,13 @@ def _normalize_llm_payload(data: dict[str, Any], *, listing_hint: str | None = N
     return out
 
 
-def apply_listing_llm_price_to_commodity(commodity: dict[str, Any], listing_llm: dict[str, Any]) -> None:
-    """把有效的 ``listing_llm['cny_price']`` 写入 ``commodity['optimaPrice']``；否则清空 ``optimaPrice``（表示无 LLM 价）。"""
+def apply_listing_llm_price_to_commodity(
+    commodity: dict[str, Any],
+    listing_llm: dict[str, Any],
+    *,
+    record: dict[str, Any] | None = None,
+) -> None:
+    """把有效的 ``listing_llm['cny_price']`` 写入 ``commodity['optimaPrice']`` 与 ``record['price_cny']``。"""
     cp = listing_llm.get("cny_price")
     if cp is None:
         commodity["optimaPrice"] = ""
@@ -452,30 +794,15 @@ def apply_listing_llm_price_to_commodity(commodity: dict[str, Any], listing_llm:
         commodity["optimaPrice"] = ""
         return
     commodity["optimaPrice"] = s
+    if isinstance(record, dict):
+        record["price_cny"] = s
 
 
-def listing_llm_name_ko_usable(listing_llm: dict[str, Any] | None) -> bool:
-    """``name_ko`` 非空且含韩文字符（上架标题用，不用 ``name_zh`` 顶替）。"""
+def listing_llm_name_zh_usable(listing_llm: dict[str, Any] | None) -> bool:
+    """``name_zh`` 非空（上架标题用）。"""
     if not isinstance(listing_llm, dict):
         return False
-    nk = str(listing_llm.get("name_ko") or "").strip()
-    if not nk:
-        return False
-    return any("\uac00" <= ch <= "\ud7a3" for ch in nk)
-
-
-def listing_llm_needs_name_ko(
-    listing_llm: dict[str, Any] | None,
-    *,
-    title: str = "",
-) -> bool:
-    """已有 LLM 结果但缺可用韩文标题，且仍有中文名或原标题可译。"""
-    if listing_llm_name_ko_usable(listing_llm):
-        return False
-    if not isinstance(listing_llm, dict):
-        return bool(str(title or "").strip())
-    src = str(listing_llm.get("name_zh") or "").strip() or str(title or "").strip()
-    return bool(src)
+    return bool(str(listing_llm.get("name_zh") or "").strip())
 
 
 def listing_llm_meets_upload_requirements(rec: dict[str, Any]) -> bool:
@@ -483,7 +810,7 @@ def listing_llm_meets_upload_requirements(rec: dict[str, Any]) -> bool:
     ll = rec.get("listing_llm")
     if not isinstance(ll, dict):
         return False
-    if not listing_llm_name_ko_usable(ll):
+    if not str(ll.get("name_zh") or "").strip():
         return False
     if not str(ll.get("desc_ko") or "").strip():
         return False
@@ -497,8 +824,7 @@ def listing_llm_meets_upload_requirements(rec: dict[str, Any]) -> bool:
     com = commodity_from_wecatalog_record(rec)
     if not isinstance(com, dict):
         return False
-    # 回退 1：抓取阶段写入的 commodity_price_raw。
-    raw = parse_price_str(rec.get("commodity_price_raw"), "")
+    raw = parse_price_str(rec.get("price_cny"), "")
     if raw and raw not in ("0", "0.0"):
         return True
     # 回退 2：commodity 自身可解析价格（含 title 里的 Pxxx / ￥xxx）。
@@ -636,12 +962,12 @@ LLM_EXHAUSTED_REASON = "max_attempts"
 
 
 def listing_llm_max_attempts() -> int:
-    """单商品累计 LLM 处理次数上限（``LISTING_LLM_MAX_ATTEMPTS``，默认 3）。"""
-    raw = (_cfg_get("LISTING_LLM_MAX_ATTEMPTS") or _cfg_get("LISTING_LLM_FAIL_SKIP_AFTER") or "3").strip()
+    """单商品累计 LLM 处理次数上限（``LISTING_LLM_MAX_ATTEMPTS``，默认 1）。"""
+    raw = (_cfg_get("LISTING_LLM_MAX_ATTEMPTS") or _cfg_get("LISTING_LLM_FAIL_SKIP_AFTER") or "1").strip()
     try:
         n = int(raw)
     except ValueError:
-        n = 3
+        n = 1
     return max(1, n)
 
 
@@ -726,7 +1052,7 @@ def note_llm_attempt_consumed(record: dict[str, Any], *, error: str | None = Non
                     ("attempt_count", n),
                     ("max_attempts", cap),
                     ("cny_ok", 1 if listing_llm_cny_usable(record["listing_llm"]) else 0),
-                    ("name_ko_ok", 1 if listing_llm_name_ko_usable(record["listing_llm"]) else 0),
+                    ("name_zh_ok", 1 if listing_llm_name_zh_usable(record["listing_llm"]) else 0),
                 ],
                 zh="LLM 处理次数已达上限，不再处理；字段齐全时仍可上架",
             ),
@@ -761,18 +1087,9 @@ def record_after_llm_attempt(
     note_llm_attempt_consumed(record, error=None if ok else error)
     ll = record.get("listing_llm")
     if isinstance(ll, dict):
-        apply_listing_llm_price_to_commodity(commodity, ll)
+        apply_listing_llm_price_to_commodity(commodity, ll, record=record)
     update_can_upload_flag(record)
     return True
-
-
-def listing_llm_batch_size() -> int:
-    raw = (_cfg_get("OPENAI_LISTING_LLM_BATCH_SIZE") or "12").strip()
-    try:
-        n = int(raw)
-    except ValueError:
-        n = 12
-    return max(1, min(n, 50))
 
 
 def _cfg_raw(key: str) -> Any:
@@ -958,7 +1275,11 @@ def listing_llm_thread_count() -> int:
 
 
 def listing_llm_color_vision_enabled() -> bool:
-    """为 true 时 LLM 单条请求附带商品缩略图，用于校正 attr_map 颜色（关闭 JSON 批量接口）。"""
+    """是否允许从商品缩略图提取/校正颜色（``OPENAI_LISTING_COLOR_VISION``）。
+
+    - **false**（默认）：API 探测仅文生文；逐条请求；颜色由 LLM 仅从标题推断。
+    - **true**：探测含图生文；逐条附带缩略图，颜色以图中可见色为准。
+    """
     return _cfg_bool("OPENAI_LISTING_COLOR_VISION", False)
 
 
@@ -1177,6 +1498,16 @@ def probe_profile(
                 )
     elif not result["text_ok"]:
         result["vision_error"] = "文生文未通过，跳过图生文"
+    elif not test_vision:
+        result["vision_ok"] = True
+        _log.info(
+            "%s",
+            pf_kv(
+                [("event", "llm.probe.vision_skip"), ("label", label),
+                 ("reason", "OPENAI_LISTING_COLOR_VISION=false")],
+                zh=f"图生文探测已跳过（{label}）：未开启图片颜色提取",
+            ),
+        )
 
     return result
 
@@ -1235,6 +1566,7 @@ def probe_all_profiles(
         for r in probed.values()
         if bool(r["text_ok"]) and (not test_vision or bool(r["vision_ok"]))
     )
+    probe_mode_zh = "文生文+图生文" if test_vision else "仅文生文（颜色从标题提取）"
     _log.info(
         "%s",
         pf_kv(
@@ -1243,103 +1575,12 @@ def probe_all_profiles(
              ("unique_apis", unique_total),
              ("apis_passed", unique_passed),
              ("threads_passed", len(passed)),
+             ("color_vision", test_vision),
              ("passed_labels", ",".join(p.get("label", "?") for p in passed))],
-            zh=f"API 探测完成：{unique_passed}/{unique_total} 个 API 通过，{len(passed)} 个线程可用",
+            zh=f"API 探测完成（{probe_mode_zh}）：{unique_passed}/{unique_total} 个 API 通过，{len(passed)} 个线程可用",
         ),
     )
     return passed
-
-
-_SYSTEM_NAME_KO_ONLY = """你是电商标题翻译助手。只输出一个 JSON 对象，不要 Markdown。
-格式：{"name_ko":"韩文精简商品名"}
-将输入的中文商品名译为韩文标题（约 8~24 字），去掉营销词与 emoji，不新增原文没有的信息。"""
-
-
-def _parse_name_ko_only_response(content: str) -> str:
-    raw = _strip_json_fence(content)
-    data = json.loads(raw)
-    if not isinstance(data, dict):
-        return ""
-    nk = data.get("name_ko")
-    t = str(nk).strip() if nk is not None else ""
-    t = re.sub(r"[\u200b\ufeff]", "", t)
-    t = " ".join(t.split())
-    if len(t) > 30:
-        t = t[:30].rstrip(" ,-/|")
-    return t
-
-
-def _translate_name_to_ko(
-    source_text: str,
-    *,
-    timeout: float | None = None,
-    api_profile: ListingLlmApiProfile | None = None,
-) -> str | None:
-    """将中文商品名译为韩文 ``name_ko``；失败返回 None。"""
-    src = str(source_text or "").strip()
-    if not src:
-        return None
-    client, model, host = _openai_client(timeout, api_profile=api_profile)
-    use_response_format = "dashscope.aliyuncs.com" not in host.lower()
-    messages = [
-        {"role": "system", "content": _SYSTEM_NAME_KO_ONLY},
-        {"role": "user", "content": f"中文商品名：\n{src}"},
-    ]
-    content, _elapsed_ms = _chat_once_json(
-        client,
-        model=model,
-        messages=messages,
-        use_response_format=use_response_format,
-    )
-    nk = _parse_name_ko_only_response(content)
-    if nk and listing_llm_name_ko_usable({"name_ko": nk}):
-        return nk
-    return None
-
-
-def ensure_listing_llm_name_ko(
-    record: dict[str, Any],
-    commodity: dict[str, Any],
-    *,
-    timeout: float | None = None,
-    api_profile: ListingLlmApiProfile | None = None,
-    count_attempt: bool = True,
-) -> bool:
-    """若 ``listing_llm`` 缺可用 ``name_ko``，用 LLM 从 ``name_zh`` 或原标题补译；成功返回 True。"""
-    if listing_llm_attempts_exhausted(record):
-        return False
-    ll = record.get("listing_llm")
-    if not isinstance(ll, dict):
-        ll = {}
-        record["listing_llm"] = ll
-    if listing_llm_name_ko_usable(ll):
-        return True
-    title = str(commodity.get("title") or "").strip()
-    src = str(ll.get("name_zh") or "").strip() or title
-    if not src:
-        return False
-    nk = _translate_name_to_ko(src, timeout=timeout, api_profile=api_profile)
-    if not nk:
-        return False
-    ll["name_ko"] = nk
-    record["listing_llm"] = ll
-    record["llm_processed_at"] = now_cst8_iso()
-    ll["processed_at"] = record["llm_processed_at"]
-    if count_attempt:
-        note_llm_attempt_consumed(record)
-    _log.info(
-        "%s",
-        pf_kv(
-            [
-                ("event", "llm.name_ko.fill"),
-                *pf_store_row_id_kv(record),
-                ("name_ko_len", len(nk)),
-                ("source", "name_zh" if str(ll.get("name_zh") or "").strip() else "title"),
-            ],
-            zh="已用 LLM 补译韩文商品名（未用中文名直接上架）",
-        ),
-    )
-    return True
 
 
 def _chat_once_json(
@@ -1376,214 +1617,6 @@ def _chat_once_json(
     if not content:
         raise RuntimeError("LLM 返回空 content")
     return content, elapsed_ms
-
-
-def enrich_records_listing_llm_batch(
-    rows: list[tuple[dict[str, Any], dict[str, Any]]],
-    *,
-    timeout: float | None = None,
-    batch_size: int | None = None,
-    api_profile: ListingLlmApiProfile | None = None,
-) -> list[dict[str, Any]]:
-    """批量 enrich 多条 (record, commodity)，返回发生变更、建议写回存储层的 record 列表。"""
-    if not rows:
-        return []
-
-    changed: list[dict[str, Any]] = []
-    need_call: list[tuple[int, dict[str, Any], dict[str, Any], str]] = []
-
-    for i, (record, commodity) in enumerate(rows):
-        title = str(commodity.get("title") or "").strip()
-        if not title:
-            _log.warning(
-                "%s",
-                pf_kv(
-                    [("event", "llm.skip"), ("reason", "no_title"), *pf_store_row_id_kv(record)],
-                    zh="跳过 LLM：商品无标题",
-                ),
-            )
-            continue
-        existing = record.get("listing_llm")
-        if isinstance(existing, dict) and record.get("llm_processed_at") and not listing_llm_force_refresh():
-            apply_listing_llm_price_to_commodity(commodity, existing)
-            update_can_upload_flag(record)
-            changed.append(record)
-            _log.info(
-                "%s",
-                pf_kv(
-                    [("event", "llm.cache"), *pf_store_row_id_kv(record)],
-                    zh="使用已有 LLM 缓存，未重新请求接口",
-                ),
-            )
-            continue
-        need_call.append((i, record, commodity, title))
-
-    if not need_call:
-        return changed
-
-    if listing_llm_color_vision_enabled():
-        _log.info(
-            "%s",
-            pf_kv(
-                [
-                    ("event", "llm.batch.bypass"),
-                    ("reason", "OPENAI_LISTING_COLOR_VISION"),
-                    ("n", len(need_call)),
-                ],
-                zh="已开启颜色缩略图修正，改为逐条调用（不走 JSON 批量）",
-            ),
-        )
-        for _idx, record, commodity, _title in need_call:
-            try:
-                ok = enrich_record_listing_llm(record, commodity, timeout=timeout, api_profile=api_profile)
-            except Exception as e:
-                if record_after_llm_attempt(record, commodity, ok=False, error=str(e)):
-                    changed.append(record)
-                continue
-            if record_after_llm_attempt(
-                record,
-                commodity,
-                ok=ok,
-                error=None if ok else "enrich_returned_false",
-            ):
-                changed.append(record)
-        return changed
-
-    client, model, host = _openai_client(timeout, api_profile=api_profile)
-    size = batch_size or listing_llm_batch_size()
-    use_response_format = "dashscope.aliyuncs.com" not in host.lower()
-
-    for offset in range(0, len(need_call), size):
-        chunk = need_call[offset : offset + size]
-        log_item_separator(_log)
-        payload = [
-            {
-                "idx": idx,
-                "goods_id": pf_goods_id(record),
-                "title": title,
-            }
-            for idx, record, _commodity, title in chunk
-        ]
-        batch_log: list[tuple[str, Any]] = [
-            ("event", "llm.batch.request"),
-            ("model", model),
-            ("host", host),
-            ("batch", len(payload)),
-        ]
-        if api_profile is not None:
-            batch_log.append(("thread", api_profile.get("label", "")))
-        _log.info(
-            "%s",
-            pf_kv(batch_log, zh="批量调用 OpenAI 解析上架标题"),
-        )
-        messages = [
-            {"role": "system", "content": _SYSTEM_BATCH},
-            {"role": "user", "content": json.dumps(payload, ensure_ascii=False)},
-        ]
-        try:
-            content, elapsed_ms = _chat_once_json(
-                client,
-                model=model,
-                messages=messages,
-                use_response_format=use_response_format,
-            )
-            data = json.loads(_strip_json_fence(content))
-            items = data.get("items") if isinstance(data, dict) else None
-            if not isinstance(items, list):
-                raise ValueError("批量返回缺少 items 数组")
-            by_idx: dict[int, dict[str, Any]] = {}
-            titles_by_idx = {idx: title for idx, _r, _c, title in chunk}
-            for it in items:
-                if not isinstance(it, dict):
-                    continue
-                idx = it.get("idx")
-                if not isinstance(idx, int):
-                    continue
-                by_idx[idx] = _normalize_llm_payload(it, listing_hint=titles_by_idx.get(idx))
-
-            for idx, record, commodity, _title in chunk:
-                norm = by_idx.get(idx)
-                if norm is None:
-                    try:
-                        ok = enrich_record_listing_llm(
-                            record,
-                            commodity,
-                            timeout=timeout,
-                            api_profile=api_profile,
-                        )
-                    except Exception as e:
-                        if record_after_llm_attempt(record, commodity, ok=False, error=str(e)):
-                            changed.append(record)
-                        continue
-                    if record_after_llm_attempt(
-                        record,
-                        commodity,
-                        ok=ok,
-                        error=None if ok else "batch_item_missing",
-                    ):
-                        changed.append(record)
-                    continue
-                norm["source"] = "openai"
-                norm["model"] = model
-                record["listing_llm"] = norm
-                ensure_listing_llm_name_ko(
-                    record,
-                    commodity,
-                    timeout=timeout,
-                    api_profile=api_profile,
-                    count_attempt=False,
-                )
-                ll_final = record.get("listing_llm")
-                if not isinstance(ll_final, dict):
-                    ll_final = norm
-                ll_final["processed_at"] = now_cst8_iso()
-                record["listing_llm"] = ll_final
-                record["llm_processed_at"] = ll_final["processed_at"]
-                note_llm_attempt_consumed(record)
-                apply_listing_llm_price_to_commodity(commodity, ll_final)
-                update_can_upload_flag(record)
-                changed.append(record)
-                _log.info(
-                    "%s",
-                    pf_kv(
-                        [
-                            ("event", "llm.response"),
-                            *pf_store_row_id_kv(record),
-                            ("elapsed_ms", elapsed_ms),
-                            ("cny_price", norm.get("cny_price")),
-                            ("optimaPrice", commodity.get("optimaPrice")),
-                            ("attr_keys", ",".join((norm.get("attr_map") or {}).keys())),
-                            ("attr_ko_keys", ",".join((norm.get("attr_map_ko") or {}).keys())),
-                            ("name_ko_len", len(norm.get("name_ko") or "")),
-                            ("desc_ko_len", len(norm.get("desc_ko") or "")),
-                        ],
-                        zh="LLM 批量返回已解析并写回记录",
-                    ),
-                )
-        except Exception as e:
-            _log.warning(
-                "%s",
-                pf_kv(
-                    [("event", "llm.batch.fallback"), ("err", str(e)), ("batch", len(payload))],
-                    zh="批量解析失败，回退为单条调用",
-                ),
-            )
-            for _idx, record, commodity, _title in chunk:
-                try:
-                    ok = enrich_record_listing_llm(record, commodity, timeout=timeout, api_profile=api_profile)
-                except Exception as e:
-                    if record_after_llm_attempt(record, commodity, ok=False, error=str(e)):
-                        changed.append(record)
-                    continue
-                if record_after_llm_attempt(
-                    record,
-                    commodity,
-                    ok=ok,
-                    error=None if ok else "batch_fallback_failed",
-                ):
-                    changed.append(record)
-
-    return changed
 
 
 def enrich_record_listing_llm(
@@ -1632,156 +1665,73 @@ def enrich_record_listing_llm(
         return False
 
     existing = record.get("listing_llm")
+    ll_base: dict[str, Any] = dict(existing) if isinstance(existing, dict) else {}
+    _apply_scrape_fields_to_listing_llm(record, ll_base, listing_hint=title)
+
     if isinstance(existing, dict) and record.get("llm_processed_at") and not listing_llm_force_refresh():
-        apply_listing_llm_price_to_commodity(commodity, existing)
-        if listing_llm_name_ko_usable(existing):
-            update_can_upload_flag(record)
+        record["listing_llm"] = ll_base
+        apply_listing_llm_price_to_commodity(commodity, ll_base, record=record)
+        update_can_upload_flag(record)
+        if listing_llm_meets_upload_requirements(record):
             _log.info(
                 "%s",
                 pf_kv(
-                    [
-                        ("event", "llm.cache"),
-                        *pf_store_row_id_kv(record),
-                    ],
+                    [("event", "llm.cache"), *pf_store_row_id_kv(record)],
                     zh="使用已有 LLM 缓存，未重新请求接口",
                 ),
             )
             return True
-        if ensure_listing_llm_name_ko(
-            record,
-            commodity,
-            timeout=timeout,
-            api_profile=api_profile,
-            count_attempt=True,
-        ):
-            apply_listing_llm_price_to_commodity(commodity, record["listing_llm"])
-            update_can_upload_flag(record)
-            return True
         _log.warning(
             "%s",
             pf_kv(
-                [
-                    ("event", "llm.name_ko.missing"),
-                    *pf_store_row_id_kv(record),
-                ],
-                zh="缓存无韩文标题，将重新走完整 LLM",
+                [("event", "llm.cache.incomplete"), *pf_store_row_id_kv(record)],
+                zh="已有 LLM 缓存但未达上架条件，将重新走 LLM",
             ),
         )
+        ll_base = dict(record.get("listing_llm") or {})
 
-    client, model, host = _openai_client(timeout, api_profile=api_profile)
-    use_response_format = "dashscope.aliyuncs.com" not in host.lower()
-    want_vision = listing_llm_color_vision_enabled()
-    data_urls: list[str] = []
-    if want_vision:
-        from product_feed_kr.wego_commodity import commodity_image_urls
-
-        urls = commodity_image_urls(commodity)
-        data_urls = _download_resize_jpeg_data_urls(
-            urls,
-            max_images=listing_llm_color_vision_max_images(),
-            max_px=listing_llm_color_vision_max_px(),
-        )
-        if not data_urls:
-            _log.warning(
-                "%s",
-                pf_kv(
-                    [
-                        ("event", "llm.vision_no_images"),
-                        *pf_store_row_id_kv(record),
-                        ("url_candidates", len(urls)),
-                    ],
-                    zh="颜色修正已开启但未得到有效缩略图，退回纯文本请求",
-                ),
-            )
-            want_vision = False
-
-    if want_vision and data_urls:
-        system_text = _SYSTEM + _VISION_COLOR_SUPPLEMENT
-        user_msg = _USER_TMPL.format(title=title)
-        user_parts: list[dict[str, Any]] = [
-            {
-                "type": "text",
-                "text": user_msg.rstrip() + "\n\n（附：商品参考缩略图，已缩小分辨率。）",
-            },
-        ]
-        for durl in data_urls:
-            user_parts.append({"type": "image_url", "image_url": {"url": durl}})
-        messages: list[dict[str, Any]] = [
-            {"role": "system", "content": system_text},
-            {"role": "user", "content": user_parts},
-        ]
-        log_kv: list[tuple[str, Any]] = [
-            ("event", "llm.request"),
-            *pf_store_row_id_kv(record),
-            ("model", model),
-            ("host", host),
-            ("title_len", len(title)),
-            ("vision", 1),
-            ("vision_images", len(data_urls)),
-        ]
-        if api_profile is not None:
-            log_kv.append(("thread", api_profile.get("label", "")))
-        log_zh = "正在调用 OpenAI 丰富上架字段（含颜色缩略图）"
-    else:
-        messages = [
-            {"role": "system", "content": _SYSTEM},
-            {"role": "user", "content": _USER_TMPL.format(title=title)},
-        ]
-        log_kv = [
-            ("event", "llm.request"),
-            *pf_store_row_id_kv(record),
-            ("model", model),
-            ("host", host),
-            ("title_len", len(title)),
-        ]
-        if api_profile is not None:
-            log_kv.append(("thread", api_profile.get("label", "")))
-        log_zh = "正在调用 OpenAI 丰富上架字段（标题价颜色尺码等）"
-    _log.info("%s", pf_kv(log_kv, zh=log_zh))
-    content, elapsed_ms = _chat_once_json(
-        client,
-        model=model,
-        messages=messages,
-        use_response_format=use_response_format,
-    )
-
-    normalized = parse_listing_llm_response(content, listing_hint=title)
-    normalized["source"] = "openai"
-    normalized["model"] = model
-    record["listing_llm"] = normalized
-    ensure_listing_llm_name_ko(
+    log_item_separator(_log)
+    if not enrich_listing_scrape_gaps(
         record,
         commodity,
         timeout=timeout,
         api_profile=api_profile,
-        count_attempt=False,
-    )
+        listing_llm_base=ll_base,
+    ):
+        return False
+    ll_mid = record.get("listing_llm")
+    if not isinstance(ll_mid, dict):
+        ll_mid = ll_base
+    if not enrich_listing_copy(
+        record,
+        commodity,
+        timeout=timeout,
+        api_profile=api_profile,
+        listing_llm_base=ll_mid,
+    ):
+        return False
+
     ll_final = record.get("listing_llm")
     if not isinstance(ll_final, dict):
-        ll_final = normalized
+        return False
     ll_final["processed_at"] = now_cst8_iso()
     record["listing_llm"] = ll_final
     record["llm_processed_at"] = ll_final["processed_at"]
     if register_attempt:
         note_llm_attempt_consumed(record)
-    apply_listing_llm_price_to_commodity(commodity, ll_final)
+    apply_listing_llm_price_to_commodity(commodity, ll_final, record=record)
     update_can_upload_flag(record)
-    normalized = ll_final
     _log.info(
         "%s",
         pf_kv(
             [
-                ("event", "llm.response"),
+                ("event", "llm.done"),
                 *pf_store_row_id_kv(record),
-                ("elapsed_ms", elapsed_ms),
-                ("cny_price", normalized.get("cny_price")),
-                ("optimaPrice", commodity.get("optimaPrice")),
-                ("attr_keys", ",".join((normalized.get("attr_map") or {}).keys())),
-                ("attr_ko_keys", ",".join((normalized.get("attr_map_ko") or {}).keys())),
-                ("name_ko_len", len(normalized.get("name_ko") or "")),
-                ("desc_ko_len", len(normalized.get("desc_ko") or "")),
+                ("cny_price", ll_final.get("cny_price")),
+                ("name_zh_len", len(ll_final.get("name_zh") or "")),
+                ("desc_ko_len", len(ll_final.get("desc_ko") or "")),
             ],
-            zh="LLM 返回已解析并写回记录",
+            zh="LLM 两阶段处理完成",
         ),
     )
     return True

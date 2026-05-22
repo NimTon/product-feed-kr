@@ -1,14 +1,6 @@
-"""扫描 SQLite：从 **中文** ``attr_map`` 的 ``尺码`` 读取欧码，换算后写入 ``attr_map_ko`` 的 ``사이즈``（毫米脚长）。
+"""扫描 SQLite：从 **中文** ``commodity_sizes_json`` 的欧码换算韩文 ``sizes_ko_json``。
 
-**不以韩文 ``사이즈`` 为换算来源**；仅对比韩文列是否已与「中文尺码换算结果」一致。
-
-默认 **dry-run**（只列出待修复行）；加 ``--apply`` 才写库（同步 ``attr_map_ko_json`` 与 ``listing_llm_json.attr_map_ko``）。
-
-用法::
-
-  python -m product_feed_kr.fix_attr_ko_shoe_sizes_mm
-  python -m product_feed_kr.fix_attr_ko_shoe_sizes_mm --album-id YOUR_ALBUM_ID --limit 20
-  python -m product_feed_kr.fix_attr_ko_shoe_sizes_mm --apply
+默认 **dry-run**（只列出待修复行）；加 ``--apply`` 才写库（同步 ``sizes_ko_json``）。
 """
 
 from __future__ import annotations
@@ -17,82 +9,82 @@ import argparse
 import json
 from typing import Any
 
-from product_feed_kr.listing_llm_enrich import (
-    _shoe_size_token_to_kr_mm,
-    _shoe_sizes_to_kr_mm,
-    _text_suggests_footwear,
+from product_feed_kr.listing_llm_enrich import _shoe_sizes_to_kr_mm, _text_suggests_footwear
+from product_feed_kr.llm_spec_fields import (
+    COLOR_ZH,
+    SIZE_KO,
+    SIZE_ZH,
+    effective_sizes_colors_zh,
+    parse_json_str_list,
 )
-from product_feed_kr.store_sqlite import (
-    connect_sqlite,
-    ensure_sqlite_schema,
-    sqlite_db_path,
-    sqlite_update_llm_result,
-)
+from product_feed_kr.store_sqlite import connect_sqlite, ensure_sqlite_schema, sqlite_db_path, sqlite_update_llm_result
 
-_SIZE_ZH = "尺码"
-_SIZE_KO = "사이즈"
+_SIZE_ZH = SIZE_ZH
+_SIZE_KO = SIZE_KO
 
 
 def _parse_json_obj(raw: Any) -> dict[str, Any]:
     if isinstance(raw, dict):
         return raw
-    if isinstance(raw, str) and raw.strip():
-        try:
-            parsed = json.loads(raw)
-            return parsed if isinstance(parsed, dict) else {}
-        except json.JSONDecodeError:
-            return {}
-    return {}
+    if not isinstance(raw, str) or not raw.strip():
+        return {}
+    try:
+        data = json.loads(raw)
+    except json.JSONDecodeError:
+        return {}
+    return data if isinstance(data, dict) else {}
 
 
-def _as_size_list(vals: Any) -> list[str]:
-    if not isinstance(vals, list):
-        return []
-    out: list[str] = []
-    for v in vals:
-        s = str(v).strip()
-        if s:
-            out.append(s)
+def _as_size_list(raw: Any) -> list[str]:
+    if isinstance(raw, list):
+        return [str(x).strip() for x in raw if str(x).strip()]
+    if raw is not None and str(raw).strip():
+        return [str(raw).strip()]
+    return []
+
+
+def _token_is_convertible_eu(token: str) -> bool:
+    s = str(token).strip()
+    if not s or not s.replace(".", "", 1).isdigit():
+        return False
+    try:
+        v = float(s)
+    except ValueError:
+        return False
+    return 10 <= v <= 60
+
+
+def _attr_map_from_row(row: dict[str, Any]) -> dict[str, Any]:
+    sizes, colors = effective_sizes_colors_zh(row)
+    out: dict[str, Any] = {}
+    if sizes:
+        out[SIZE_ZH] = sizes
+    if colors:
+        out[COLOR_ZH] = colors
     return out
 
 
-def _token_is_convertible_eu(tok: str) -> bool:
-    """欧码数字（含 EU42、40.5）且可映射到毫米表时为 True。"""
-    t = str(tok).strip()
-    if not t:
-        return False
-    return _shoe_size_token_to_kr_mm(t) != t
+def _attr_map_ko_from_row(row: dict[str, Any]) -> dict[str, Any]:
+    sizes_ko = parse_json_str_list(row.get("sizes_ko_json"))
+    colors_ko = parse_json_str_list(row.get("colors_ko_json"))
+    out: dict[str, Any] = {}
+    if sizes_ko:
+        out[SIZE_KO] = sizes_ko
+    if colors_ko:
+        from product_feed_kr.llm_spec_fields import COLOR_KO
 
-
-def _attr_map_has_eu_numeric_sizes(attr_map: dict[str, Any]) -> bool:
-    return any(_token_is_convertible_eu(s) for s in _as_size_list(attr_map.get(_SIZE_ZH)))
+        out[COLOR_KO] = colors_ko
+    return out
 
 
 def _mm_sizes_from_zh(attr_map: dict[str, Any]) -> list[str] | None:
-    """仅依据中文 ``尺码`` 列表换算韩版毫米脚长。"""
     zh_sizes = _as_size_list(attr_map.get(_SIZE_ZH))
-    if not zh_sizes or not _attr_map_has_eu_numeric_sizes(attr_map):
+    if not zh_sizes or not any(_token_is_convertible_eu(s) for s in zh_sizes):
         return None
     mm = _shoe_sizes_to_kr_mm(zh_sizes)
     if not mm or mm == zh_sizes:
         return None
     return mm
-
-
-def _attr_map_from_row(row: dict[str, Any]) -> dict[str, Any]:
-    """优先 ``attr_map_json``；缺 ``尺码`` 时回退 ``listing_llm_json.attr_map``（仍不用韩文）。"""
-    attr_map = _parse_json_obj(row.get("attr_map_json"))
-    if _as_size_list(attr_map.get(_SIZE_ZH)):
-        return attr_map
-    ll = _parse_json_obj(row.get("listing_llm_json"))
-    ll_am = ll.get("attr_map") if isinstance(ll.get("attr_map"), dict) else None
-    if isinstance(ll_am, dict) and _as_size_list(ll_am.get(_SIZE_ZH)):
-        merged = dict(attr_map)
-        merged[_SIZE_ZH] = ll_am[_SIZE_ZH]
-        if "颜色" in ll_am and "颜色" not in merged:
-            merged["颜色"] = ll_am["颜色"]
-        return merged
-    return attr_map
 
 
 def _needs_fix(
@@ -118,12 +110,10 @@ def _context_text(row: dict[str, Any], attr_map: dict[str, Any]) -> str:
         str(row.get("commodity_title") or ""),
         str(row.get("llm_name_zh") or ""),
     ]
-    ll = _parse_json_obj(row.get("listing_llm_json"))
-    if isinstance(ll, dict):
-        for k in ("name_zh", "name_ko", "desc_zh"):
-            v = ll.get(k)
-            if isinstance(v, str) and v.strip():
-                parts.append(v.strip()[:300])
+    for k in ("llm_name_ko", "llm_desc_zh"):
+        v = row.get(k)
+        if isinstance(v, str) and v.strip():
+            parts.append(v.strip()[:300])
     return "\n".join(p for p in parts if p)
 
 
@@ -136,9 +126,10 @@ def _scan_rows(
 ) -> list[dict[str, Any]]:
     sql = """
         SELECT id, album_id, goods_id, tag_id, commodity_title,
-               llm_name_zh, attr_map_json, attr_map_ko_json, listing_llm_json
+               llm_name_zh, commodity_sizes_json,
+               sizes_ko_json, colors_ko_json
         FROM pf_store_item
-        WHERE attr_map_json IS NOT NULL AND trim(attr_map_json) != ''
+        WHERE trim(COALESCE(commodity_sizes_json,'')) <> ''
     """
     params: list[Any] = []
     if album_id:
@@ -153,7 +144,7 @@ def _scan_rows(
     for row in cur.fetchall():
         row_d = dict(row)
         attr_map = _attr_map_from_row(row_d)
-        attr_map_ko = _parse_json_obj(row_d.get("attr_map_ko_json"))
+        attr_map_ko = _attr_map_ko_from_row(row_d)
         ctx = _context_text(row_d, attr_map)
         ok, mm = _needs_fix(
             attr_map, attr_map_ko, footwear_only=footwear_only, context_text=ctx
@@ -174,7 +165,7 @@ def _scan_rows(
                 "ko_sizes_after": mm,
                 "attr_map": attr_map,
                 "attr_map_ko": attr_map_ko,
-                "listing_llm_json": row_d.get("listing_llm_json"),
+                "commodity_sizes_json": row_d.get("commodity_sizes_json"),
             }
         )
     return hits
@@ -183,11 +174,8 @@ def _scan_rows(
 def _apply_one(conn: Any, hit: dict[str, Any]) -> None:
     attr_map_ko = dict(hit["attr_map_ko"])
     attr_map_ko[_SIZE_KO] = hit["ko_sizes_after"]
-    ll = _parse_json_obj(hit.get("listing_llm_json"))
-    if not ll:
-        ll = {}
-    ll["attr_map_ko"] = attr_map_ko
-    if _SIZE_ZH not in ll and hit.get("attr_map"):
+    ll: dict[str, Any] = {"attr_map_ko": attr_map_ko}
+    if hit.get("attr_map"):
         ll["attr_map"] = hit["attr_map"]
     rec: dict[str, Any] = {
         "id": hit["id"],
@@ -195,19 +183,20 @@ def _apply_one(conn: Any, hit: dict[str, Any]) -> None:
         "goods_id": hit["goods_id"],
         "tag_id": hit["tag_id"],
         "listing_llm": ll,
+        "commodity_sizes_json": hit.get("commodity_sizes_json"),
     }
     sqlite_update_llm_result(conn, str(hit["album_id"]), rec)
 
 
 def main(argv: list[str] | None = None) -> int:
-    ap = argparse.ArgumentParser(description="attr_map 欧码数字 → attr_map_ko 사이즈 韩版毫米脚长")
+    ap = argparse.ArgumentParser(description="中文欧码 → sizes_ko_json 韩版毫米脚长")
     ap.add_argument("--album-id", default="", help="仅处理指定相册 album_id")
     ap.add_argument("--limit", type=int, default=0, help="最多扫描行数（0=不限制）")
     ap.add_argument("--apply", action="store_true", help="写回数据库（默认仅预览）")
     ap.add_argument(
         "--all-numeric",
         action="store_true",
-        help="不校验鞋类标题/名称（默认仅处理鞋靴类语境，避免裤装 30–38 误换算）",
+        help="不校验鞋类标题/名称（默认仅处理鞋靴类语境）",
     )
     args = ap.parse_args(argv)
 
@@ -240,7 +229,7 @@ def main(argv: list[str] | None = None) -> int:
         elif args.apply:
             print("无待修复记录，未写库")
         elif hits:
-            print("提示: 加 --apply 写回 attr_map_ko_json / listing_llm_json")
+            print("提示: 加 --apply 写回 sizes_ko_json")
     finally:
         conn.close()
     return 0
