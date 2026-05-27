@@ -1,8 +1,8 @@
 """抓取阶段 CNY→KRW 换算（千韩元取整）。"""
 from __future__ import annotations
 
-from product_feed_kr.cny_krw_rate import cny_amount_to_krw_won_str, cny_listing_amount_to_krw_won_str
-from product_feed_kr.wecatalog_scrape_fields import apply_price_krw_from_cny
+from product_feed_kr.common.cny_krw_rate import cny_amount_to_krw_won_str, cny_listing_amount_to_krw_won_str
+from product_feed_kr.wecatalog.wecatalog_scrape_fields import apply_price_krw_from_cny
 
 
 def test_krw_rounds_to_thousand_won() -> None:

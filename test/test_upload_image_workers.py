@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from product_feed_kr.seven17_upload import (
+from product_feed_kr.seven17.seven17_upload import (
     upload_image_download_workers,
     upload_image_prefetch_queue_size,
 )

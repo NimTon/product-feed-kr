@@ -1,6 +1,6 @@
 """LLM token usage 解析与累计。"""
 
-from product_feed_kr.listing_llm_enrich import (
+from product_feed_kr.listing.listing_llm_enrich import (
     _chat_usage_from_response,
     llm_token_usage_run_snapshot,
     note_llm_token_usage,

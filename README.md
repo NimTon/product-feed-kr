@@ -17,21 +17,21 @@ python -m playwright install chromium
 ```bash
 # 爬取（默认入口等同下列模块）
 python -m product_feed_kr
-python -m product_feed_kr.wecatalog_scrape_store --store-url "..." --out data/wecatalog_store_products.json --existing-json data/wecatalog_store_products.json
+python -m product_feed_kr.wecatalog.wecatalog_scrape_store --store-url "..." --out data/wecatalog_store_products.json --existing-json data/wecatalog_store_products.json
 
 # 映射表生成（编辑 config/wecatalog_tag_category_map.txt 后）
-python -m product_feed_kr.wecatalog_tag_category_map_builder
+python -m product_feed_kr.wecatalog.wecatalog_tag_category_map_builder
 # 或双击 test\build_wecatalog_tag_category_map.bat
 
 # 无价格白名单 GUI（勾选 map.txt 分类并写入 SEVEN17_NO_PRICE_ALLOW_CATEGORIES）
-python -m product_feed_kr.seven17_no_price_whitelist_gui
+python -m product_feed_kr.seven17.seven17_no_price_whitelist_gui
 # 或双击 04_无价格白名单设置.bat
 
 # 上架（默认读取 data/wecatalog_store_products.json）
-python -m product_feed_kr.seven17_upload --limit 5
+python -m product_feed_kr.seven17.seven17_upload --limit 5
 
 # 爬一次后台「商品录入」页，导出 ca_id / ca_id2 / ca_id3 下拉的 value + 文案（对照 map 里 seven17_ca_id）
-python -m product_feed_kr.seven17_dump_itemform_categories --out data/seven17_ca_options.json
+python -m product_feed_kr.seven17.seven17_dump_itemform_categories --out data/seven17_ca_options.json
 
 # 用上面的 dump 自动写入 wecatalog_tag_category_map.json 的 meta.seven17_ca_id（路径一致即匹配）
 python -m product_feed_kr.wecatalog_tag_category_map_apply_seven17
@@ -62,13 +62,13 @@ python -m product_feed_kr.wecatalog_tag_category_map_apply_seven17
 
 ```bash
 # 只登录并填表，不点最终提交（确认浏览器里表单是否正常）
-python -m product_feed_kr.seven17_upload --limit 5 --dry-run
+python -m product_feed_kr.seven17.seven17_upload --limit 5 --dry-run
 
 # 正式提交最多 5 条
-python -m product_feed_kr.seven17_upload --limit 5
+python -m product_feed_kr.seven17.seven17_upload --limit 5
 
 # 成功后把 uploaded_to_platform 写回 JSON，便于断点续传
-python -m product_feed_kr.seven17_upload --limit 5 --write-back-store-json
+python -m product_feed_kr.seven17.seven17_upload --limit 5 --write-back-store-json
 ```
 
 **本地看浏览器（调试登录/校验错误）**
@@ -79,7 +79,7 @@ python -m product_feed_kr.seven17_upload --limit 5 --write-back-store-json
 **不登录预览单条会填什么字段**
 
 ```bash
-python -m product_feed_kr.seven17_upload --test-store-json data/wecatalog_store_products.json --test-index 0
+python -m product_feed_kr.seven17.seven17_upload --test-store-json data/wecatalog_store_products.json --test-index 0
 ```
 
 **常用可选配置（环境变量或 `seven17.json`）**
@@ -97,18 +97,17 @@ python -m product_feed_kr.seven17_upload --test-store-json data/wecatalog_store_
 
 Windows 核心入口：**`01_采集微猫店铺.bat`**、**`02_LLM补全上架信息.bat`**、**`03_上传韩国站正式.bat`**、**`04_无价格白名单设置.bat`**。并行三任务可用 **`test/run_scrape_llm_upload_parallel.bat`**。
 
-## 包结构（保留文件）
+## 包结构
 
-| 模块 | 说明 |
+代码按功能分子包（详见 **`product_feed_kr/STRUCTURE.md`**）。包根目录不再堆放业务 `.py`，仅入口与配置 JSON。
+
+| 子包 | 说明 |
 |------|------|
-| `wecatalog_scrape_store.py` | 爬取 |
-| `wecatalog_fetch_tags.py` | 分类树 / 浏览器 |
-| `wecatalog_tag_mapping.py` + `wecatalog_tag_category_map.json` | 路径映射 |
-| `wecatalog_tag_category_map_builder.py` | 生成 JSON |
-| `seven17_upload.py` | 表单上传 |
-| `seven17_dump_itemform_categories.py` | 登录后抓取 itemform 分类下拉的 value / 文案 |
-| `wecatalog_tag_category_map_apply_seven17.py` | 用 dump 批量写入 map 的 seven17_ca_id |
-| `seven17_adm.py` | 登录 |
-| `seven17_config.py` | 配置 |
-| `wego_commodity.py` | 详情 commodity → 标题/价/图 |
-| `playwright_path.py` | Chromium 路径 |
+| `wecatalog/` | 爬取、弹窗、尺码、分类映射 |
+| `seven17/` | 登录、上架、LLM 入口 |
+| `listing/` | LLM 补全与计费 |
+| `db/` | SQLite 商品库 |
+| `common/` | 配置、日志、汇率、Playwright |
+| `wego/` | commodity 解析 |
+| `tools/` | 迁移、韩元重算等维护脚本 |
+| `pf_browser/` | 商品库 Web UI |

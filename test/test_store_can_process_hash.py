@@ -2,7 +2,7 @@
 
 import sqlite3
 
-from product_feed_kr.store_sqlite import (
+from product_feed_kr.db.store_sqlite import (
     _resolve_can_process_for_image_hash,
     sqlite_reconcile_can_process_dup_hashes,
 )

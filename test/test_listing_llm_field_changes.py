@@ -1,6 +1,6 @@
 """listing_llm 字段变更日志摘要。"""
 
-from product_feed_kr.listing_llm_enrich import listing_llm_field_changes
+from product_feed_kr.listing.listing_llm_enrich import listing_llm_field_changes
 
 
 def test_listing_llm_field_changes_detects_scalar_and_attr() -> None:

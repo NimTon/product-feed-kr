@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from product_feed_kr.listing_llm_enrich import (
+from product_feed_kr.listing.listing_llm_enrich import (
     apply_listing_size_fix_from_zh,
     listing_llm_wants_shoe_size_mm,
     normalize_size_spec_kind,

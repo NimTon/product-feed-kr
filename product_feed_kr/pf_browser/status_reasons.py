@@ -5,9 +5,9 @@ from __future__ import annotations
 from collections import defaultdict
 from typing import Any
 
-from product_feed_kr.llm_spec_fields import listing_llm_from_row
-from product_feed_kr.seven17_config import bool_env, getenv
-from product_feed_kr.seven17_upload import _upload_skip_reason
+from product_feed_kr.db.llm_spec_fields import listing_llm_from_row
+from product_feed_kr.common.seven17_config import bool_env, getenv
+from product_feed_kr.seven17.seven17_upload import _upload_skip_reason
 
 
 def row_as_upload_record(row: dict[str, Any]) -> dict[str, Any]:
@@ -44,7 +44,7 @@ def process_block_reason_zh(
 
 
 def _llm_upload_block_detail(rec: dict[str, Any]) -> str:
-    from product_feed_kr.listing_llm_enrich import (
+    from product_feed_kr.listing.listing_llm_enrich import (
         listing_llm_attempts_exhausted,
         listing_llm_is_gave_up,
         listing_llm_name_ko_usable,

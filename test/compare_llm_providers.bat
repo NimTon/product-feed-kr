@@ -12,6 +12,6 @@ if not exist "%PY%" (
 
 rem Default: dry-run only (no API). Add --run after config is ready.
 echo [llm-compare] dry-run by default; pass --run to call APIs
-"%PY%" -m product_feed_kr.llm_providers_compare %*
+"%PY%" -m product_feed_kr.listing.llm_providers_compare %*
 
 endlocal

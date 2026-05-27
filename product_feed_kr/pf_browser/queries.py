@@ -5,13 +5,13 @@ from __future__ import annotations
 import json
 from typing import Any
 
-from product_feed_kr.llm_spec_fields import (
+from product_feed_kr.db.llm_spec_fields import (
     effective_sizes_colors_ko,
     effective_sizes_colors_zh,
     parse_json_str_list,
 )
 from product_feed_kr.pf_browser.status_reasons import enrich_status_reasons
-from product_feed_kr.store_sqlite import connect_sqlite, sqlite_db_path
+from product_feed_kr.db.store_sqlite import connect_sqlite, sqlite_db_path
 
 _MAX_PAGE_SIZE = 200
 _DEFAULT_PAGE_SIZE = 50
@@ -53,6 +53,7 @@ _LIST_COLS: tuple[str, ...] = (
     "wecatalog_group",
     "wecatalog_tag",
     "commodity_title",
+    "wecatalog_listed_at",
     "commodity_goods_num",
     "goods_url",
     "first_image_hash",

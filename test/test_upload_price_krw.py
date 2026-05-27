@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from product_feed_kr.seven17_upload import (
+from product_feed_kr.seven17.seven17_upload import (
     _resolve_upload_listing_price_krw,
     _upload_db_write_needed,
 )

@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from unittest.mock import patch
 
-from product_feed_kr.listing_llm_enrich import (
+from product_feed_kr.listing.listing_llm_enrich import (
     _build_color_vision_grid_data_url,
     _system_listing_prompt,
     listing_llm_color_vision_max_images,
@@ -12,7 +12,7 @@ from product_feed_kr.listing_llm_enrich import (
 
 def test_max_images_capped_at_nine() -> None:
     with patch(
-        "product_feed_kr.listing_llm_enrich._cfg_get",
+        "product_feed_kr.listing.listing_llm_enrich._cfg_get",
         return_value="12",
     ):
         assert listing_llm_color_vision_max_images() == 9
@@ -20,7 +20,7 @@ def test_max_images_capped_at_nine() -> None:
 
 def test_vision_prompt_ignores_title_colors() -> None:
     with patch(
-        "product_feed_kr.listing_llm_enrich.listing_llm_color_vision_enabled",
+        "product_feed_kr.listing.listing_llm_enrich.listing_llm_color_vision_enabled",
         return_value=True,
     ):
         p = _system_listing_prompt()
@@ -49,7 +49,7 @@ def test_build_grid_from_local_images() -> None:
     ]
 
     with patch(
-        "product_feed_kr.listing_llm_enrich._fetch_rgb_image_from_url",
+        "product_feed_kr.listing.listing_llm_enrich._fetch_rgb_image_from_url",
         side_effect=lambda u: Image.open(
             io.BytesIO(base64.standard_b64decode(u.split(",", 1)[1]))
         ).convert("RGB"),

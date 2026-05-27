@@ -1,7 +1,7 @@
 """popUpsInfoV2 解析单测。"""
 from __future__ import annotations
 
-from product_feed_kr.wecatalog_popups import (
+from product_feed_kr.wecatalog.wecatalog_popups import (
     POPUPS_ERR_COMMODITY_INVALID,
     POPUPS_ERR_LOGIN_EXPIRED,
     extract_format_options,

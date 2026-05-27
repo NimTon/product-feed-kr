@@ -12,7 +12,7 @@ if not exist "%PY%" (
 )
 
 echo [mapbuild] config\wecatalog_tag_category_map.txt -^> product_feed_kr\wecatalog_tag_category_map.json
-"%PY%" -m product_feed_kr.wecatalog_tag_category_map_builder %*
+"%PY%" -m product_feed_kr.wecatalog.wecatalog_tag_category_map_builder %*
 set "EC=%ERRORLEVEL%"
 if not "%EC%"=="0" (
   echo [mapbuild] FAILED exit=%EC%

@@ -12,6 +12,11 @@ build/
 
 # IDE
 .idea/
+.pytest_cache/
+
+# 本地打包备份 / 旧补丁解压目录
+*.rar
+_patch_extract/
 
 # 导出产物（可选保留目录）
 data/*.xlsx

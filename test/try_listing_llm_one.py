@@ -6,7 +6,7 @@ import json
 import os
 import sys
 
-from product_feed_kr.listing_llm_enrich import (
+from product_feed_kr.listing.listing_llm_enrich import (
     _normalize_llm_payload,
     _text_suggests_footwear,
     enrich_record_listing_llm,

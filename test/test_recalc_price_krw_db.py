@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from product_feed_kr.recalc_price_krw_db import _plan_updates
+from product_feed_kr.tools.recalc_price_krw_db import _plan_updates
 
 
 def test_plan_updates_from_cny():

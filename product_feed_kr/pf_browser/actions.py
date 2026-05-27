@@ -5,7 +5,7 @@ from __future__ import annotations
 from typing import Any
 
 from product_feed_kr.pf_browser.queries import _finalize_items, _row_to_item
-from product_feed_kr.store_sqlite import (
+from product_feed_kr.db.store_sqlite import (
     connect_sqlite,
     ensure_sqlite_schema,
     sqlite_request_item_rerun,
