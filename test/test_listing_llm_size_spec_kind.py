@@ -59,3 +59,19 @@ def test_parse_listing_llm_response_keeps_size_spec_kind():
     raw = '{"size_spec_kind": "footwear", "name_zh": "x", "attr_map": {"尺码": ["40"]}}'
     out = parse_listing_llm_response(raw)
     assert out.get("size_spec_kind") == "footwear"
+
+
+BRUNELLO_TITLE = (
+    "P650 BC新品板鞋 Brunel*o Cucinell* 标准专柜码数：39～44# （38.45.46# 🉑️定做)"
+)
+
+
+def test_apply_listing_size_fix_drops_custom_order_sizes():
+    payload = {
+        "size_spec_kind": "footwear",
+        "attr_map": {"尺码": ["38", "39", "40", "41", "42", "43", "44", "45", "46"]},
+        "attr_map_ko": {},
+    }
+    apply_listing_size_fix_from_zh(payload, listing_hint=BRUNELLO_TITLE)
+    assert payload["attr_map"]["尺码"] == ["39", "40", "41", "42", "43", "44"]
+    assert payload["attr_map_ko"]["사이즈"] == ["245", "250", "260", "265", "275", "280"]

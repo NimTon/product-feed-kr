@@ -66,9 +66,17 @@ _KR_MM_EU_TO_MM: dict[str, str] = {
 _EU_SHOE_SIZE_MIN = 32
 _EU_SHOE_SIZE_MAX = 50
 
-# 38-41、0-4、38~41 等区间
+# 38-41、0-4、38~41、39～44# 等区间（含全角 ～）
 _SIZE_RANGE_RE = re.compile(
-    r"^\s*(\d+(?:\.[05])?)\s*[-~–—到至]\s*(\d+(?:\.[05])?)\s*$",
+    r"^\s*(\d+(?:\.[05])?)\s*[-~–—到至～]\s*(\d+(?:\.[05])?)\s*#?\s*$",
+    re.I,
+)
+
+_CUSTOM_ORDER_MARK = r"(?:可)?(?:定做|定制|可定)"
+_STANDARD_STOCK_SECTION_RE = re.compile(
+    r"(?:现货|标准(?:专柜)?码数?|专柜码数|常备(?:码数?)?)"
+    r"[：:\s]*"
+    r"([\d～~\-–—到至\.]+(?:\.[\d]+)?)",
     re.I,
 )
 
@@ -145,7 +153,7 @@ def expand_size_range_token(token: str) -> list[str] | None:
     展开区间尺码：``0-4`` → 数字档 ``0``…``4``；``38-41`` → 欧码 ``38``…``41``。
     无法识别时返回 None（由调用方保留原 token）。
     """
-    t = str(token).strip()
+    t = str(token).strip().rstrip("#").strip()
     if not t:
         return None
     m = _SIZE_RANGE_RE.match(t)
@@ -241,6 +249,72 @@ def shoe_size_token_to_kr_mm(tok: str) -> str:
 def shoe_sizes_to_kr_mm(tokens: list[str]) -> list[str]:
     mapped = [shoe_size_token_to_kr_mm(x) for x in tokens]
     return dedupe_str_list(mapped)
+
+
+def _split_dotted_size_blob(blob: str) -> list[str]:
+    """``38.45.46#`` → ``['38','45','46']``。"""
+    text = str(blob or "").strip().rstrip("#").strip()
+    if not text:
+        return []
+    out: list[str] = []
+    for part in re.split(r"[\.、/,，/\s]+", text):
+        p = str(part).strip().rstrip("#")
+        if re.fullmatch(r"\d+(?:\.5)?", p):
+            out.append(p)
+    return out
+
+
+def custom_order_sizes_from_title(title: str) -> frozenset[str]:
+    """标题中标注为定做/定制/可定的码（不应作为上架现货尺码）。"""
+    out: set[str] = set()
+    t = str(title or "")
+    if not t.strip():
+        return frozenset()
+    mark = _CUSTOM_ORDER_MARK
+    for m in re.finditer(rf"[（(]([^）)]*{mark}[^）)]*)[）)]", t, flags=re.I):
+        block = m.group(1)
+        pre = re.split(mark, block, maxsplit=1, flags=re.I)[0]
+        out.update(_split_dotted_size_blob(pre))
+    for m in re.finditer(
+        rf"([\d][\d\.#、/,，\s]*)\s*[#🉑️\s]*{mark}",
+        t,
+        flags=re.I,
+    ):
+        out.update(_split_dotted_size_blob(m.group(1)))
+    return frozenset(out)
+
+
+def standard_stock_sizes_from_title(title: str) -> list[str] | None:
+    """标题中现货/标准/专柜码数段落展开后的尺码；无法识别时返回 None。"""
+    t = str(title or "")
+    m = _STANDARD_STOCK_SECTION_RE.search(t)
+    if not m:
+        return None
+    blob = str(m.group(1) or "").strip().rstrip("#").strip()
+    blob = re.split(r"[（(]", blob, maxsplit=1)[0].strip().rstrip("#").strip()
+    if not blob:
+        return None
+    expanded = fix_scrape_sizes([blob])
+    return expanded or None
+
+
+def filter_listing_sizes_for_title(
+    sizes: list[str],
+    title: str,
+) -> list[str]:
+    """去掉定做码；若标题有现货/标准段落则只保留该段（或回退为该段展开结果）。"""
+    zh_list = [str(x).strip() for x in sizes if str(x).strip()]
+    if not zh_list or not str(title or "").strip():
+        return zh_list
+    custom = custom_order_sizes_from_title(title)
+    if custom:
+        zh_list = [x for x in zh_list if x not in custom]
+    standard = standard_stock_sizes_from_title(title)
+    if standard:
+        std_set = set(standard)
+        kept = [x for x in zh_list if x in std_set]
+        return kept if kept else list(standard)
+    return zh_list
 
 
 def apply_scrape_size_fix(fields: dict) -> None:

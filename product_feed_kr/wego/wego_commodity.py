@@ -17,21 +17,33 @@ DEFAULT_WEGO_DESC_TEMPLATE = (
 _TITLE_CNY_PRICE_PATTERNS: tuple[re.Pattern[str], ...] = (
     # 微商标题常见：💰290、💰 290.5-Chrome...
     re.compile(r"💰\s*(\d+(?:\.\d+)?)"),
-    re.compile(r"[¥￥]\s*(\d+(?:\.\d+)?)"),
-    re.compile(r"(?:人民币|RMB|rmb)\s*[:：]?\s*(\d+(?:\.\d+)?)"),
-    # P270、p 399（标价写法；P 前不可为字母数字，避免误匹配如 GP270）
+    # P650、p 399：微商拿货价（P 前不可为字母数字，避免 GP270）
     re.compile(r"(?<![A-Za-z0-9])P\s*(\d+(?:\.\d+)?)\b", re.IGNORECASE),
 )
 
 
+def _normalize_title_price_capture(raw: str) -> str:
+    """标题价捕获：去千分位逗号，小数按整数价取整。"""
+    s = str(raw).strip().replace(",", "")
+    if not s:
+        return s
+    if "." in s:
+        head, tail = s.split(".", 1)
+        if head.isdigit() and tail.isdigit():
+            return str(int(float(s)))
+        return head
+    return s
+
+
 def price_from_title_cny(title: str) -> str | None:
-    """从标题中抓取人民币标价（¥/￥/💰/人民币/RMB/P 数字），命中即返回数字字符串，否则 None。"""
+    """从标题抓取人民币拿货价：仅 ``💰`` 或 ``P数字``（不匹配 ¥/RMB 等宣传零售价）。"""
     if not (title and title.strip()):
         return None
     for rx in _TITLE_CNY_PRICE_PATTERNS:
         m = rx.search(title)
         if m:
-            return m.group(1)
+            out = _normalize_title_price_capture(m.group(1))
+            return out or None
     return None
 
 
@@ -49,18 +61,71 @@ def parse_price_str(raw: str | None, default: str) -> str:
     return digits
 
 
-def commodity_image_urls(obj: dict[str, Any]) -> list[str]:
-    """从 commodity 风格 dict 抽取主图/附图 URL 列表（不要求有价格）。"""
+_VIDEO_URL_EXTENSIONS: tuple[str, ...] = (
+    ".mp4",
+    ".mov",
+    ".m4v",
+    ".webm",
+    ".avi",
+    ".mkv",
+    ".flv",
+    ".3gp",
+)
+_VIDEO_URL_PATH_MARKERS: tuple[str, ...] = (
+    "/video/",
+    "/videos/",
+    "/vod/",
+    "/mp4/",
+    "video.szwego.com",
+    "vod.szwego.com",
+)
+
+
+def is_video_media_url(url: str) -> bool:
+    """微猫 ``imgsSrc`` 等字段中的视频资源（非可上架静态图）。"""
+    raw = str(url or "").strip()
+    if not raw:
+        return False
+    low = raw.lower().split("#", 1)[0]
+    path = low.split("?", 1)[0]
+    if any(path.endswith(ext) for ext in _VIDEO_URL_EXTENSIONS):
+        return True
+    if any(marker in path for marker in _VIDEO_URL_PATH_MARKERS):
+        return True
+    q = low.split("?", 1)[1] if "?" in low else ""
+    if q and ("format=mp4" in q or "type=video" in q or "video=1" in q):
+        return True
+    return False
+
+
+def filter_image_urls(urls: list[str]) -> list[str]:
+    """去掉视频 URL，保留可下载上架的静态图。"""
+    out: list[str] = []
+    for u in urls:
+        s = str(u or "").strip()
+        if not s or is_video_media_url(s):
+            continue
+        out.append(s)
+    return out
+
+
+def commodity_raw_media_urls(obj: dict[str, Any]) -> list[str]:
+    """从 commodity 抽取全部 http(s) 媒体 URL（含视频，未过滤）。"""
     urls_raw = obj.get("imgsSrc") or obj.get("imgs") or []
     if not isinstance(urls_raw, list):
         urls_raw = []
-    image_urls: list[str] = []
+    out: list[str] = []
     for u in urls_raw:
         if isinstance(u, str):
             u = u.strip().split("|")[0].strip()
             if u.startswith(("http://", "https://")):
-                image_urls.append(u)
-    return image_urls
+                out.append(u)
+    return out
+
+
+def commodity_image_urls(obj: dict[str, Any]) -> list[str]:
+    """从 commodity 风格 dict 抽取主图/附图 URL（排除视频）。"""
+    return filter_image_urls(commodity_raw_media_urls(obj))
 
 
 def parse_wego_product(
@@ -99,7 +164,7 @@ def parse_wego_product(
         else:
             raise ValueError(
                 "JSON 缺少 optimaPrice、itemNamePrice、有效的 priceArr[0].value，且 title 中未匹配到 "
-                "¥/￥/💰/人民币/RMB/P 数字 等形式价格",
+                "💰 或 P 数字 等形式拿货价",
             )
 
     srp = str(raw_price).strip()

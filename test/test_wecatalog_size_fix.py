@@ -7,17 +7,14 @@ from __future__ import annotations
 
 
 from product_feed_kr.wecatalog.wecatalog_size_fix import (
-
     apply_scrape_size_fix,
-
+    custom_order_sizes_from_title,
     expand_digit_slot_code,
-
     expand_size_range_token,
-
+    filter_listing_sizes_for_title,
     fix_scrape_sizes,
-
     shoe_sizes_to_kr_mm,
-
+    standard_stock_sizes_from_title,
 )
 
 
@@ -170,3 +167,39 @@ def test_apply_scrape_size_fix_clothing():
 
     assert "commodity_sizes_ko" not in fields
 
+
+BRUNELLO_TITLE = (
+    "P650 BC新品板鞋 Brunel*o Cucinell* 新款运动鞋男鞋出货！"
+    "标准专柜码数：39～44# （38.45.46# 🉑️定做)"
+)
+
+
+def test_expand_fullwidth_tilde_range():
+    assert fix_scrape_sizes(["39～44#"]) == ["39", "40", "41", "42", "43", "44"]
+
+
+def test_custom_order_sizes_from_title():
+    assert custom_order_sizes_from_title(BRUNELLO_TITLE) == frozenset({"38", "45", "46"})
+
+
+def test_standard_stock_sizes_from_title():
+    assert standard_stock_sizes_from_title(BRUNELLO_TITLE) == [
+        "39",
+        "40",
+        "41",
+        "42",
+        "43",
+        "44",
+    ]
+
+
+def test_filter_listing_sizes_strips_custom_and_keeps_standard():
+    llm_sizes = ["38", "39", "40", "41", "42", "43", "44", "45", "46"]
+    assert filter_listing_sizes_for_title(llm_sizes, BRUNELLO_TITLE) == [
+        "39",
+        "40",
+        "41",
+        "42",
+        "43",
+        "44",
+    ]

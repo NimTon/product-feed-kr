@@ -240,6 +240,7 @@ _SYSTEM_LISTING_BASE = """你是电商上架信息翻译与纠错助手。只输
 - name_ko：韩文商品名（上架标题用，8~30 字）
 - desc_zh：中文描述（2~5 句，可轻润色）
 - desc_ko：韩文描述（基于 desc_zh 翻译，不增信息）
+- **货号/款号/型号数字**：``name_zh``、``name_ko``、``desc_zh``、``desc_ko`` 中**不要**写入商品货号、款号、SKU、纯数字型号或「型号为 12345」「790038 款」等数字编号；只写款式/材质/用途等可读文案
 - size_spec_kind：有 ``attr_map.尺码`` 时**必填**：``footwear``（鞋靴/运动鞋等，中文尺码用欧码 32–50，系统将把韩文尺码转为毫米脚长）或 ``apparel``（服装等，中文尺码用 S/M/L/XL）
 {attr_spec_lines}
 **禁止**输出 `attr_map_ko.사이즈`（韩文尺码由系统根据 ``size_spec_kind`` 与中文尺码自动生成）
@@ -254,6 +255,12 @@ _SYSTEM_LISTING_BASE = """你是电商上架信息翻译与纠错助手。只输
 | 鞋靴 | 写成 S/M/L 或数字档 ``0`` ``1`` | 改为欧码 ``35`` ``36`` ``40`` ``40.5`` 等（32–50） |
 | 鞋靴 | 区间 ``38-41`` | 展开为 ``38,39,40,41`` |
 | 通用 | 重复、乱序、与标题不符 | 去重、从小到大；不确定的删除 |
+
+**现货尺码（只写入 attr_map.尺码）**：
+- **只要**标题/原文中**现货、标准、专柜码数、常备**等段落列出的码；区间（如 ``39～44#``）展开为单码
+- **完全忽略**标注为**定做、定制、可定、可定做**的码及其所在括号/句段（如 ``（38.45.46# 🉑️定做）`` 中的 38/45/46 **不要**输出）
+- 同一数字若既出现在现货段又出现在定做段，**以定做标注为准剔除**
+- 无法从原文高置信确认现货码时：**不要**输出 ``attr_map.尺码``，勿用定做码或连续脑补码凑全
 
 鞋靴中文尺码用**欧码数字**；服装用 **S/M/L/XL…**。不要输出毫米、不要改韩文 사이즈。
 
@@ -281,11 +288,11 @@ _COLOR_POLICY_OFF = """**颜色（文生文：仅从原始描述明确写出的�
 - 尺码/价格/名称/描述仍按上文与已整理字段处理"""
 
 _SIZE_FILL_RULE_WITH_COLORS = (
-    "尺码空项可从原文中与尺码相关的描述补全。"
+    "尺码空项时仅从原文**现货/标准/专柜码数**段落补全，**忽略定做/定制/可定**码；"
     "颜色**只能**来自附图九宫格可见配色，**禁止**从标题/描述/材料文案填写或补全颜色。"
 )
 _SIZE_FILL_RULE_TEXT_COLORS = (
-    "尺码空项可从原文中与尺码相关的描述补全。"
+    "尺码空项时仅从原文**现货/标准/专柜码数**段落补全，**忽略定做/定制/可定**码；"
     "颜色：仅当「原始描述」**明确写出**商品销售色/可选色时可写入；禁止从材料/里料/五金等猜色。"
 )
 
@@ -382,14 +389,82 @@ def _listing_llm_draft_snapshot(
     if listing_llm_color_vision_enabled():
         draft["_note"] = (
             "只需纠错 attr_map 中文尺码；有尺码时必须输出 size_spec_kind（footwear 或 apparel）；"
-            "颜色/색상仅能从附图九宫格识别，勿从标题取色；勿输出 attr_map_ko.사이즈"
+            "尺码只写现货/标准/专柜码数，忽略定做/定制/可定码；"
+            "颜色/색상仅能从附图九宫格识别，勿从标题取色；勿输出 attr_map_ko.사이즈；"
+            "中韩文名称/描述勿写货号、款号、SKU 等数字编号"
         )
     else:
         draft["_note"] = (
             "纠错 attr_map 中文尺码；有尺码时必须输出 size_spec_kind（footwear=鞋靴欧码，apparel=服装字母码）；"
-            "颜色/색상仅从「原始描述」中明确写出的销售色提取；勿输出 attr_map_ko.사이즈"
+            "尺码只写现货/标准/专柜码数，忽略定做/定制/可定码；"
+            "颜色/색상仅从「原始描述」中明确写出的销售色提取；勿输出 attr_map_ko.사이즈；"
+            "中韩文名称/描述勿写货号、款号、SKU 等数字编号"
         )
     return draft
+
+
+def _listing_goods_num_tokens(record: dict[str, Any], *, listing_hint: str | None = None) -> tuple[str, ...]:
+    """用于从 LLM 文案中剔除的货号/款号类 token（≥3 字符）。"""
+    toks: list[str] = []
+
+    def add(raw: Any) -> None:
+        s = str(raw or "").strip()
+        if len(s) < 3 or s in toks:
+            return
+        toks.append(s)
+
+    add(record.get("commodity_goods_num"))
+    cm = record.get("commodity_min")
+    if isinstance(cm, dict):
+        add(cm.get("goods_num"))
+    hint = str(listing_hint or "").strip()
+    if hint:
+        add(hint)
+    title = str(record.get("commodity_title") or "").strip()
+    if title and re.fullmatch(r"[\w\-.]{3,32}", title):
+        add(title)
+    return tuple(toks)
+
+
+def _strip_goods_num_phrases(text: str, tokens: tuple[str, ...]) -> str:
+    if not text or not tokens:
+        return text
+    out = text
+    for tok in tokens:
+        esc = re.escape(tok)
+        out = re.sub(esc, "", out, flags=re.IGNORECASE)
+        out = re.sub(
+            rf"(?:货号|款号|型号|款|모델\s*번호|모델번호|스타일)\s*[:：]?\s*{esc}",
+            "",
+            out,
+            flags=re.IGNORECASE,
+        )
+        out = re.sub(rf"\b{esc}\s*(?:款|스타일)\b", "", out, flags=re.IGNORECASE)
+    out = re.sub(r"[，,]\s*[，,]", "，", out)
+    out = re.sub(r"\s{2,}", " ", out)
+    out = re.sub(r"^[，,\s]+|[，,\s]+$", "", out)
+    return out.strip()
+
+
+def strip_listing_llm_goods_num_refs(
+    record: dict[str, Any],
+    payload: dict[str, Any],
+    *,
+    listing_hint: str | None = None,
+) -> None:
+    """从 LLM 中韩文名称/描述中移除货号、款号等数字编号（就地修改）。"""
+    tokens = _listing_goods_num_tokens(record, listing_hint=listing_hint)
+    if not tokens:
+        return
+    for key in ("name_zh", "name_ko", "desc_zh", "desc_ko"):
+        raw = payload.get(key)
+        if not isinstance(raw, str) or not raw.strip():
+            continue
+        cleaned = _strip_goods_num_phrases(raw, tokens)
+        if cleaned:
+            payload[key] = cleaned
+        else:
+            payload.pop(key, None)
 
 
 def _apply_scrape_fields_to_listing_llm(
@@ -429,16 +504,27 @@ def apply_listing_size_fix_from_zh(
     record: dict[str, Any] | None = None,
 ) -> None:
     """修正中文 ``attr_map.尺码``；``size_spec_kind=footwear`` 时生成毫米 ``attr_map_ko.사이즈``。"""
-    _ = listing_hint, record
-    from product_feed_kr.wecatalog.wecatalog_size_fix import fix_scrape_sizes
+    from product_feed_kr.wecatalog.wecatalog_size_fix import (
+        filter_listing_sizes_for_title,
+        fix_scrape_sizes,
+    )
+
+    title = str(listing_hint or "").strip()
+    if not title and isinstance(record, dict):
+        title = str(record.get("commodity_title") or "").strip()
+        if not title:
+            cm = record.get("commodity_min")
+            if isinstance(cm, dict):
+                title = str(cm.get("title") or "").strip()
 
     am = dict(payload.get("attr_map") or {}) if isinstance(payload.get("attr_map"), dict) else {}
     ko = dict(payload.get("attr_map_ko") or {}) if isinstance(payload.get("attr_map_ko"), dict) else {}
     zh_raw = am.get("尺码")
     if isinstance(zh_raw, list) and zh_raw:
-        zh_fixed = fix_scrape_sizes(
-            [str(x).strip() for x in zh_raw if str(x).strip()],
-        )
+        zh_list = [str(x).strip() for x in zh_raw if str(x).strip()]
+        if title:
+            zh_list = filter_listing_sizes_for_title(zh_list, title)
+        zh_fixed = fix_scrape_sizes(zh_list)
         am["尺码"] = zh_fixed
         payload["attr_map"] = am
         if listing_llm_wants_shoe_size_mm(payload):
@@ -446,7 +532,20 @@ def apply_listing_size_fix_from_zh(
         else:
             ko["사이즈"] = list(zh_fixed)
     else:
-        ko.pop("사이즈", None)
+        if title:
+            standard_only = filter_listing_sizes_for_title([], title)
+            if standard_only:
+                zh_fixed = fix_scrape_sizes(standard_only)
+                am["尺码"] = zh_fixed
+                payload["attr_map"] = am
+                if listing_llm_wants_shoe_size_mm(payload):
+                    ko["사이즈"] = _dedupe_str_list(shoe_sizes_to_kr_mm(zh_fixed))
+                else:
+                    ko["사이즈"] = list(zh_fixed)
+            else:
+                ko.pop("사이즈", None)
+        else:
+            ko.pop("사이즈", None)
     payload["attr_map_ko"] = ko
     _dedupe_attr_map_size_lists(payload)
 
@@ -654,10 +753,15 @@ def enrich_listing(
         usage_log_record=record,
         call_kind="listing",
     )
-    patch = parse_listing_llm_response(content, listing_hint=title)
+    patch = parse_listing_llm_response(
+        content,
+        listing_hint=title,
+        record=record,
+    )
     patch.pop("price_krw", None)
     patch.pop("cny_price", None)
     merged = _merge_listing_llm_payload(ll, patch)
+    strip_listing_llm_goods_num_refs(record, merged, listing_hint=title)
     merged.pop("price_krw", None)
     apply_listing_size_fix_from_zh(merged, listing_hint=title, record=record)
     strip_listing_llm_colors(
@@ -1182,12 +1286,20 @@ def listing_llm_cny_usable(listing_llm: dict[str, Any]) -> bool:
     )
 
 
-def parse_listing_llm_response(text: str, *, listing_hint: str | None = None) -> dict[str, Any]:
+def parse_listing_llm_response(
+    text: str,
+    *,
+    listing_hint: str | None = None,
+    record: dict[str, Any] | None = None,
+) -> dict[str, Any]:
     raw = _strip_json_fence(text)
     data = json.loads(raw)
     if not isinstance(data, dict):
         raise ValueError("LLM 返回根节点须为 JSON 对象")
-    return _normalize_llm_payload(data, listing_hint=listing_hint)
+    out = _normalize_llm_payload(data, listing_hint=listing_hint)
+    if isinstance(record, dict):
+        strip_listing_llm_goods_num_refs(record, out, listing_hint=listing_hint)
+    return out
 
 
 def listing_llm_enabled() -> bool:

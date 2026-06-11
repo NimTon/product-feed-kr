@@ -1360,15 +1360,28 @@ def sqlite_load_products_for_upload(
     *,
     skip_uploaded: bool = True,
 ) -> list[dict[str, Any]]:
-    """载入商品行，按表主键 ``id`` 正序（先入先处理）。"""
+    """载入商品行：``wecatalog_listed_at`` 早的优先（空上架时间排后），同时间按 ``id``。"""
+    order_sql = """
+        CASE WHEN trim(COALESCE(wecatalog_listed_at, '')) = '' THEN 1 ELSE 0 END,
+        wecatalog_listed_at ASC,
+        id ASC
+    """
     if skip_uploaded:
         cur = conn.execute(
-            "SELECT * FROM pf_store_item WHERE album_id = ? AND seven17_uploaded_at IS NULL ORDER BY id ASC",
+            f"""
+            SELECT * FROM pf_store_item
+            WHERE album_id = ? AND seven17_uploaded_at IS NULL
+            ORDER BY {order_sql}
+            """,
             (album_id,),
         )
     else:
         cur = conn.execute(
-            "SELECT * FROM pf_store_item WHERE album_id = ? ORDER BY id ASC",
+            f"""
+            SELECT * FROM pf_store_item
+            WHERE album_id = ?
+            ORDER BY {order_sql}
+            """,
             (album_id,),
         )
     rows = [row_to_product_record(_row_to_dict(r)) for r in cur.fetchall()]
@@ -1383,7 +1396,7 @@ def sqlite_load_products_for_upload(
                 ("skip_uploaded", 1 if skip_uploaded else 0),
                 ("rows", len(rows)),
             ],
-            zh="读库：载入待上架/处理商品列表",
+            zh="读库：载入待上架/处理商品列表（微猫上架时间早的优先）",
         ),
     )
     return rows

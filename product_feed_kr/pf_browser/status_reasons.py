@@ -81,6 +81,8 @@ def upload_block_reason_zh(rec: dict[str, Any], code: str) -> str:
         return "无法解析 seven17 分类 ca_id，请补全 map 映射"
     if code == "no_images":
         return "缺少商品图片 URL"
+    if code == "video_media":
+        return "商品媒体为视频（imgsSrc/imgs 无静态图），上架已跳过"
     if code == "already_uploaded":
         return "已上传"
     return f"不可上传（{code}）"

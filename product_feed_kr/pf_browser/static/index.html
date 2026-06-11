@@ -145,7 +145,7 @@
     table {
       width: 100%;
       border-collapse: collapse;
-      min-width: 1680px;
+      min-width: 1960px;
     }
     th, td {
       padding: 7px 9px;
@@ -352,6 +352,8 @@
             <th class="grp grp-status">上传时间</th>
             <th class="grp grp-id">goods_id</th>
             <th class="grp grp-id">分组 / 标签</th>
+            <th class="grp grp-id">韩文类目</th>
+            <th class="grp grp-scrape">微猫上架</th>
             <th class="grp grp-scrape">原标题</th>
             <th class="grp grp-scrape">货号</th>
             <th class="grp grp-price">¥</th>
@@ -584,6 +586,8 @@
             cellGrp("", `<span class="mono">${esc(formatDisplayTime(row.seven17_uploaded_at)) || "—"}</span>`),
             cellGrp("", `<span class="mono">${esc(row.goods_id)}</span>`),
             cellGrp("", esc(row.wecatalog_label)),
+            cellGrp("title-cell", shopCategoryPathCell(row)),
+            cellGrp("", `<span class="mono">${esc(formatDisplayTime(row.wecatalog_listed_at)) || "—"}</span>`),
             cellGrp("title-cell", `<span title="${esc(row.commodity_title)}">${esc(row.commodity_title_short)}</span>`),
             cellGrp("", `<span class="mono">${esc(row.commodity_goods_num) || "—"}</span>`),
             cellGrp("", esc(row.price_cny_display) || "—"),
@@ -629,6 +633,20 @@
       return s || "—";
     }
 
+    function formatShopCategoryPath(row) {
+      if (Array.isArray(row.shop_category_path) && row.shop_category_path.length) {
+        return row.shop_category_path.join(" > ");
+      }
+      return String(row.shop_category_path_display || "").trim();
+    }
+
+    function shopCategoryPathCell(row) {
+      const full = formatShopCategoryPath(row);
+      if (!full) return "—";
+      const shown = row.shop_category_path_preview || full;
+      return `<span title="${esc(full)}">${esc(shown)}</span>`;
+    }
+
     function listPlain(items) {
       if (!items || !items.length) return "—";
       return items.join("、");
@@ -647,9 +665,7 @@
     }
 
     function formatItemClipboardText(row) {
-      const path = Array.isArray(row.shop_category_path)
-        ? row.shop_category_path.join(" > ")
-        : textOrDash(row.shop_category_path);
+      const path = formatShopCategoryPath(row) || "—";
       const lines = [
         `#${row.id} ${textOrDash(row.commodity_title)}`,
         "",
@@ -659,6 +675,8 @@
         `goods_id: ${textOrDash(row.goods_id)}`,
         `tag_id: ${row.tag_id ?? 0}`,
         `分组 / 标签: ${textOrDash(row.wecatalog_label)}`,
+        `韩文类目路径: ${path}`,
+        `微猫上架: ${displayTimeOrDash(row.wecatalog_listed_at)}`,
         `货号: ${textOrDash(row.commodity_goods_num)}`,
         `首图 hash: ${textOrDash(row.first_image_hash)}`,
         `图片数: ${row.image_count || 0}`,
@@ -780,9 +798,7 @@
       $("btnCopyDetail").disabled = false;
       $("dlgTitle").textContent = `#${row.id} ${row.commodity_title || ""}`;
       $("dlgTitle").dataset.itemId = String(row.id);
-      const path = Array.isArray(row.shop_category_path)
-        ? row.shop_category_path.join(" > ")
-        : (row.shop_category_path || "");
+      const path = formatShopCategoryPath(row);
 
       $("dlgBody").innerHTML = `
         <div class="section">
@@ -793,6 +809,8 @@
             ${kvRow("goods_id", `<span class="mono">${esc(row.goods_id)}</span>`)}
             ${kvRow("tag_id", `<span class="mono">${row.tag_id ?? 0}</span>`)}
             ${kvRow("分组 / 标签", esc(row.wecatalog_label))}
+            ${kvRow("韩文类目路径", esc(path) || "—")}
+            ${kvRow("微猫上架", `<span class="mono">${esc(formatDisplayTime(row.wecatalog_listed_at)) || "—"}</span>`)}
             ${kvRow("货号", esc(row.commodity_goods_num) || "—")}
             ${kvRow("首图 hash", `<span class="mono">${esc(row.first_image_hash) || "—"}</span>`)}
             ${kvRow("图片数", String(row.image_count || 0))}

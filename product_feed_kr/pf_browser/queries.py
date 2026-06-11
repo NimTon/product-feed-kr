@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import re
 from typing import Any
 
 from product_feed_kr.db.llm_spec_fields import (
@@ -12,9 +13,12 @@ from product_feed_kr.db.llm_spec_fields import (
 )
 from product_feed_kr.pf_browser.status_reasons import enrich_status_reasons
 from product_feed_kr.db.store_sqlite import connect_sqlite, sqlite_db_path
+from product_feed_kr.wecatalog.wecatalog_tag_mapping import resolve_category_path
 
 _MAX_PAGE_SIZE = 200
 _DEFAULT_PAGE_SIZE = 50
+
+_WECATALOG_GROUP_PREFIX = re.compile(r"^\d+\s*,\s*(.+)$")
 
 _SORT_SQL: dict[str, str] = {
     "llm": """
@@ -52,6 +56,7 @@ _LIST_COLS: tuple[str, ...] = (
     "tag_id",
     "wecatalog_group",
     "wecatalog_tag",
+    "shop_category_path_json",
     "commodity_title",
     "wecatalog_listed_at",
     "commodity_goods_num",
@@ -80,7 +85,6 @@ _LIST_COLS: tuple[str, ...] = (
 )
 
 _DETAIL_EXTRA: tuple[str, ...] = (
-    "shop_category_path_json",
     "commodity_image_urls_json",
     "commodity_tag_names_json",
     "first_image_hash",
@@ -183,6 +187,45 @@ def _list_preview(items: list[str], *, max_show: int = 6) -> str:
     return "、".join(items[:max_show]) + f"…(+{len(items) - max_show})"
 
 
+def _parse_shop_category_path_raw(raw: Any) -> list[str] | None:
+    if isinstance(raw, list):
+        seg = [str(x).strip() for x in raw if str(x).strip()]
+        return seg or None
+    if isinstance(raw, str) and raw.strip():
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            return None
+        if isinstance(parsed, list):
+            seg = [str(x).strip() for x in parsed if str(x).strip()]
+            return seg or None
+    return None
+
+
+def _normalize_wecatalog_group_name(group_name: str) -> str:
+    """映射表分组名不含 ``1,`` 前缀；微猫 API 可能带编号。"""
+    g = str(group_name or "").strip()
+    m = _WECATALOG_GROUP_PREFIX.match(g)
+    return m.group(1).strip() if m else g
+
+
+def _shop_category_path_segments(d: dict[str, Any]) -> list[str] | None:
+    """韩文商城类目层级：DB 缓存优先，否则按 wecatalog 分组+标签查映射表。"""
+    for key in ("shop_category_path", "shop_category_path_json"):
+        seg = _parse_shop_category_path_raw(d.get(key))
+        if seg:
+            return seg
+    g = str(d.get("wecatalog_group") or "").strip()
+    t = str(d.get("wecatalog_tag") or "").strip()
+    if not g or not t:
+        return None
+    for group in (g, _normalize_wecatalog_group_name(g)):
+        resolved = resolve_category_path(group, t)
+        if resolved:
+            return list(resolved)
+    return None
+
+
 def _apply_display_fields(d: dict[str, Any]) -> None:
     """列表/详情展示用派生字段（中文规格=爬取优先否则兜底；韩文=翻译列）。"""
     sizes_zh, colors_zh = effective_sizes_colors_zh(d)
@@ -220,6 +263,16 @@ def _apply_display_fields(d: dict[str, Any]) -> None:
     grp = str(d.get("wecatalog_group") or "").strip()
     tag = str(d.get("wecatalog_tag") or "").strip()
     d["wecatalog_label"] = f"{grp} / {tag}" if grp or tag else "—"
+
+    path_seg = _shop_category_path_segments(d)
+    d["shop_category_path"] = path_seg
+    if path_seg:
+        path_joined = " > ".join(path_seg)
+        d["shop_category_path_display"] = path_joined
+        d["shop_category_path_preview"] = _text_short(path_joined, max_len=56)
+    else:
+        d["shop_category_path_display"] = ""
+        d["shop_category_path_preview"] = ""
 
 
 def _row_to_item(row: Any) -> dict[str, Any]:
@@ -327,12 +380,6 @@ def get_item(item_id: int) -> dict[str, Any] | None:
             return None
         item = _row_to_item(row)
         _finalize_items(conn, [item])
-        raw_path = row["shop_category_path_json"] if "shop_category_path_json" in row.keys() else None
-        if isinstance(raw_path, str) and raw_path.strip():
-            try:
-                item["shop_category_path"] = json.loads(raw_path)
-            except json.JSONDecodeError:
-                item["shop_category_path"] = raw_path
         return item
     finally:
         conn.close()

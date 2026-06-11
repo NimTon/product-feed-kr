@@ -10,8 +10,8 @@
 ``data/seven17_path_ca_map.json``。爬取阶段默认跳过无分类商品；分类仅走路径映射，不用 LLM 兜底。
 
 常用可选：`SEVEN17_CONFIG`、`SEVEN17_BASE_URL`、`SEVEN17_HEADLESS`、`SEVEN17_STOCK_QTY`、
-`SEVEN17_DEFAULT_PRICE`（货源无价格时兜底）、`SEVEN17_SC_TYPE`、`SEVEN17_MAX_IMAGES`、
-`SEVEN17_NO_PRICE_ALLOW_CATEGORIES`（无价格允许上传白名单分类，逗号分隔；仅匹配 map 的微猫分组/标签）、
+`SEVEN17_DEFAULT_PRICE`（仅非白名单货源无价格时兜底；白名单内无价上架不填 ``it_price``）、`SEVEN17_SC_TYPE`、`SEVEN17_MAX_IMAGES`、
+`SEVEN17_NO_PRICE_ALLOW_CATEGORIES`（无价格允许上传白名单：匹配 map 分组/标签；无价时不换算、不填售价）、
 `WEGO_TITLE_PREFIX`、`WEGO_DESC_TEMPLATE`、
 `SEVEN17_CONVERT_CNY_TO_KRW`（默认 true：每条商品填表前拉汇率，把人民币售价换算为韩元填入 `it_price`）、
 `SEVEN17_CNY_KRW_RATE`（可选固定汇率，填则不走接口）、`SEVEN17_CNY_KRW_FALLBACK`（接口失败时的 1 CNY 兑多少 KRW）、
@@ -167,6 +167,7 @@ _UPLOAD_SKIP_REASON_ZH: dict[str, str] = {
     "listed_too_old": "微猫上架时间早于配置阈值",
     "no_category": "无分类",
     "no_images": "无图片",
+    "video_media": "资源为视频",
 }
 
 
@@ -443,6 +444,8 @@ def _download_image(url: str) -> Path:
                     suffix = ".gif"
                 elif "image/jpeg" in ctype or "image/jpg" in ctype:
                     suffix = ".jpg"
+            elif ctype.startswith("video/"):
+                raise RuntimeError(f"下载内容为视频而非图片: ctype={ctype} url={url}")
             # 防空图/防错误页面：必须有足够字节且签名像图片。
             if len(data) < 512:
                 raise RuntimeError(f"图片下载体积异常（过小）: bytes={len(data)} url={url}")
@@ -782,7 +785,14 @@ def _record_price_krw_usable(rec: dict[str, Any]) -> str:
 
 def _upload_db_write_needed(price_src: str) -> bool:
     """``SEVEN17_WRITE_BACK_AFTER_LLM``：仅当韩元价非「直接沿用库内 price_krw」时写库。"""
-    return price_src not in ("price_krw",)
+    return price_src not in ("price_krw", "whitelist_no_price")
+
+
+def _upload_skip_price_fill(rec: dict[str, Any], listing_price: str) -> bool:
+    """无价白名单且当前无有效韩元售价：上架不换算、不填 ``it_price``。"""
+    from product_feed_kr.listing.listing_llm_enrich import record_is_no_price_allowed_by_map_category
+
+    return record_is_no_price_allowed_by_map_category(rec) and not _krw_price_str_usable(listing_price)
 
 
 def _resolve_upload_listing_price_krw(
@@ -1196,9 +1206,22 @@ def _fill_itemform(
     # 分类：必须来自 tag 映射后的 seven17 ca_id。
     page.select_option('select[name="ca_id"]', value=ca_id)
 
-    # 标题/售价：直接按最终上架值填充。
+    # 标题/售价：无价白名单可不填售价。
     page.fill('input[name="it_name"]', title)
-    page.fill('input[name="it_price"]', price)
+    if str(price or "").strip():
+        page.fill('input[name="it_price"]', price)
+    else:
+        _log.info(
+            "%s",
+            pf_kv(
+                [
+                    ("event", "itemform.note"),
+                    ("it_price", "skip"),
+                    ("reason", "whitelist_no_price"),
+                ],
+                zh="无价白名单：不填写售价字段",
+            ),
+        )
 
     # 库存：只写 stock_qty，和说明字段完全独立。
     stock = page.locator('input[name="it_stock_qty"]')
@@ -1497,7 +1520,13 @@ def _upload_skip_reason(
     ca_id, _ca_src = resolve_ca_id_for_store_record(rec)
     if not (ca_id or "").strip():
         return "no_category"
-    if not prod["image_urls"]:
+    from product_feed_kr.wego.wego_commodity import commodity_raw_media_urls, filter_image_urls
+
+    raw_media = commodity_raw_media_urls(com)
+    image_urls = filter_image_urls(raw_media)
+    if not image_urls:
+        if raw_media:
+            return "video_media"
         return "no_images"
     return None
 
@@ -1609,7 +1638,7 @@ def _claim_next_uploadable(
     claim_lock: threading.Lock | None = None,
     in_flight: set[tuple[str, int]] | None = None,
 ) -> dict[str, Any] | None:
-    """每次从 SQLite 重新加载，按 id 正序取第一条可上架且本 run 未占用/未跳过的记录。"""
+    """每次从 SQLite 重新加载，按微猫上架时间早的优先取第一条可上架且本 run 未占用/未跳过的记录。"""
     from product_feed_kr.db.store_sqlite import sqlite_load_products_for_upload
 
     def _scan() -> dict[str, Any] | None:
@@ -1835,6 +1864,10 @@ def _process_upload_record(
 
     urls = prod["image_urls"][: ctx.max_img]
     if not urls:
+        from product_feed_kr.wego.wego_commodity import commodity_raw_media_urls
+
+        if commodity_raw_media_urls(com):
+            return "skip", {"goods_id": gid, "error": "商品媒体为视频，无上架静态图，已跳过"}
         return "fail", {"goods_id": gid, "error": "无主图/图片 URL（imgsSrc/imgs）"}
 
     _upload_phase_log(
@@ -1888,12 +1921,14 @@ def _process_upload_record(
             prod=prod,
             krw_per_cny=None,
         )
+        skip_price_fill = _upload_skip_price_fill(rec, listing_price)
 
         krw_pc: float | None = None
         fx_src: str | None = None
         fx_rate: float | None = None
         if (
-            ctx.convert_fx
+            not skip_price_fill
+            and ctx.convert_fx
             and price_src not in ("price_krw", "listing_llm")
             and not _krw_price_str_usable(listing_price)
         ):
@@ -1919,7 +1954,11 @@ def _process_upload_record(
                 krw_per_cny=fx_rate,
             )
 
-        if ctx.llm_on and price_src not in ("price_krw", "listing_llm"):
+        if (
+            ctx.llm_on
+            and not skip_price_fill
+            and price_src not in ("price_krw", "listing_llm")
+        ):
             _log.warning(
                 "%s",
                 pf_kv(
@@ -1935,7 +1974,18 @@ def _process_upload_record(
             )
         cny_src = _price_cny_usable(rec) or str(rec.get("price_cny") or "").strip() or None
 
-        if not str(listing_price).strip():
+        if skip_price_fill:
+            listing_price = ""
+            price_src = "whitelist_no_price"
+            _upload_phase_log(
+                "upload.price.resolve",
+                "无价白名单：不换算、不填售价",
+                elapsed_ms=_ms_since(price_t0),
+                thread_label=thread_label,
+                rec=rec,
+                extra=[("price_src", price_src)],
+            )
+        elif not str(listing_price).strip():
             if fx_rate is None and ctx.convert_fx:
                 krw_pc, fx_src = _resolve_krw_per_cny()
                 fx_rate = krw_pc
@@ -1946,17 +1996,18 @@ def _process_upload_record(
             )
             if listing_price:
                 price_src = "whitelist_default"
-        if not str(listing_price).strip():
+        if not skip_price_fill and not str(listing_price).strip():
             return "skip", {"goods_id": gid, "error": "无法得到有效售价，已跳过"}
 
-        _upload_phase_log(
-            "upload.price.resolve",
-            "韩元售价已确定",
-            elapsed_ms=_ms_since(price_t0),
-            thread_label=thread_label,
-            rec=rec,
-            extra=[("price_src", price_src), ("it_price", listing_price)],
-        )
+        if not skip_price_fill:
+            _upload_phase_log(
+                "upload.price.resolve",
+                "韩元售价已确定",
+                elapsed_ms=_ms_since(price_t0),
+                thread_label=thread_label,
+                rec=rec,
+                extra=[("price_src", price_src), ("it_price", listing_price)],
+            )
 
         rec["price_krw"] = listing_price if listing_price else None
         fx_log_rate: float | None = fx_rate if price_src in (

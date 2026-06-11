@@ -49,3 +49,33 @@ def test_record_listed_before_threshold_exact_boundary():
     min_ms = parse_min_listed_at_threshold("2026-05-27")
     on_day = {"wecatalog_listed_at": ms_to_wecatalog_listed_at_iso(min_ms)}
     assert not record_listed_before_threshold(on_day, min_ms)
+
+
+def test_load_products_for_upload_listed_at_order(tmp_path) -> None:
+    import sqlite3
+    from pathlib import Path
+
+    from product_feed_kr.db.store_sqlite import ensure_sqlite_schema_at, sqlite_load_products_for_upload
+
+    db_path = tmp_path / "order.db"
+    conn = sqlite3.connect(db_path)
+    conn.row_factory = sqlite3.Row
+    ensure_sqlite_schema_at(conn, db_path)
+    aid = "album_test"
+    rows = [
+        ("g_new", "2026-05-20T10:00:00+08:00"),
+        ("g_old", "2026-05-01T08:00:00+08:00"),
+        ("g_mid", "2026-05-10T12:00:00+08:00"),
+        ("g_empty", None),
+    ]
+    for gid, listed in rows:
+        conn.execute(
+            """
+            INSERT INTO pf_store_item (album_id, goods_id, tag_id, goods_url, wecatalog_listed_at)
+            VALUES (?, ?, 0, ?, ?)
+            """,
+            (aid, gid, f"https://example/{gid}", listed),
+        )
+    conn.commit()
+    loaded = sqlite_load_products_for_upload(conn, aid, skip_uploaded=False)
+    assert [r["goods_id"] for r in loaded] == ["g_old", "g_mid", "g_new", "g_empty"]

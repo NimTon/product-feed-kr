@@ -120,7 +120,7 @@ def _claim_next_llm_work_item(
     claim_lock: threading.Lock,
     in_flight: set[tuple[str, int]],
 ) -> tuple[dict[str, Any], dict[str, Any]] | None:
-    """按 ``id`` 正序取第一条待 LLM 且未占用的记录。"""
+    """按微猫上架时间早的优先取第一条待 LLM 且未占用的记录。"""
     from product_feed_kr.db.store_sqlite import sqlite_load_products_for_upload
 
     with claim_lock:
