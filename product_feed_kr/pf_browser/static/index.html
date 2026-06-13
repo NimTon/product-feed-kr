@@ -714,6 +714,7 @@
       <strong>分类配对 · 微猫 ↔ 韩文</strong>
       <div class="modal-actions">
         <button type="button" class="secondary" id="btnPairSync">重新同步分类</button>
+        <button type="button" class="btn-warn" id="btnPairClear">清空配对</button>
         <button type="button" id="btnPairSave">保存配对</button>
         <button type="button" class="secondary" id="btnPairClose">关闭</button>
       </div>
@@ -1882,6 +1883,8 @@
 
     async function syncCategoryMapsFromUi() {
       $("btnPairSync").disabled = true;
+      $("btnPairSave").disabled = true;
+      $("btnPairClear").disabled = true;
       setPairStatus("正在同步微猫与韩文分类…");
       try {
         const res = await fetch("/api/category-maps/sync", { method: "POST" });
@@ -1895,11 +1898,14 @@
         setPairStatus("同步失败: " + e.message, true);
       } finally {
         $("btnPairSync").disabled = false;
+        $("btnPairSave").disabled = false;
+        $("btnPairClear").disabled = false;
       }
     }
 
     async function savePairMapsFromUi() {
       $("btnPairSave").disabled = true;
+      $("btnPairClear").disabled = true;
       setPairStatus("保存中…");
       try {
         const rows = Object.values(pairState.pairs)
@@ -1925,6 +1931,44 @@
         setPairStatus("保存失败: " + e.message, true);
       } finally {
         $("btnPairSave").disabled = false;
+        $("btnPairClear").disabled = false;
+      }
+    }
+
+    async function clearPairMapsFromUi() {
+      const count = Object.values(pairState.pairs).filter(isPairablePair).length;
+      if (count === 0) {
+        setPairStatus("当前没有已保存或可清空的配对");
+        return;
+      }
+      const hint = pairState.dirty
+        ? `当前界面共 ${count} 条配对（含未保存的修改）。`
+        : `当前共 ${count} 条配对。`;
+      if (!confirm(`${hint}\n\n确定全部清空？将立即写入 JSON，无法撤销。`)) return;
+
+      $("btnPairSave").disabled = true;
+      $("btnPairClear").disabled = true;
+      $("btnPairSync").disabled = true;
+      setPairStatus("清空中…");
+      try {
+        const res = await fetch("/api/category-maps/pairs", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ rows: [] }),
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) throw new Error(data.error || res.statusText);
+        pairState.pairs = {};
+        pairState.selectedWc = null;
+        pairState.dirty = false;
+        await loadCategoryMaps();
+        setPairStatus("已清空全部配对");
+      } catch (e) {
+        setPairStatus("清空失败: " + e.message, true);
+      } finally {
+        $("btnPairSave").disabled = false;
+        $("btnPairClear").disabled = false;
+        $("btnPairSync").disabled = false;
       }
     }
 
@@ -2131,6 +2175,7 @@
     $("btnCategoryMap").addEventListener("click", () => openPairMapDialog());
     $("btnPairClose").addEventListener("click", () => $("pairMapDlg").close());
     $("btnPairSync").addEventListener("click", () => syncCategoryMapsFromUi());
+    $("btnPairClear").addEventListener("click", () => clearPairMapsFromUi());
     $("btnPairSave").addEventListener("click", () => savePairMapsFromUi());
     $("pairSearchWc").addEventListener("input", () => renderPairMapLists());
     $("pairSearchS17").addEventListener("input", () => renderPairMapLists());
