@@ -114,7 +114,9 @@
     .legend {
       display: flex;
       flex-wrap: wrap;
+      align-items: center;
       gap: 12px 20px;
+      width: 100%;
       margin-bottom: 8px;
       font-size: 11px;
       color: var(--muted);
@@ -134,18 +136,39 @@
     .legend .g-price::before { background: var(--grp-price); }
     .legend .g-spec::before { background: var(--grp-spec); }
     .legend .g-llm::before { background: var(--grp-llm); }
+    .legend .table-scroll-hint::before { display: none; }
     .table-wrap {
       flex: 1 1 auto;
       min-height: 0;
       overflow: auto;
+      overscroll-behavior: contain;
       border: 1px solid var(--border);
       border-radius: 8px;
       background: var(--panel);
+      cursor: grab;
+    }
+    .table-wrap.is-dragging {
+      cursor: grabbing;
+      user-select: none;
+    }
+    .table-wrap.is-dragging * {
+      user-select: none;
+    }
+    .table-wrap a,
+    .table-wrap button,
+    .table-wrap input,
+    .table-wrap select {
+      cursor: pointer;
+    }
+    .table-scroll-hint {
+      font-size: 11px;
+      color: var(--muted);
+      margin-left: auto;
     }
     table {
-      width: 100%;
+      width: max-content;
+      min-width: 100%;
       border-collapse: collapse;
-      min-width: 1960px;
     }
     th, td {
       padding: 7px 9px;
@@ -170,6 +193,43 @@
     th.grp-spec { background: var(--grp-spec); }
     th.grp-llm { background: var(--grp-llm); }
     td.grp { border-left: 2px solid rgba(45, 58, 79, 0.6); }
+    td.thumb-cell {
+      width: 58px;
+      padding: 4px 6px !important;
+      vertical-align: middle;
+    }
+    .thumb-box {
+      width: 48px;
+      height: 48px;
+      border-radius: 4px;
+      border: 1px solid var(--border);
+      background: var(--bg);
+      overflow: hidden;
+      flex: 0 0 auto;
+    }
+    .thumb-box a.thumb-link {
+      display: block;
+      width: 100%;
+      height: 100%;
+      line-height: 0;
+    }
+    .thumb-box img {
+      width: 100%;
+      height: 100%;
+      object-fit: cover;
+      object-position: center center;
+      display: block;
+    }
+    .thumb-box .no-thumb {
+      width: 100%;
+      height: 100%;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 11px;
+      color: var(--muted);
+      text-align: center;
+    }
     tr:hover td { background: rgba(61, 139, 253, 0.08); }
     tr.clickable { cursor: pointer; }
     .mono { font-family: ui-monospace, Consolas, monospace; font-size: 11px; }
@@ -286,6 +346,259 @@
     a.ext-link:hover { color: #6ba8ff; }
     .url-hint { font-size: 11px; color: var(--muted); margin-top: 4px; }
     .muted { color: var(--muted); }
+    .diag-panel {
+      margin-top: 10px;
+      padding: 10px 12px;
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--bg);
+    }
+    .diag-panel[hidden] { display: none !important; }
+    dialog.diag-dlg {
+      max-width: min(860px, 94vw);
+      width: min(860px, 94vw);
+    }
+    .diag-head {
+      display: flex;
+      gap: 12px;
+      align-items: flex-start;
+    }
+    .diag-thumb {
+      flex: 0 0 auto;
+      width: 72px;
+      height: 72px;
+    }
+    .diag-thumb.thumb-box {
+      border-radius: 6px;
+    }
+    .thumb-wrap {
+      width: 96px;
+      height: 96px;
+      border-radius: 8px;
+    }
+    .diag-text { flex: 1; min-width: 0; }
+    .diag-steps { margin: 8px 0 0; padding: 0; list-style: none; }
+    .diag-steps li {
+      display: flex;
+      gap: 10px;
+      align-items: flex-start;
+      padding: 6px 0;
+      border-bottom: 1px solid var(--border);
+    }
+    .diag-steps li:last-child { border-bottom: none; }
+    .diag-step-badge {
+      flex: 0 0 auto;
+      min-width: 52px;
+      text-align: center;
+      font-size: 11px;
+      padding: 2px 6px;
+      border-radius: 4px;
+    }
+    .diag-step-badge.ok { background: rgba(61, 214, 140, 0.15); color: var(--ok); }
+    .diag-step-badge.warn { background: rgba(245, 165, 36, 0.15); color: var(--warn); }
+    .diag-step-badge.fail { background: rgba(242, 85, 90, 0.15); color: var(--err); }
+    .diag-step-badge.skip { background: rgba(139, 156, 179, 0.12); color: var(--muted); }
+    .diag-conclusion {
+      margin: 0 0 6px;
+      color: var(--text);
+      font-size: 13px;
+    }
+    .diag-findings {
+      margin: 10px 0 0;
+      padding: 8px 10px;
+      border: 1px solid var(--border);
+      border-radius: 6px;
+      background: var(--panel);
+      font-size: 12px;
+    }
+    .diag-findings h4 {
+      margin: 0 0 6px;
+      font-size: 12px;
+      color: var(--muted);
+      font-weight: 600;
+    }
+    .diag-findings ul {
+      margin: 0;
+      padding: 0;
+      list-style: none;
+    }
+    .diag-findings li {
+      padding: 3px 0;
+      border-bottom: 1px solid rgba(45, 58, 79, 0.35);
+    }
+    .diag-findings li:last-child { border-bottom: none; }
+    .diag-findings .fk { color: var(--muted); min-width: 108px; display: inline-block; }
+    .diag-blocker { color: var(--err); }
+    dialog.pair-map-dlg {
+      max-width: min(1200px, 96vw);
+      width: min(1200px, 96vw);
+    }
+    .pair-map-hint {
+      margin: 0 0 10px;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .pair-map-meta {
+      margin: 0 0 10px;
+      font-size: 11px;
+      color: var(--muted);
+    }
+    .pair-map-grid {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+      min-height: 360px;
+    }
+    @media (max-width: 820px) {
+      .pair-map-grid { grid-template-columns: 1fr; }
+    }
+    .pair-col {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--bg);
+      display: flex;
+      flex-direction: column;
+      min-height: 320px;
+      max-height: 58vh;
+    }
+    .pair-col-head {
+      padding: 8px 10px;
+      border-bottom: 1px solid var(--border);
+      font-weight: 600;
+      font-size: 12px;
+      color: var(--muted);
+      flex: 0 0 auto;
+      display: flex;
+      flex-direction: column;
+      gap: 6px;
+    }
+    .pair-search {
+      width: 100%;
+      padding: 5px 8px;
+      font-size: 12px;
+      font-weight: 400;
+      color: var(--text);
+      background: var(--panel);
+      border: 1px solid var(--border);
+      border-radius: 6px;
+    }
+    .pair-search::placeholder { color: var(--muted); opacity: 0.85; }
+    .pair-empty {
+      padding: 16px 8px;
+      text-align: center;
+      color: var(--muted);
+      font-size: 12px;
+    }
+    .pair-col-body {
+      overflow: auto;
+      padding: 6px;
+      flex: 1 1 auto;
+    }
+    .pair-group-title {
+      margin: 8px 4px 4px;
+      font-size: 11px;
+      color: var(--muted);
+      font-weight: 600;
+    }
+    .pair-item {
+      display: block;
+      width: 100%;
+      text-align: left;
+      margin: 0 0 4px;
+      padding: 6px 8px;
+      border-radius: 6px;
+      border: 1px solid transparent;
+      background: transparent;
+      color: var(--text);
+      cursor: pointer;
+      font-size: 12px;
+      line-height: 1.35;
+    }
+    .pair-item:hover { background: rgba(61, 139, 253, 0.1); }
+    .pair-item.selected {
+      border-color: var(--accent);
+      background: rgba(61, 139, 253, 0.18);
+    }
+    .pair-item.mapped {
+      border-color: rgba(61, 214, 140, 0.45);
+      background: rgba(61, 214, 140, 0.08);
+    }
+    .pair-item.taken {
+      color: var(--muted);
+      opacity: 0.62;
+      cursor: not-allowed;
+      border-color: transparent;
+      background: rgba(139, 156, 179, 0.06);
+    }
+    .pair-item.taken:hover { background: rgba(139, 156, 179, 0.06); }
+    .pair-item.taken .sub { color: var(--muted); }
+    .pair-item .sub {
+      display: block;
+      margin-top: 2px;
+      font-size: 11px;
+      color: var(--muted);
+      word-break: break-word;
+    }
+    .pair-item .sub.ok { color: var(--ok); }
+    .pair-status {
+      margin-top: 10px;
+      font-size: 12px;
+      color: var(--muted);
+      min-height: 18px;
+    }
+    .pair-status.err { color: var(--err); }
+    dialog.whitelist-dlg {
+      max-width: min(920px, 94vw);
+      width: min(920px, 94vw);
+    }
+    .whitelist-list {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--bg);
+      max-height: 58vh;
+      overflow: auto;
+      padding: 6px;
+    }
+    .whitelist-group {
+      margin-bottom: 8px;
+      padding-bottom: 6px;
+      border-bottom: 1px solid rgba(45, 58, 79, 0.45);
+    }
+    .whitelist-group:last-child { border-bottom: none; margin-bottom: 0; }
+    .whitelist-row {
+      display: flex;
+      align-items: flex-start;
+      gap: 8px;
+      padding: 5px 6px;
+      border-radius: 6px;
+      cursor: pointer;
+      font-size: 12px;
+      line-height: 1.35;
+    }
+    .whitelist-row:hover { background: rgba(61, 139, 253, 0.08); }
+    .whitelist-row.root {
+      font-weight: 600;
+      color: var(--text);
+      margin-bottom: 2px;
+    }
+    .whitelist-row.child {
+      padding-left: 22px;
+      color: var(--text);
+    }
+    .whitelist-row input[type="checkbox"] {
+      margin: 2px 0 0;
+      flex: 0 0 auto;
+      cursor: pointer;
+    }
+    .whitelist-row .wl-label { flex: 1; min-width: 0; word-break: break-word; }
+    .whitelist-tools {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 8px;
+      margin-bottom: 10px;
+      align-items: center;
+    }
+    .whitelist-tools .pair-search { max-width: 360px; flex: 1 1 220px; }
   </style>
 </head>
 <body>
@@ -323,6 +636,9 @@
       <div style="align-self:flex-end">
         <button type="button" id="btnSearch">查询</button>
         <button type="button" class="secondary" id="btnReload">刷新</button>
+        <button type="button" class="secondary" id="btnCategoryMap">分类配对</button>
+        <button type="button" class="secondary" id="btnNoPriceWhitelist">无价白名单</button>
+        <button type="button" class="secondary" id="btnDiagnoseOpen">不上架诊断</button>
       </div>
     </div>
   </header>
@@ -336,14 +652,16 @@
         <span class="g-price">价格</span>
         <span class="g-spec">规格</span>
         <span class="g-llm">LLM 文案</span>
+        <span class="table-scroll-hint">表格可左右拖拽 · Shift+滚轮横移</span>
       </div>
     </div>
-    <div class="table-wrap">
+    <div class="table-wrap" id="tableWrap">
       <div class="loading" id="loading">加载数据…</div>
       <table id="tbl" hidden>
         <thead>
           <tr>
             <th class="grp grp-status">ID</th>
+            <th class="grp grp-scrape">图</th>
             <th class="grp grp-status">操作</th>
             <th class="grp grp-status">状态</th>
             <th class="grp grp-status">LLM次</th>
@@ -391,8 +709,103 @@
     <div class="modal-body" id="dlgBody"></div>
   </dialog>
 
+  <dialog id="pairMapDlg" class="pair-map-dlg">
+    <div class="modal-head">
+      <strong>分类配对 · 微猫 ↔ 韩文</strong>
+      <div class="modal-actions">
+        <button type="button" class="secondary" id="btnPairSync">重新同步分类</button>
+        <button type="button" id="btnPairSave">保存配对</button>
+        <button type="button" class="secondary" id="btnPairClose">关闭</button>
+      </div>
+    </div>
+    <div class="modal-body">
+      <p class="pair-map-hint">先点击左侧微猫子标签，再点击右侧韩文子分类完成配对（两侧 root 类不参与：微猫分组锚点、韩文一级分类）。已占用的韩文分类显示为灰色。</p>
+      <div class="pair-map-meta" id="pairMapMeta"></div>
+      <div class="pair-map-grid">
+        <div class="pair-col">
+          <div class="pair-col-head">
+            <span>微猫分类（左选）</span>
+            <input type="search" id="pairSearchWc" class="pair-search" placeholder="搜索分组 / 标签 / 已配韩文路径" autocomplete="off" />
+          </div>
+          <div class="pair-col-body" id="pairWcList"></div>
+        </div>
+        <div class="pair-col">
+          <div class="pair-col-head">
+            <span>韩文分类（右选）</span>
+            <input type="search" id="pairSearchS17" class="pair-search" placeholder="搜索韩文路径 / ca_id / 占用方" autocomplete="off" />
+          </div>
+          <div class="pair-col-body" id="pairS17List"></div>
+        </div>
+      </div>
+      <div class="pair-status" id="pairMapStatus"></div>
+    </div>
+  </dialog>
+
+  <dialog id="whitelistDlg" class="whitelist-dlg">
+    <div class="modal-head">
+      <strong>无价白名单 · 微猫 (分组 / 标签)</strong>
+      <div class="modal-actions">
+        <button type="button" id="btnWhitelistSave">保存</button>
+        <button type="button" class="secondary" id="btnWhitelistClose">关闭</button>
+      </div>
+    </div>
+    <div class="modal-body">
+      <p class="pair-map-hint">勾选允许「无价格仍采集/上架」的微猫分类。勾选分组（root）将自动勾选其下全部子标签；保存至 <span class="mono">config/seven17.json</span> 的 <span class="mono">SEVEN17_NO_PRICE_ALLOW_CATEGORIES</span>。</p>
+      <div class="pair-map-meta" id="whitelistMeta"></div>
+      <div class="whitelist-tools">
+        <input type="search" id="whitelistSearch" class="pair-search" placeholder="搜索分组 / 标签" autocomplete="off" />
+        <button type="button" class="secondary btn-xs" id="btnWhitelistAllVisible">全选当前显示</button>
+        <button type="button" class="secondary btn-xs" id="btnWhitelistNoneVisible">全不选当前显示</button>
+      </div>
+      <div class="whitelist-list" id="whitelistList"></div>
+      <div class="pair-status" id="whitelistStatus"></div>
+    </div>
+  </dialog>
+
+  <dialog id="diagDlg" class="diag-dlg">
+    <div class="modal-head">
+      <strong>不上架诊断</strong>
+      <div class="modal-actions">
+        <button type="button" class="secondary" id="btnDiagClose">关闭</button>
+      </div>
+    </div>
+    <div class="modal-body">
+      <p class="pair-map-hint">粘贴微猫商品 URL 或 goods_id，查看未采集 / 跳过 / 未 LLM / 未上架等原因（含实时 commodity/view 探测）。</p>
+      <div class="whitelist-tools">
+        <input id="diagInput" type="search" class="pair-search" placeholder="https://www.wecatalog.cn/weshop/goods/…/…" autocomplete="off" />
+        <button type="button" id="btnDiagnoseRun">诊断</button>
+      </div>
+      <div class="diag-panel" id="diagPanel" hidden>
+        <div class="diag-head">
+          <div class="diag-thumb thumb-box" id="diagThumb"><span class="no-thumb">无图</span></div>
+          <div class="diag-text">
+            <p class="diag-conclusion" id="diagConclusion"></p>
+            <div class="muted" id="diagMeta"></div>
+          </div>
+        </div>
+        <ul class="diag-steps" id="diagSteps"></ul>
+        <div class="diag-findings" id="diagFindings" hidden></div>
+        <div id="diagItems" class="muted" style="margin-top:8px"></div>
+      </div>
+    </div>
+  </dialog>
+
   <script>
     const state = { page: 1, total: 0, pages: 1, detailRow: null };
+    const pairState = {
+      wcGroups: [],
+      s17Cats: [],
+      pairs: {},
+      selectedWc: null,
+      dirty: false,
+      meta: null,
+    };
+    const whitelistState = {
+      groups: [],
+      selected: new Set(),
+      configPath: "",
+      dirty: false,
+    };
 
     const $ = (id) => document.getElementById(id);
 
@@ -529,6 +942,98 @@
       return esc(preview) || '<span class="muted">—</span>';
     }
 
+    function thumbHtml(url, title) {
+      if (!url || !String(url).trim()) {
+        return '<div class="thumb-box"><span class="no-thumb">无图</span></div>';
+      }
+      const alt = esc(title || "商品图");
+      const src = esc(String(url).trim());
+      return (
+        `<div class="thumb-box">` +
+        `<a class="thumb-link" href="${src}" target="_blank" rel="noopener noreferrer" title="查看原图">` +
+        `<img src="${src}" alt="${alt}" loading="lazy" referrerpolicy="no-referrer" />` +
+        `</a></div>`
+      );
+    }
+
+    function thumbCell(row) {
+      const url = row.image_urls && row.image_urls[0];
+      return `<td class="grp thumb-cell">${thumbHtml(url, row.commodity_title_short || row.commodity_title)}</td>`;
+    }
+
+    function renderThumb(el, url, title) {
+      if (!el) return;
+      if (!url || !String(url).trim()) {
+        el.innerHTML = '<span class="no-thumb">无图</span>';
+        return;
+      }
+      const alt = esc(title || "商品缩略图");
+      const src = esc(String(url).trim());
+      el.innerHTML =
+        `<a class="thumb-link" href="${src}" target="_blank" rel="noopener noreferrer" title="在新标签页打开原图">` +
+        `<img src="${src}" alt="${alt}" loading="lazy" referrerpolicy="no-referrer" /></a>`;
+    }
+
+    function bindThumbLinks(root) {
+      if (!root) return;
+      root.querySelectorAll("a.thumb-link").forEach((a) => {
+        a.addEventListener("click", (ev) => ev.stopPropagation());
+      });
+    }
+
+    function bindTableDragScroll(el) {
+      if (!el || el.dataset.dragBound === "1") return;
+      el.dataset.dragBound = "1";
+
+      let dragging = false;
+      let moved = false;
+      let startX = 0;
+      let startScrollLeft = 0;
+
+      const isInteractive = (target) => {
+        if (!(target instanceof Element)) return false;
+        return !!target.closest("a, button, input, select, textarea, .thumb-link, .actions-cell");
+      };
+
+      el.addEventListener("mousedown", (e) => {
+        if (e.button !== 0 || isInteractive(e.target)) return;
+        dragging = true;
+        moved = false;
+        startX = e.pageX;
+        startScrollLeft = el.scrollLeft;
+        el.classList.add("is-dragging");
+      });
+
+      window.addEventListener("mousemove", (e) => {
+        if (!dragging) return;
+        const dx = e.pageX - startX;
+        if (Math.abs(dx) > 2) moved = true;
+        el.scrollLeft = startScrollLeft - dx;
+      });
+
+      const stopDrag = () => {
+        if (!dragging) return;
+        dragging = false;
+        el.classList.remove("is-dragging");
+      };
+      window.addEventListener("mouseup", stopDrag);
+
+      el.addEventListener("click", (e) => {
+        if (moved) {
+          e.preventDefault();
+          e.stopPropagation();
+          moved = false;
+        }
+      }, true);
+
+      el.addEventListener("wheel", (e) => {
+        if (!e.shiftKey) return;
+        if (Math.abs(e.deltaY) <= Math.abs(e.deltaX)) return;
+        el.scrollLeft += e.deltaY;
+        e.preventDefault();
+      }, { passive: false });
+    }
+
     async function loadAlbums() {
       const res = await fetch("/api/albums");
       const data = await res.json();
@@ -578,6 +1083,7 @@
           tr.dataset.id = row.id;
           tr.innerHTML = [
             cellGrp("", `<span class="mono">${row.id}</span>`),
+            thumbCell(row),
             `<td class="grp actions-cell">${actionButtons(row)}</td>`,
             cellGrp("", statusBadges(row)),
             cellGrp("", `<span class="mono">${row.llm_attempt_count ?? 0}</span>`),
@@ -605,6 +1111,7 @@
           tbody.appendChild(tr);
         }
         bindRerunButtons(tbody);
+        bindThumbLinks(tbody);
 
         $("pageInfo").textContent = `第 ${data.page} / ${data.pages} 页`;
         $("pageHint").textContent = `共 ${data.total} 条`;
@@ -787,6 +1294,157 @@
       });
     }
 
+    function diagStepBadge(status) {
+      const map = { ok: "通过", warn: "待处理", fail: "阻塞", skip: "跳过" };
+      return `<span class="diag-step-badge ${esc(status)}">${esc(map[status] || status)}</span>`;
+    }
+
+    function renderDiagnoseFindings(live) {
+      const box = $("diagFindings");
+      if (!live || !live.probe_ok) {
+        box.hidden = true;
+        box.innerHTML = "";
+        return;
+      }
+      const parts = [];
+      const blockers = live.blockers || [];
+      if (blockers.length) {
+        parts.push("<h4>阻塞原因（实时）</h4><ul>");
+        for (const b of blockers) {
+          parts.push(`<li class="diag-blocker">• ${esc(b.detail_zh || b.code || "")}</li>`);
+        }
+        parts.push("</ul>");
+      }
+      const findings = live.findings || [];
+      if (findings.length) {
+        parts.push("<h4>实时数据</h4><ul>");
+        for (const f of findings) {
+          parts.push(`<li><span class="fk">${esc(f.label || f.key || "")}</span>${esc(f.value || "")}</li>`);
+        }
+        parts.push("</ul>");
+      }
+      const tags = live.tag_contexts || [];
+      if (tags.length) {
+        parts.push("<h4>分类标签</h4><ul>");
+        for (const t of tags) {
+          const label = `${t.wecatalog_group || "?"}/${t.wecatalog_tag || "?"}`;
+          const bits = [];
+          if (t.has_category_mapping) bits.push("已映射");
+          else if (t.would_skip_uncategorized) bits.push("未映射→跳过");
+          if (t.no_price_skip) bits.push("无价非白名单→跳过");
+          else if (t.no_price_whitelist) bits.push("无价白名单");
+          const path = Array.isArray(t.shop_category_path) ? t.shop_category_path.join(" > ") : "";
+          parts.push(
+            `<li><span class="fk">${esc(label)}</span>${esc(bits.join("；") || "—")}` +
+            (path ? ` <span class="muted">(${esc(path)})</span>` : "") +
+            `</li>`,
+          );
+        }
+        parts.push("</ul>");
+      }
+      if (!parts.length) {
+        box.hidden = true;
+        return;
+      }
+      box.hidden = false;
+      box.innerHTML = parts.join("");
+    }
+
+    function renderDiagnose(data) {
+      const panel = $("diagPanel");
+      panel.hidden = false;
+      renderThumb($("diagThumb"), data.thumbnail_url, data.thumbnail_title);
+      bindThumbLinks(panel);
+      $("diagConclusion").textContent = data.conclusion_zh || "—";
+      const metaParts = [];
+      if (data.goods_id) metaParts.push(`goods_id: ${data.goods_id}`);
+      if (data.album_id) metaParts.push(`album_id: ${data.album_id}`);
+      if (data.pipeline_status) metaParts.push(`状态: ${data.pipeline_status}`);
+      $("diagMeta").textContent = metaParts.join(" · ");
+      const stepsEl = $("diagSteps");
+      stepsEl.innerHTML = (data.steps || [])
+        .map((st) => {
+          const extra = [];
+          if (st.item_id) extra.push(`#${st.item_id}`);
+          if (st.hit_count != null) extra.push(`命中 ${st.hit_count} 次`);
+          const suffix = extra.length ? ` <span class="muted">(${extra.join(" · ")})</span>` : "";
+          return (
+            `<li>${diagStepBadge(st.status)}<div><strong>${esc(st.title)}</strong>${suffix}<br />` +
+            `<span class="muted">${esc(st.detail_zh || "")}</span></div></li>`
+          );
+        })
+        .join("");
+      renderDiagnoseFindings(data.live_probe);
+      const items = data.store_items || [];
+      if (items.length) {
+        $("diagItems").innerHTML =
+          "库内记录：" +
+          items
+            .map((it) => {
+              const label = `#${it.id} ${it.wecatalog_group || ""}/${it.wecatalog_tag || ""}`;
+              const up = it.uploaded_to_platform ? "已上传" : (it.upload_eligible ? "可上传" : "不可上传");
+              return `<a href="#" data-open-id="${it.id}">${esc(label)}</a>（${esc(up)}）`;
+            })
+            .join("； ");
+        $("diagItems").querySelectorAll("a[data-open-id]").forEach((a) => {
+          a.addEventListener("click", (ev) => {
+            ev.preventDefault();
+            openDetail(Number(a.dataset.openId));
+          });
+        });
+      } else if (data.goods_url) {
+        $("diagItems").innerHTML = goodsUrlLink(data.goods_url);
+        bindExternalLinks($("diagItems"));
+      } else {
+        $("diagItems").textContent = "";
+      }
+    }
+
+    function openDiagnoseDialog(prefill) {
+      if (prefill != null && String(prefill).trim()) {
+        $("diagInput").value = String(prefill).trim();
+      }
+      $("diagPanel").hidden = true;
+      $("diagFindings").hidden = true;
+      $("diagFindings").innerHTML = "";
+      $("diagSteps").innerHTML = "";
+      $("diagItems").textContent = "";
+      $("diagConclusion").textContent = "";
+      $("diagMeta").textContent = "";
+      renderThumb($("diagThumb"), null, null);
+      $("diagDlg").showModal();
+      $("diagInput").focus();
+    }
+
+    async function runDiagnose() {
+      const q = ($("diagInput").value || "").trim();
+      if (!q) {
+        alert("请粘贴微猫商品 URL 或 goods_id");
+        return;
+      }
+      if (!$("diagDlg").open) openDiagnoseDialog(q);
+      $("diagConclusion").textContent = "正在请求 commodity/view 诊断…";
+      $("diagFindings").hidden = true;
+      $("diagFindings").innerHTML = "";
+      $("diagPanel").hidden = false;
+      try {
+        const res = await fetch("/api/diagnose?" + new URLSearchParams({ url: q }));
+        const data = await res.json();
+        if (!res.ok || !data.ok) {
+          throw new Error(data.message_zh || data.error || "诊断失败");
+        }
+        renderDiagnose(data);
+      } catch (e) {
+        renderThumb($("diagThumb"), null, null);
+        $("diagConclusion").textContent = "诊断失败：" + e.message;
+        $("diagMeta").textContent = "";
+        $("diagSteps").innerHTML = "";
+        $("diagFindings").hidden = true;
+        $("diagFindings").innerHTML = "";
+        $("diagItems").textContent = "";
+      }
+    }
+
     async function openDetail(id) {
       const res = await fetch("/api/items/" + id);
       if (!res.ok) {
@@ -801,21 +1459,24 @@
       const path = formatShopCategoryPath(row);
 
       $("dlgBody").innerHTML = `
-        <div class="section">
-          <h3>标识</h3>
-          <table class="kv">
-            ${kvRow("商品 URL", goodsUrlLink(row.goods_url))}
-            ${kvRow("album_id", `<span class="mono">${esc(row.album_id)}</span>`)}
-            ${kvRow("goods_id", `<span class="mono">${esc(row.goods_id)}</span>`)}
-            ${kvRow("tag_id", `<span class="mono">${row.tag_id ?? 0}</span>`)}
-            ${kvRow("分组 / 标签", esc(row.wecatalog_label))}
-            ${kvRow("韩文类目路径", esc(path) || "—")}
-            ${kvRow("微猫上架", `<span class="mono">${esc(formatDisplayTime(row.wecatalog_listed_at)) || "—"}</span>`)}
-            ${kvRow("货号", esc(row.commodity_goods_num) || "—")}
-            ${kvRow("首图 hash", `<span class="mono">${esc(row.first_image_hash) || "—"}</span>`)}
-            ${kvRow("图片数", String(row.image_count || 0))}
-            ${kvRow("微猫标签", listDetail(row.tag_names))}
-          </table>
+        <div class="section" style="display:flex;gap:14px;align-items:flex-start">
+          <div class="thumb-wrap thumb-box" id="dlgThumb"></div>
+          <div style="flex:1;min-width:0">
+            <h3 style="margin:0 0 8px">标识</h3>
+            <table class="kv">
+              ${kvRow("商品 URL", goodsUrlLink(row.goods_url))}
+              ${kvRow("album_id", `<span class="mono">${esc(row.album_id)}</span>`)}
+              ${kvRow("goods_id", `<span class="mono">${esc(row.goods_id)}</span>`)}
+              ${kvRow("tag_id", `<span class="mono">${row.tag_id ?? 0}</span>`)}
+              ${kvRow("分组 / 标签", esc(row.wecatalog_label))}
+              ${kvRow("韩文类目路径", esc(path) || "—")}
+              ${kvRow("微猫上架", `<span class="mono">${esc(formatDisplayTime(row.wecatalog_listed_at)) || "—"}</span>`)}
+              ${kvRow("货号", esc(row.commodity_goods_num) || "—")}
+              ${kvRow("首图 hash", `<span class="mono">${esc(row.first_image_hash) || "—"}</span>`)}
+              ${kvRow("图片数", String(row.image_count || 0))}
+              ${kvRow("微猫标签", listDetail(row.tag_names))}
+            </table>
+          </div>
         </div>
         <div class="section">
           <h3>重跑</h3>
@@ -888,9 +1549,568 @@
           <pre>${esc(row.commodity_title) || "—"}</pre>
         </div>
       `;
+      renderThumb(
+        $("dlgThumb"),
+        row.image_urls && row.image_urls[0],
+        row.commodity_title_short || row.commodity_title,
+      );
+      bindThumbLinks($("dlgBody"));
       bindExternalLinks($("dlgBody"));
       bindRerunButtons($("dlgBody"));
       $("detailDlg").showModal();
+    }
+
+    function pairKey(group, tag) {
+      return String(group) + "\0" + String(tag);
+    }
+
+    function pathLabel(path) {
+      if (!Array.isArray(path) || !path.length) return "";
+      return path.map((x) => String(x).trim()).filter(Boolean).join(" > ");
+    }
+
+    function s17CategoryKey(cat) {
+      const fromPath = pathLabel(cat.path);
+      if (fromPath) return fromPath;
+      return String(cat.label || "").trim();
+    }
+
+    function buildS17TakenMap() {
+      const taken = {};
+      for (const p of Object.values(pairState.pairs)) {
+        if (isWecatalogRootTag(p.group, p.tag, p)) continue;
+        if (isS17RootPath(p.path)) continue;
+        const k = pathLabel(p.path);
+        if (k) taken[k] = p;
+      }
+      return taken;
+    }
+
+    function isWecatalogRootTag(gname, tname, mapped) {
+      if (mapped && mapped.anchor_only) return true;
+      return String(gname || "").trim() === String(tname || "").trim();
+    }
+
+    function isS17RootPath(path) {
+      if (!Array.isArray(path) || !path.length) return true;
+      const segs = path.map((x) => String(x).trim()).filter(Boolean);
+      return segs.length <= 1;
+    }
+
+    function isS17RootCategory(cat) {
+      if (Array.isArray(cat.path) && cat.path.length) return isS17RootPath(cat.path);
+      const label = String(cat.label || "").trim();
+      if (!label) return true;
+      return !label.includes(">");
+    }
+
+    function isPairablePair(p) {
+      return p && !isWecatalogRootTag(p.group, p.tag, p) && !isS17RootPath(p.path);
+    }
+
+    function pairSearchNorm(q) {
+      return String(q || "").trim().toLowerCase();
+    }
+
+    function pairTextMatches(text, q) {
+      if (!q) return true;
+      return String(text || "").toLowerCase().includes(q);
+    }
+
+    function wcItemMatches(gname, tname, mapped, q) {
+      if (!q) return true;
+      if (pairTextMatches(gname, q)) return true;
+      if (pairTextMatches(tname, q)) return true;
+      if (pairTextMatches(`${gname} / ${tname}`, q)) return true;
+      if (mapped && pairTextMatches(pathLabel(mapped.path), q)) return true;
+      return false;
+    }
+
+    function s17ItemMatches(cat, label, takenBy, q) {
+      if (!q) return true;
+      if (pairTextMatches(label, q)) return true;
+      if (pairTextMatches(cat.ca_id, q)) return true;
+      if (pairTextMatches(pathLabel(cat.path), q)) return true;
+      if (takenBy) {
+        if (pairTextMatches(takenBy.group, q)) return true;
+        if (pairTextMatches(takenBy.tag, q)) return true;
+        if (pairTextMatches(`${takenBy.group} / ${takenBy.tag}`, q)) return true;
+      }
+      return false;
+    }
+
+    function wcTagIsMapped(gname, tname) {
+      return !!pairState.pairs[pairKey(gname, tname)];
+    }
+
+    /** 未配对微猫子标签排在已配对之前；同档按标签名排序。 */
+    function sortWcTagsForDisplay(gname, tags) {
+      return [...tags].sort((a, b) => {
+        const an = String(a.tagName || "").trim();
+        const bn = String(b.tagName || "").trim();
+        const aMapped = wcTagIsMapped(gname, an);
+        const bMapped = wcTagIsMapped(gname, bn);
+        if (aMapped !== bMapped) return aMapped ? 1 : -1;
+        return an.localeCompare(bn, "zh-CN");
+      });
+    }
+
+    /** 含未配对子标签的分组排在前面。 */
+    function wcGroupSortRank(gname, tags) {
+      const hasUnpaired = tags.some((t) => !wcTagIsMapped(gname, String(t.tagName || "").trim()));
+      return hasUnpaired ? 0 : 1;
+    }
+
+    /** 未占用韩文分类优先；当前选中微猫标签的配对次之；其余已占用排最后。 */
+    function s17DisplaySortRank(isTaken, isCurrentPair) {
+      if (!isTaken) return 0;
+      if (isCurrentPair) return 1;
+      return 2;
+    }
+
+    function setPairStatus(msg, isErr) {
+      const el = $("pairMapStatus");
+      el.textContent = msg || "";
+      el.className = "pair-status" + (isErr ? " err" : "");
+    }
+
+    function ingestCategoryMaps(data) {
+      pairState.meta = data;
+      pairState.wcGroups = (data.wecatalog && data.wecatalog.groups) || [];
+      pairState.s17Cats = (data.seven17 && data.seven17.categories) || [];
+      pairState.pairs = {};
+      for (const row of ((data.pairs && data.pairs.rows) || [])) {
+        if (!Array.isArray(row) || row.length < 3) continue;
+        const meta = row.length > 3 && row[3] && typeof row[3] === "object" ? row[3] : {};
+        const entry = {
+          group: String(row[0]),
+          tag: String(row[1]),
+          path: row[2],
+          anchor_only: !!meta.anchor_only,
+          tag_id: meta.tag_id,
+        };
+        if (!isPairablePair(entry)) continue;
+        pairState.pairs[pairKey(row[0], row[1])] = entry;
+      }
+    }
+
+    function renderPairMapMeta() {
+      const wc = pairState.meta && pairState.meta.wecatalog;
+      const s17 = pairState.meta && pairState.meta.seven17;
+      const pairs = pairState.meta && pairState.meta.pairs;
+      const mapped = Object.keys(pairState.pairs).length;
+      const wcTags = (pairState.wcGroups || []).reduce((n, g) => {
+        const gname = String(g.groupName || "").trim();
+        return n + (g.tags || []).filter((t) => {
+          const tname = String(t.tagName || "").trim();
+          return tname && !isWecatalogRootTag(gname, tname);
+        }).length;
+      }, 0);
+      const s17Pairable = (pairState.s17Cats || []).filter((c) => !isS17RootCategory(c)).length;
+      $("pairMapMeta").textContent =
+        `微猫 ${pairState.wcGroups.length} 组 / ${wcTags} 可配对标签 · 韩文 ${s17Pairable} 可配对 · 已配对 ${mapped} · ` +
+        `更新：微猫 ${(wc && wc.updated_at) || "—"} · 韩文 ${(s17 && s17.updated_at) || "—"} · 配对 ${(pairs && pairs.updated_at) || "—"}`;
+    }
+
+    function renderPairMapLists() {
+      const wcRoot = $("pairWcList");
+      const s17Root = $("pairS17List");
+      wcRoot.innerHTML = "";
+      s17Root.innerHTML = "";
+      const wcQ = pairSearchNorm($("pairSearchWc") && $("pairSearchWc").value);
+      const s17Q = pairSearchNorm($("pairSearchS17") && $("pairSearchS17").value);
+      const s17Taken = buildS17TakenMap();
+      const selectedPair = pairState.selectedWc
+        ? pairState.pairs[pairKey(pairState.selectedWc.group, pairState.selectedWc.tag)]
+        : null;
+      const selectedS17Key = selectedPair ? pathLabel(selectedPair.path) : null;
+      let wcVisible = 0;
+      let s17Visible = 0;
+
+      const wcGroupBlocks = [];
+      for (const g of pairState.wcGroups) {
+        const gname = String(g.groupName || "").trim();
+        if (!gname) continue;
+        const tags = sortWcTagsForDisplay(gname, (g.tags || []).filter((t) => {
+          const tname = String(t.tagName || "").trim();
+          if (!tname || isWecatalogRootTag(gname, tname)) return false;
+          const mapped = pairState.pairs[pairKey(gname, tname)];
+          return wcItemMatches(gname, tname, mapped, wcQ);
+        }));
+        if (!tags.length) continue;
+        wcGroupBlocks.push({ g, gname, tags, rank: wcGroupSortRank(gname, tags) });
+      }
+      wcGroupBlocks.sort((a, b) => {
+        if (a.rank !== b.rank) return a.rank - b.rank;
+        return a.gname.localeCompare(b.gname, "zh-CN");
+      });
+
+      for (const { gname, tags } of wcGroupBlocks) {
+        const title = document.createElement("div");
+        title.className = "pair-group-title";
+        title.textContent = gname;
+        wcRoot.appendChild(title);
+        for (const t of tags) {
+          const tname = String(t.tagName || "").trim();
+          wcVisible += 1;
+          const key = pairKey(gname, tname);
+          const mapped = pairState.pairs[key];
+          const btn = document.createElement("button");
+          btn.type = "button";
+          btn.className = "pair-item";
+          if (pairState.selectedWc && pairState.selectedWc.group === gname && pairState.selectedWc.tag === tname) {
+            btn.classList.add("selected");
+          }
+          if (mapped) btn.classList.add("mapped");
+          btn.innerHTML = esc(tname) + (mapped
+            ? `<span class="sub ok">→ ${esc(pathLabel(mapped.path))}</span>`
+            : `<span class="sub">未配对</span>`);
+          btn.addEventListener("click", () => {
+            if (mapped) {
+              delete pairState.pairs[key];
+              pairState.selectedWc = null;
+              pairState.dirty = true;
+              renderPairMapLists();
+              setPairStatus(`已清除「${gname} / ${tname}」的配对（保存后生效）`);
+              return;
+            }
+            pairState.selectedWc = { group: gname, tag: tname, tag_id: t.tagId };
+            renderPairMapLists();
+            setPairStatus(`已选微猫标签「${gname} / ${tname}」，请点击右侧未占用的韩文分类`);
+          });
+          wcRoot.appendChild(btn);
+        }
+      }
+      if (wcVisible === 0) {
+        wcRoot.innerHTML = `<div class="pair-empty">${wcQ ? "无匹配的微猫分类" : "暂无微猫分类"}</div>`;
+      }
+
+      const s17Items = [];
+      for (const cat of pairState.s17Cats) {
+        if (isS17RootCategory(cat)) continue;
+        const label = String(cat.label || pathLabel(cat.path)).trim();
+        if (!label) continue;
+        const s17Key = s17CategoryKey(cat);
+        const takenBy = s17Taken[s17Key] || s17Taken[label];
+        if (!s17ItemMatches(cat, label, takenBy, s17Q)) continue;
+        const isTaken = !!takenBy;
+        const isCurrentPair = !!(selectedS17Key && (s17Key === selectedS17Key || label === selectedS17Key));
+        s17Items.push({ cat, label, s17Key, takenBy, isTaken, isCurrentPair });
+      }
+      s17Items.sort((a, b) => {
+        const ra = s17DisplaySortRank(a.isTaken, a.isCurrentPair);
+        const rb = s17DisplaySortRank(b.isTaken, b.isCurrentPair);
+        if (ra !== rb) return ra - rb;
+        return a.label.localeCompare(b.label, "ko");
+      });
+
+      for (const { cat, label, s17Key, takenBy, isTaken, isCurrentPair } of s17Items) {
+        s17Visible += 1;
+        const btn = document.createElement("button");
+        btn.type = "button";
+        btn.className = "pair-item";
+        if (isTaken && !isCurrentPair) btn.classList.add("taken");
+        btn.innerHTML = esc(label) + `<span class="sub mono">ca_id ${esc(cat.ca_id || "—")}</span>` +
+          (isTaken && !isCurrentPair
+            ? `<span class="sub">已占用 · ${esc(takenBy.group)} / ${esc(takenBy.tag)}</span>`
+            : isCurrentPair
+              ? `<span class="sub ok">当前配对</span>`
+              : "");
+        btn.addEventListener("click", () => {
+          if (isTaken && !isCurrentPair) {
+            setPairStatus(`「${label}」已被「${takenBy.group} / ${takenBy.tag}」占用`, true);
+            return;
+          }
+          if (!pairState.selectedWc) {
+            setPairStatus("请先在左侧选择一个微猫子标签", true);
+            return;
+          }
+          if (isWecatalogRootTag(pairState.selectedWc.group, pairState.selectedWc.tag)) {
+            setPairStatus("微猫 root 分组锚点不参与配对", true);
+            return;
+          }
+          const path = Array.isArray(cat.path) && cat.path.length
+            ? cat.path.map((x) => String(x).trim()).filter(Boolean)
+            : label.split(">").map((x) => x.trim()).filter(Boolean);
+          if (isS17RootPath(path)) {
+            setPairStatus("韩文 root 一级分类不参与配对", true);
+            return;
+          }
+          const g = pairState.selectedWc.group;
+          const t = pairState.selectedWc.tag;
+          const rowMeta = {};
+          if (pairState.selectedWc.tag_id != null) rowMeta.tag_id = pairState.selectedWc.tag_id;
+          pairState.pairs[pairKey(g, t)] = {
+            group: g,
+            tag: t,
+            path,
+            tag_id: rowMeta.tag_id,
+          };
+          pairState.selectedWc = null;
+          pairState.dirty = true;
+          renderPairMapLists();
+          setPairStatus(`已配对「${g} / ${t}」→ ${pathLabel(path)}（保存后写入 JSON）`);
+        });
+        s17Root.appendChild(btn);
+      }
+      if (s17Visible === 0) {
+        s17Root.innerHTML = `<div class="pair-empty">${s17Q ? "无匹配的韩文分类" : "暂无韩文分类"}</div>`;
+      }
+      renderPairMapMeta();
+    }
+
+    async function loadCategoryMaps() {
+      setPairStatus("加载分类数据…");
+      const res = await fetch("/api/category-maps");
+      if (!res.ok) throw new Error(res.status + " " + res.statusText);
+      const data = await res.json();
+      ingestCategoryMaps(data);
+      renderPairMapLists();
+      setPairStatus("");
+    }
+
+    async function openPairMapDialog() {
+      $("pairSearchWc").value = "";
+      $("pairSearchS17").value = "";
+      $("pairMapDlg").showModal();
+      try {
+        await loadCategoryMaps();
+      } catch (e) {
+        setPairStatus("加载失败: " + e.message, true);
+      }
+    }
+
+    async function syncCategoryMapsFromUi() {
+      $("btnPairSync").disabled = true;
+      setPairStatus("正在同步微猫与韩文分类…");
+      try {
+        const res = await fetch("/api/category-maps/sync", { method: "POST" });
+        const data = await res.json();
+        if (!res.ok || data.ok === false) {
+          throw new Error((data.errors && data.errors.join("; ")) || data.error || res.statusText);
+        }
+        await loadCategoryMaps();
+        setPairStatus("分类 JSON 已更新");
+      } catch (e) {
+        setPairStatus("同步失败: " + e.message, true);
+      } finally {
+        $("btnPairSync").disabled = false;
+      }
+    }
+
+    async function savePairMapsFromUi() {
+      $("btnPairSave").disabled = true;
+      setPairStatus("保存中…");
+      try {
+        const rows = Object.values(pairState.pairs)
+          .filter(isPairablePair)
+          .map((p) => {
+          const row = [p.group, p.tag, p.path];
+          const meta = {};
+          if (p.tag_id != null) meta.tag_id = p.tag_id;
+          if (Object.keys(meta).length) row.push(meta);
+          return row;
+        });
+        const res = await fetch("/api/category-maps/pairs", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ rows }),
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) throw new Error(data.error || res.statusText);
+        pairState.dirty = false;
+        await loadCategoryMaps();
+        setPairStatus(`已保存 ${data.row_count} 条配对`);
+      } catch (e) {
+        setPairStatus("保存失败: " + e.message, true);
+      } finally {
+        $("btnPairSave").disabled = false;
+      }
+    }
+
+    function setWhitelistStatus(msg, isErr) {
+      const el = $("whitelistStatus");
+      el.textContent = msg || "";
+      el.className = "pair-status" + (isErr ? " err" : "");
+    }
+
+    function whitelistGroupTags(g) {
+      return (g.tags || []).map((t) => String(t.tagName || "").trim()).filter(Boolean);
+    }
+
+    function isGroupAllSelected(gname, tags) {
+      return tags.length > 0 && tags.every((t) => whitelistState.selected.has(pairKey(gname, t)));
+    }
+
+    function isGroupSomeSelected(gname, tags) {
+      return tags.some((t) => whitelistState.selected.has(pairKey(gname, t)));
+    }
+
+    function setGroupSelected(gname, tags, checked) {
+      for (const t of tags) {
+        const k = pairKey(gname, t);
+        if (checked) whitelistState.selected.add(k);
+        else whitelistState.selected.delete(k);
+      }
+      whitelistState.dirty = true;
+    }
+
+    function whitelistItemMatches(gname, tname, q) {
+      if (!q) return true;
+      if (pairTextMatches(gname, q)) return true;
+      if (pairTextMatches(tname, q)) return true;
+      if (pairTextMatches(`${gname} / ${tname}`, q)) return true;
+      if (pairTextMatches(`[${gname}] ${tname}`, q)) return true;
+      return false;
+    }
+
+    function renderWhitelistList() {
+      const root = $("whitelistList");
+      root.innerHTML = "";
+      const q = pairSearchNorm($("whitelistSearch") && $("whitelistSearch").value);
+      let visibleTags = 0;
+      let visibleGroups = 0;
+
+      for (const g of whitelistState.groups) {
+        const gname = String(g.groupName || "").trim();
+        if (!gname) continue;
+        const allTags = whitelistGroupTags(g);
+        const visible = allTags.filter((t) => whitelistItemMatches(gname, t, q));
+        const groupMatch = pairTextMatches(gname, q);
+        if (!visible.length && !groupMatch) continue;
+        visibleGroups += 1;
+        visibleTags += visible.length;
+
+        const block = document.createElement("div");
+        block.className = "whitelist-group";
+
+        const rootRow = document.createElement("label");
+        rootRow.className = "whitelist-row root";
+        const rootCb = document.createElement("input");
+        rootCb.type = "checkbox";
+        const allSel = isGroupAllSelected(gname, allTags);
+        const someSel = isGroupSomeSelected(gname, allTags);
+        rootCb.checked = allSel;
+        rootCb.indeterminate = !allSel && someSel;
+        rootRow.appendChild(rootCb);
+        const rootLab = document.createElement("span");
+        rootLab.className = "wl-label";
+        rootLab.textContent = `[${gname}] 全组（${allTags.length} 项）`;
+        rootRow.appendChild(rootLab);
+        rootCb.addEventListener("change", () => {
+          setGroupSelected(gname, allTags, rootCb.checked);
+          renderWhitelistList();
+          setWhitelistStatus(rootCb.checked ? `已勾选分组「${gname}」全部子类` : `已取消分组「${gname}」全部子类（保存后生效）`);
+        });
+        block.appendChild(rootRow);
+
+        const tagsToShow = visible.length ? visible : (groupMatch ? allTags : []);
+        for (const tname of tagsToShow) {
+          const row = document.createElement("label");
+          row.className = "whitelist-row child";
+          const cb = document.createElement("input");
+          cb.type = "checkbox";
+          cb.checked = whitelistState.selected.has(pairKey(gname, tname));
+          row.appendChild(cb);
+          const lab = document.createElement("span");
+          lab.className = "wl-label";
+          lab.textContent = tname;
+          row.appendChild(lab);
+          cb.addEventListener("change", () => {
+            const k = pairKey(gname, tname);
+            if (cb.checked) whitelistState.selected.add(k);
+            else whitelistState.selected.delete(k);
+            whitelistState.dirty = true;
+            renderWhitelistList();
+          });
+          block.appendChild(row);
+        }
+        root.appendChild(block);
+      }
+
+      if (visibleGroups === 0) {
+        root.innerHTML = `<div class="pair-empty">${q ? "无匹配分类" : "暂无分类"}</div>`;
+      }
+
+      const sel = whitelistState.selected.size;
+      const total = whitelistState.groups.reduce((n, g) => n + whitelistGroupTags(g).length, 0);
+      $("whitelistMeta").textContent =
+        `配置: ${whitelistState.configPath || "—"} · 已勾选 ${sel} / ${total} · 当前显示 ${visibleTags} 项` +
+        (whitelistState.dirty ? " · 有未保存更改" : "");
+    }
+
+    function ingestWhitelistData(data) {
+      whitelistState.groups = data.groups || [];
+      whitelistState.configPath = data.config_path || "";
+      whitelistState.selected = new Set();
+      for (const p of (data.selected || [])) {
+        if (!Array.isArray(p) || p.length < 2) continue;
+        whitelistState.selected.add(pairKey(p[0], p[1]));
+      }
+      whitelistState.dirty = false;
+    }
+
+    async function loadNoPriceWhitelist() {
+      setWhitelistStatus("加载中…");
+      const res = await fetch("/api/no-price-whitelist");
+      if (!res.ok) throw new Error(res.status + " " + res.statusText);
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error || "load failed");
+      ingestWhitelistData(data);
+      renderWhitelistList();
+      setWhitelistStatus("");
+    }
+
+    async function openNoPriceWhitelistDialog() {
+      $("whitelistSearch").value = "";
+      $("whitelistDlg").showModal();
+      try {
+        await loadNoPriceWhitelist();
+      } catch (e) {
+        setWhitelistStatus("加载失败: " + e.message, true);
+      }
+    }
+
+    function setWhitelistVisible(checked) {
+      const q = pairSearchNorm($("whitelistSearch").value);
+      for (const g of whitelistState.groups) {
+        const gname = String(g.groupName || "").trim();
+        if (!gname) continue;
+        const allTags = whitelistGroupTags(g);
+        for (const t of allTags) {
+          if (!whitelistItemMatches(gname, t, q) && !pairTextMatches(gname, q)) continue;
+          const k = pairKey(gname, t);
+          if (checked) whitelistState.selected.add(k);
+          else whitelistState.selected.delete(k);
+        }
+      }
+      whitelistState.dirty = true;
+      renderWhitelistList();
+    }
+
+    async function saveNoPriceWhitelistFromUi() {
+      $("btnWhitelistSave").disabled = true;
+      setWhitelistStatus("保存中…");
+      try {
+        const pairs = [...whitelistState.selected].map((k) => {
+          const i = k.indexOf("\0");
+          return [k.slice(0, i), k.slice(i + 1)];
+        });
+        const res = await fetch("/api/no-price-whitelist", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ pairs }),
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) throw new Error(data.error || res.statusText);
+        whitelistState.dirty = false;
+        await loadNoPriceWhitelist();
+        setWhitelistStatus(`已保存 ${data.selected_count} 项到 seven17.json`);
+      } catch (e) {
+        setWhitelistStatus("保存失败: " + e.message, true);
+      } finally {
+        $("btnWhitelistSave").disabled = false;
+      }
     }
 
     $("btnSearch").addEventListener("click", () => { state.page = 1; loadItems(); });
@@ -898,16 +2118,40 @@
     $("btnPrev").addEventListener("click", () => { if (state.page > 1) { state.page--; loadItems(); } });
     $("btnNext").addEventListener("click", () => { if (state.page < state.pages) { state.page++; loadItems(); } });
     $("q").addEventListener("keydown", (e) => { if (e.key === "Enter") { state.page = 1; loadItems(); } });
+    $("btnDiagnoseOpen").addEventListener("click", () => openDiagnoseDialog());
+    $("btnDiagnoseRun").addEventListener("click", () => runDiagnose());
+    $("btnDiagClose").addEventListener("click", () => $("diagDlg").close());
+    $("diagInput").addEventListener("keydown", (e) => { if (e.key === "Enter") runDiagnose(); });
     $("btnCloseDlg").addEventListener("click", () => {
       state.detailRow = null;
       $("btnCopyDetail").disabled = true;
       $("detailDlg").close();
     });
     $("btnCopyDetail").addEventListener("click", () => copyDetailToClipboard());
+    $("btnCategoryMap").addEventListener("click", () => openPairMapDialog());
+    $("btnPairClose").addEventListener("click", () => $("pairMapDlg").close());
+    $("btnPairSync").addEventListener("click", () => syncCategoryMapsFromUi());
+    $("btnPairSave").addEventListener("click", () => savePairMapsFromUi());
+    $("pairSearchWc").addEventListener("input", () => renderPairMapLists());
+    $("pairSearchS17").addEventListener("input", () => renderPairMapLists());
+    $("btnNoPriceWhitelist").addEventListener("click", () => openNoPriceWhitelistDialog());
+    $("btnWhitelistClose").addEventListener("click", () => $("whitelistDlg").close());
+    $("btnWhitelistSave").addEventListener("click", () => saveNoPriceWhitelistFromUi());
+    $("whitelistSearch").addEventListener("input", () => renderWhitelistList());
+    $("btnWhitelistAllVisible").addEventListener("click", () => {
+      setWhitelistVisible(true);
+      setWhitelistStatus("已全选当前显示项（保存后生效）");
+    });
+    $("btnWhitelistNoneVisible").addEventListener("click", () => {
+      setWhitelistVisible(false);
+      setWhitelistStatus("已取消当前显示项（保存后生效）");
+    });
 
     (async () => {
+      bindTableDragScroll($("tableWrap"));
       await loadAlbums();
       await loadItems();
+      if (location.hash === "#no-price-whitelist") openNoPriceWhitelistDialog();
     })();
   </script>
 </body>
