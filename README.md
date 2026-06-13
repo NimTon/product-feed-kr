@@ -1,7 +1,7 @@
 # product-feed-kr（精简）
 
-微猫 **wecatalog** 店铺采集 → **`wecatalog_store_products.json`** → **seven17.kr** 后台 **`itemform`** 表单上传。  
-分类 `(分组, 标签)` → 韩文路径：维护 **`product_feed_kr/wecatalog_tag_category_map.json`**（可用 **`wecatalog_tag_category_map_builder`** 生成）。
+微猫 **wecatalog** 店铺采集 → **SQLite** → **seven17.kr** 后台上架。  
+分类 `(分组, 标签)` → 韩文路径：在 **`05_查看商品库.bat`** 打开的 Web UI 中维护（`data/wecatalog_category_pairs.json` 等三个 JSON）。
 
 ## 环境
 
@@ -19,27 +19,20 @@ python -m playwright install chromium
 python -m product_feed_kr
 python -m product_feed_kr.wecatalog.wecatalog_scrape_store --store-url "..." --out data/wecatalog_store_products.json --existing-json data/wecatalog_store_products.json
 
-# 映射表生成（编辑 config/wecatalog_tag_category_map.txt 后）
-python -m product_feed_kr.wecatalog.wecatalog_tag_category_map_builder
-# 或双击 test\build_wecatalog_tag_category_map.bat
-
-# 无价格白名单 GUI（勾选 map.txt 分类并写入 SEVEN17_NO_PRICE_ALLOW_CATEGORIES）
-python -m product_feed_kr.seven17.seven17_no_price_whitelist_gui
-# 或双击 04_无价格白名单设置.bat
+# 商品库浏览（分类配对 / 无价白名单 / 不上架诊断）
+python -m product_feed_kr.pf_browser
+# 或双击 05_查看商品库.bat；无价白名单：04_无价格白名单设置.bat
 
 # 上架（默认读取 data/wecatalog_store_products.json）
 python -m product_feed_kr.seven17.seven17_upload --limit 5
 
-# 爬一次后台「商品录入」页，导出 ca_id / ca_id2 / ca_id3 下拉的 value + 文案（对照 map 里 seven17_ca_id）
+# 爬一次后台「商品录入」页，导出 ca_id 下拉选项并写入 data/seven17_path_ca_map.json
 python -m product_feed_kr.seven17.seven17_dump_itemform_categories --out data/seven17_ca_options.json
-
-# 用上面的 dump 自动写入 wecatalog_tag_category_map.json 的 meta.seven17_ca_id（路径一致即匹配）
-python -m product_feed_kr.wecatalog_tag_category_map_apply_seven17
 ```
 
 配置：复制 **`config/seven17.example.json`** → **`config/seven17.json`**（账号等）。环境变量优先于 JSON；可用 **`SEVEN17_CONFIG`** 指向其它配置文件路径。**勿将含密码的 `seven17.json` 提交到 Git。**
 
-**seven17 商品分类 `ca_id`**：仅在 **`product_feed_kr/wecatalog_tag_category_map.json`** 里对应 `(分组, 标签)` 的 **`meta.seven17_ca_id`**（与后台「기본분류」下拉的 option value 一致）；未配置则上架脚本会跳过该条并报错。抓取后台下拉对照填表：`seven17_dump_itemform_categories` → `wecatalog_tag_category_map_apply_seven17`。重新运行 **`wecatalog_tag_category_map_builder`** 时会保留已填的 `seven17_ca_id`。
+**seven17 商品分类 `ca_id`**：微猫 `(分组, 标签)` → 韩文路径（`data/wecatalog_category_pairs.json`，05 UI「分类配对」）→ `data/seven17_path_ca_map.json`（05 启动同步或 `seven17_dump_itemform_categories`）。未配对则采集/上架会跳过或报错。
 
 ### `seven17_upload`（上架）怎么用
 
@@ -91,11 +84,11 @@ python -m product_feed_kr.seven17.seven17_upload --test-store-json data/wecatalo
 **后台表单：脚本会填什么、不会填什么**
 
 - **会写入**：기본분류（`ca_id`）、상품명（`it_name`）、판매가격（`it_price`，货源无价时用 **`SEVEN17_DEFAULT_PRICE`**，默认常为 `0`）、재고수량（`it_stock_qty`）、판매여부（`it_use`）、배송비유형相关（`it_sc_type`）、PC 侧 상품설명（`it_explan`，含 CKEditor 同步）、상품이미지（`it_img1`～）。
-- **不会自动填**：기본설명、모바일 상품설명、상품요약정보/전자상거래 고시 각 항목、브랜드·원산지·옵션 등 그누보드其余字段；这些需在后台模板或后续手工补。
+- **不会自动填**：기본설명、모바일 상품설명、상품요약정보/전자상거래 고시 각 항목、브랜드·원산지·옵션等 그누보드其余字段；这些需在后台模板或后续手工补。
 
 若页面上「只剩分类像填对了」：先看 **가격是否为 0**（货源 `optimaPrice` / `priceArr` 是否为空）；再看 **상품설명** 是否在「웹에디터」里——脚本写的是 PC 설명栏，编辑器加载慢时已改为等待 CKEditor 实例后再 `setData`。
 
-Windows 核心入口：**`01_采集微猫店铺.bat`**、**`02_LLM补全上架信息.bat`**、**`03_上传韩国站正式.bat`**、**`04_无价格白名单设置.bat`**。并行三任务可用 **`test/run_scrape_llm_upload_parallel.bat`**。
+Windows 核心入口：**`01_采集微猫店铺.bat`**、**`02_LLM补全上架信息.bat`**、**`03_上传韩国站正式.bat`**、**`04_无价格白名单设置.bat`**、**`05_查看商品库.bat`**。并行三任务可用 **`test/run_scrape_llm_upload_parallel.bat`**。
 
 ## 包结构
 
@@ -110,4 +103,4 @@ Windows 核心入口：**`01_采集微猫店铺.bat`**、**`02_LLM补全上架�
 | `common/` | 配置、日志、汇率、Playwright |
 | `wego/` | commodity 解析 |
 | `tools/` | 迁移、韩元重算等维护脚本 |
-| `pf_browser/` | 商品库 Web UI |
+| `pf_browser/` | 商品库 Web UI（分类配对、白名单、诊断） |

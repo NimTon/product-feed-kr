@@ -73,7 +73,6 @@
   "WECATALOG_SCRAPE_SKIP_UNCATEGORIZED": true,
   "WECATALOG_MIN_LISTED_AT": "",
   "_wecatalog_min_listed_at_note": "最早上架阈值：年 / 年-月 / 年-月-日（CST+8 当日 0 点起）；早于该时间的商品 02 LLM / 03 上架跳过；空=不限制。01 采集从列表 time_stamp 写入 wecatalog_listed_at，并对历史空值翻页补全",
-  "WECATALOG_AUTO_APPEND_TXT": false,
   "WECATALOG_SCRAPE_RESTART_AFTER_ITEMS": 1000,
   "LISTING_LLM_RESTART_AFTER_ITEMS": 1000,
   "LISTING_LLM_ROUND_DELAY_SEC": "5",
