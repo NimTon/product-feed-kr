@@ -17,7 +17,6 @@ _MOD: dict[str, str] = {
     "product_feed_kr.wecatalog.wecatalog_scrape_store": "scrape",
     "product_feed_kr.wecatalog.wecatalog_fetch_tags": "tags",
     "product_feed_kr.seven17.seven17_path_ca_map": "pathca",
-    "product_feed_kr.wecatalog.wecatalog_tag_category_map_builder": "mapbuild",
 }
 
 

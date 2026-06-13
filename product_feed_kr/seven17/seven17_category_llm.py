@@ -15,7 +15,7 @@ from product_feed_kr.wecatalog.wecatalog_tag_mapping import resolve_category_pat
 _log = logging.getLogger("product_feed_kr.seven17.seven17_category_llm")
 
 _CATEGORY_MAP_SUGGEST_ZH = (
-    "未在 wecatalog_tag_category_map 配置韩文路径，或 seven17_path_ca_map 无对应 ca_id；"
+    "未在 data/wecatalog_category_pairs.json 配置韩文路径，或 seven17_path_ca_map 无对应 ca_id；"
     "请补全 txt 映射并重新抓取同步 path_ca_map"
 )
 
@@ -41,7 +41,7 @@ def category_map_suggest_message(
     ]
     if ca_id:
         parts.append(f"，ca_id={ca_id}")
-    parts.append("）；请补全 config/wecatalog_tag_category_map.txt 韩文路径")
+    parts.append("）；请在 05 商品库浏览「分类配对」中配置韩文路径")
     return "".join(parts)
 
 

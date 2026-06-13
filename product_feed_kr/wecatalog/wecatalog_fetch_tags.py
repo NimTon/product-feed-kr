@@ -1,7 +1,7 @@
 """拉取微猫 wecatalog 店铺「标签/分类树」（commodity/tags），写入 JSON。
 
 `wecatalog_scrape_store` 会请求同一接口，按返回的分组顺序遍历标签并拉商品详情；独立站类目路径仍由
-本地 `wecatalog_tag_category_map.json` 映射。
+本地 ``data/wecatalog_category_pairs.json`` 映射（由 05 商品库浏览维护）。
 
 匿名 HTTPS 常返回 errcode 9，需在浏览器语境下请求。若 urllib 失败，则用 Playwright 打开种子页后
 在页面内 fetch。未指定 `--seed-url` / `--item-id` 时，默认种子为

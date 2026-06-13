@@ -22,7 +22,7 @@
 
 ``WECATALOG_DETAIL_DELAY``（默认 ``5``）：未传命令行 ``--detail-delay`` 时的节流默认值；格式与 ``--detail-delay`` 相同（如 ``"3,8"`` 或 JSON 数组 ``[3, 8]``）。环境变量优先于 ``seven17.json``。
 
-``WECATALOG_SCRAPE_SKIP_UNCATEGORIZED``（默认 ``true``）：仅爬取已在 ``wecatalog_tag_category_map.txt`` 中完成分类映射的商品，未映射的标签/分组下的商品将被跳过。设为 ``false`` / ``0`` 时也爬未映射商品（有分类的仍优先处理）。命令行 ``--skip-uncategorized`` 覆盖此配置。
+``WECATALOG_SCRAPE_SKIP_UNCATEGORIZED``（默认 ``true``）：仅爬取已在 ``data/wecatalog_category_pairs.json`` 中完成分类映射的商品，未映射的标签/分组下的商品将被跳过。分类映射请在 **05_查看商品库** 的「分类配对」中维护。设为 ``false`` / ``0`` 时也爬未映射商品。
 
 日志：与上架脚本同一套格式（**`event=`** + 短模块名 **`scrape:`**）；默认 **INFO** stderr；**`--log-file`** UTF-8；**`-v`** DEBUG。**`--headed`** 有界面浏览器。
 """
@@ -54,10 +54,6 @@ from product_feed_kr.common.seven17_config import (
     getenv,
     reload_seven17_config,
     restart_after_n,
-)
-from product_feed_kr.wecatalog.wecatalog_tag_category_map_sync import (
-    init_maps_at_scrape,
-    sync_unmapped_tags_after_tags,
 )
 from product_feed_kr.wecatalog.wecatalog_popups import (
     POPUPS_ERR_COMMODITY_INVALID,
@@ -413,7 +409,6 @@ def scrape_store(
     use_list_only: bool = True,
     list_resume: bool = True,
     list_from_start: bool = False,
-    auto_append_txt: bool = True,
     checkpoint_every: int = 0,
     max_records: int = 0,
     headed: bool = False,
@@ -456,12 +451,10 @@ def scrape_store(
                 ("throttle_delay_sec_range", [delay_lo, delay_hi]),
                 ("skip_uncategorized", skip_uncategorized),
                 ("use_list_only", use_list_only),
-                ("auto_append_txt", auto_append_txt),
             ],
             zh="开始抓取微猫店铺：打开种子页并准备写 SQLite"
             + ("（列表直解析，不请求 popUps）" if use_list_only else "（逐条 popUpsInfoV2）")
-            + ("（跳过无分类商品）" if skip_uncategorized else "")
-            + ("（txt 自动补全关闭）" if not auto_append_txt else ""),
+            + ("（跳过无分类商品）" if skip_uncategorized else ""),
         ),
     )
 
@@ -483,17 +476,9 @@ def scrape_store(
         "listed_at_backfilled": 0,
         "restart_fresh": False,
         "throttle_delay_sec_range": [delay_lo, delay_hi],
-        "map_unmapped": 0,
-        "map_txt_appended": 0,
-        "path_ca_entries": None,
         "use_list_only": use_list_only,
     }
     restart_after_new = restart_after_n("WECATALOG_SCRAPE_RESTART_AFTER_ITEMS", 1000)
-
-    map_rows, path_ca_n = init_maps_at_scrape(logger)
-    stats["path_ca_entries"] = path_ca_n
-    if map_rows is not None:
-        stats["map_rows"] = map_rows
 
     conn_db = None
     records: list[dict[str, Any]] = []
@@ -565,9 +550,6 @@ def scrape_store(
                 "%s",
                 pf_kv([("event", "scrape.tags_ok"), ("groups", len(groups))], zh="分类/标签树拉取成功"),
             )
-            appended, unmapped = sync_unmapped_tags_after_tags(groups, logger, auto_append=auto_append_txt)
-            stats["map_unmapped"] = len(unmapped)
-            stats["map_txt_appended"] = appended
 
             logger.info(
                 "%s",
@@ -1254,7 +1236,6 @@ def main() -> int:
     configure_scrape_logging(log_file, verbose=args.verbose)
 
     skip_uncat = args.skip_uncategorized if args.skip_uncategorized is not None else bool_env("WECATALOG_SCRAPE_SKIP_UNCATEGORIZED", True)
-    auto_append = bool_env("WECATALOG_AUTO_APPEND_TXT", False)
     use_list_only = not args.use_popups and not bool_env("WECATALOG_SCRAPE_USE_POPUPS", False)
     max_list_pages = normalize_max_list_pages(args.max_list_pages)
     list_resume = bool_env("WECATALOG_SCRAPE_LIST_RESUME", True)
@@ -1272,7 +1253,6 @@ def main() -> int:
                 use_list_only=use_list_only,
                 list_resume=list_resume,
                 list_from_start=list_from_start,
-                auto_append_txt=auto_append,
                 checkpoint_every=max(0, args.checkpoint_every),
                 max_records=max(0, args.max_records),
                 headed=args.headed,

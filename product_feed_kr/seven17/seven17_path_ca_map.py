@@ -1,6 +1,6 @@
 """seven17 后台 itemform 分类下拉：韩文路径 label → ``ca_id`` value。
 
-与 ``wecatalog_tag_category_map``（微猫分组/标签 → 韩文路径，用户维护 txt）分离；
+与 ``data/wecatalog_category_pairs.json``（微猫分组/标签 → 韩文路径，05 商品库浏览维护）分离；
 本文件由抓取初始化或 ``seven17_dump_itemform_categories`` 写入，供上架按路径查 id。
 
 默认路径：``data/seven17_path_ca_map.json``（``SEVEN17_PATH_CA_MAP_JSON``）。

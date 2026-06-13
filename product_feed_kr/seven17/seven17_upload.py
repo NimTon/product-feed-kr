@@ -6,7 +6,7 @@
 
 必填：`SEVEN17_MB_ID`、`SEVEN17_MB_PASSWORD`。数据库：`PRODUCT_FEED_SQLITE`（默认 `data/product_feed.db`）。相册 ID：命令行 **`--album-id`**，或配置 / 环境变量 **`WECATALOG_ALBUM_ID`**（与店铺 URL 中 albumId 一致）。
 
-后台分类 **`ca_id`**：微猫 (分组, 标签) → 韩文路径（``wecatalog_tag_category_map``）→
+后台分类 **`ca_id`**：微猫 (分组, 标签) → 韩文路径（``data/wecatalog_category_pairs.json``）→
 ``data/seven17_path_ca_map.json``。爬取阶段默认跳过无分类商品；分类仅走路径映射，不用 LLM 兜底。
 
 常用可选：`SEVEN17_CONFIG`、`SEVEN17_BASE_URL`、`SEVEN17_HEADLESS`、`SEVEN17_STOCK_QTY`、
@@ -1808,7 +1808,7 @@ def _process_upload_record(
             "fail",
             {
                 "goods_id": gid,
-                "error": "无法解析 seven17 分类：请补全 wecatalog_tag_category_map 韩文路径并同步 path_ca_map",
+                "error": "无法解析 seven17 分类：请在 05 商品库浏览「分类配对」中配置韩文路径并同步 path_ca_map",
             },
         )
     _log.info(
