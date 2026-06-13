@@ -85,6 +85,8 @@ def upload_block_reason_zh(rec: dict[str, Any], code: str) -> str:
         return "商品媒体为视频（imgsSrc/imgs 无静态图），上架已跳过"
     if code == "already_uploaded":
         return "已上传"
+    if code == "listed_too_old":
+        return "微猫上架时间早于配置阈值，上架流程会跳过"
     return f"不可上传（{code}）"
 
 
