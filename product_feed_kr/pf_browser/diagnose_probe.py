@@ -7,7 +7,6 @@ import time
 from typing import Any
 from urllib.parse import urlencode
 
-from product_feed_kr.common.seven17_config import bool_env
 from product_feed_kr.db.store_sqlite import connect_sqlite, sqlite_load_store_snapshot
 from product_feed_kr.listing.listing_llm_enrich import record_is_no_price_allowed_by_map_category
 from product_feed_kr.wecatalog.wecatalog_fetch_tags import (
@@ -28,8 +27,14 @@ from product_feed_kr.wecatalog.wecatalog_scrape_fields import (
     scrape_fields_has_price_cny,
     scrape_no_price_skip_needed,
 )
-from product_feed_kr.wecatalog.wecatalog_scrape_store import FETCH_TAGS_JS, goods_page_url, list_progress_from_stats
-from product_feed_kr.wecatalog.wecatalog_tag_mapping import resolve_category_path
+from product_feed_kr.wecatalog.wecatalog_scrape_store import (
+    FETCH_TAGS_JS,
+    TAG_PROGRESS_KEY,
+    goods_page_url,
+    tag_is_done,
+    tag_progress_from_stats,
+)
+from product_feed_kr.wecatalog.wecatalog_tag_mapping import build_scrape_tag_targets, resolve_category_path
 from product_feed_kr.wego.wego_commodity import commodity_raw_media_urls, filter_image_urls
 
 _log = logging.getLogger(__name__)
@@ -122,11 +127,24 @@ def _scrape_list_progress(album_id: str) -> dict[str, Any] | None:
         stats = snap.get("stats")
         if not isinstance(stats, dict):
             return None
-        done_pages, next_ts = list_progress_from_stats(stats)
+        tp = stats.get(TAG_PROGRESS_KEY)
+        if not isinstance(tp, dict):
+            return None
+        done = sum(1 for k in tp if tag_is_done(stats, int(k)))
+        in_progress = None
+        for k, entry in tp.items():
+            if isinstance(entry, dict) and not entry.get("done"):
+                try:
+                    tid = int(k)
+                except (TypeError, ValueError):
+                    continue
+                pages, next_ts = tag_progress_from_stats(stats, tid)
+                in_progress = {"tag_id": tid, "page_num": pages, "page_next_ts": next_ts}
+                break
         return {
-            "list_page_num": done_pages or None,
-            "list_page_next_ts": next_ts,
-            "map_unmapped": stats.get("map_unmapped"),
+            "tags_done": done,
+            "tags_total": stats.get("tags_total"),
+            "tag_in_progress": in_progress,
             "list_no_price": stats.get("list_no_price"),
             "list_incomplete": stats.get("list_incomplete"),
         }
@@ -145,7 +163,9 @@ def analyze_live_scrape_blockers(
     """根据 commodity/view 实时数据推断采集阶段是否会跳过及原因。"""
     blockers: list[dict[str, str]] = []
     findings: list[dict[str, str]] = []
-    skip_uncategorized = bool_env("WECATALOG_SCRAPE_SKIP_UNCATEGORIZED", True)
+    mapped_tag_ids: set[int] = set()
+    if groups:
+        mapped_tag_ids = {t.tag_id for t in build_scrape_tag_targets(groups)}
 
     ec = popups_errcode(view_resp)
     em = popups_errmsg(view_resp)
@@ -213,12 +233,17 @@ def analyze_live_scrape_blockers(
     else:
         scrape_fields = {}
 
-    if scrape_progress and scrape_progress.get("list_page_num"):
+    if scrape_progress and scrape_progress.get("tag_in_progress"):
+        tip = scrape_progress["tag_in_progress"]
         findings.append(
             {
                 "key": "scrape_progress",
-                "label": "采集列表断点",
-                "value": f"约第 {scrape_progress['list_page_num']} 页（仅供参考，诊断不翻列表）",
+                "label": "采集标签断点",
+                "value": (
+                    f"tag_id={tip.get('tag_id')} 约第 {tip.get('page_num')} 页"
+                    f"（已完成 {scrape_progress.get('tags_done') or 0}/"
+                    f"{scrape_progress.get('tags_total') or '?'} 个标签）"
+                ),
             },
         )
 
@@ -281,9 +306,9 @@ def analyze_live_scrape_blockers(
         )
         findings.append(
             {
-                "key": "skip_uncategorized",
-                "label": "skip-uncategorized",
-                "value": "开启（未映射分类不爬）" if skip_uncategorized else "关闭",
+                "key": "scrape_mode",
+                "label": "采集模式",
+                "value": f"仅已配对标签（当前 {len(mapped_tag_ids)} 个 tag 在采集队列）",
             },
         )
 
@@ -308,22 +333,27 @@ def analyze_live_scrape_blockers(
             ctx["has_category_mapping"] = _path_valid(path)
 
             if gname and tname:
-                if skip_uncategorized and not ctx["has_category_mapping"]:
+                in_scrape_queue = tid in mapped_tag_ids
+                ctx["in_scrape_queue"] = in_scrape_queue
+                if not ctx["has_category_mapping"]:
                     if path and any(_PLACEHOLDER in str(s) for s in path):
                         detail = (
                             f"分类「{gname} / {tname}」映射为占位路径（待补全），"
-                            "开启 --skip-uncategorized 时不采集"
+                            "不在采集队列"
                         )
                     else:
                         detail = (
                             f"分类「{gname} / {tname}」在 data/wecatalog_category_pairs.json 中无匹配，"
-                            "请在 05 商品库浏览的「分类配对」中配置；"
-                            "开启 --skip-uncategorized 时不采集"
+                            "请在 05 商品库浏览的「分类配对」中配置"
                         )
                     blockers.append({"code": "unmapped_category", "detail_zh": detail})
-                    ctx["would_skip_uncategorized"] = True
-                else:
-                    ctx["would_skip_uncategorized"] = False
+                elif not in_scrape_queue:
+                    blockers.append(
+                        {
+                            "code": "tag_not_in_queue",
+                            "detail_zh": f"标签「{gname} / {tname}」未进入已配对采集队列",
+                        },
+                    )
 
                 no_price_skip = scrape_no_price_skip_needed(
                     wecatalog_group=gname,
@@ -353,7 +383,6 @@ def analyze_live_scrape_blockers(
                         },
                     )
             else:
-                ctx["would_skip_uncategorized"] = None
                 findings.append(
                     {
                         "key": f"tag_unknown_{tid}",
@@ -364,7 +393,7 @@ def analyze_live_scrape_blockers(
             tag_contexts.append(ctx)
 
     primary = blockers[0]["detail_zh"] if blockers else (
-        "commodity/view 数据正常，未发现采集硬性阻塞；若仍未入库，可能采集列表尚未翻到该商品"
+        "commodity/view 数据正常，未发现采集硬性阻塞；若仍未入库，可能该商品所在标签尚未爬完或不在已配对标签队列"
     )
 
     thumb: str | None = None

@@ -1,10 +1,11 @@
-"""微猫 wecatalog 店铺：``commodity/tags`` + ``album/personal/all`` 列表直解析 → SQLite。
+"""微猫 wecatalog 店铺：``commodity/tags`` + 按已配对标签 ``album/personal/all?tagId=`` 列表 → SQLite。
 
-默认 **不** 逐条请求 ``popUpsInfoV2``（列表项已含 title / optimaPrice / formats / colors / imgsSrc）。
-``--use-popups`` 或 ``WECATALOG_SCRAPE_USE_POPUPS=true`` 可恢复旧逻辑。
+仅爬取 ``data/wecatalog_category_pairs.json`` 中已完成韩文路径配对的标签（05 商品库「分类配对」维护），
+**不**再扫全店 ``album/personal/all``。每个标签独立翻页，断点按 ``tag_id`` 保存在 ``stats.tag_progress``。
 
 列表项缺 title/图 → ``pf_scrape_skip``（``list_incomplete``）；无价且分类不在白名单 → ``list_no_price``；库内已有 ``goods_id`` 跳过。
-``--detail-delay`` 节流作用于 **相邻两次微猫 API**（tags、列表翻页）；列表模式下不对每条商品休眠。
+列表项已含 title / optimaPrice / formats / colors / imgsSrc，**不**请求 ``popUpsInfoV2``。
+``--detail-delay`` 节流作用于 **相邻两次微猫 API**（tags、各标签列表翻页）。
 
 示例::
 
@@ -12,19 +13,13 @@
     --store-url \"https://www.wecatalog.cn/weshop/store/{albumId}\" \\
     --detail-delay 5
 
-  python -m product_feed_kr.wecatalog.wecatalog_scrape_store \\
-    --store-url \"https://www.wecatalog.cn/weshop/store/{albumId}\" \\
-    --detail-delay 3,8
-
 可选配置 ``PRODUCT_FEED_SQLITE``：SQLite 文件路径（默认 ``data/product_feed.db``）。
 
-``WECATALOG_SCRAPE_RESTART_AFTER_ITEMS``（默认 1000）：本 run 新增写入 SQLite 达 N 条后退出码 **75**，供外层 bat 立即重跑以刷新进程与配置；0 关闭。
+``WECATALOG_SCRAPE_RESTART_AFTER_ITEMS``（默认 1000）：本 run 新增写入 SQLite 达 N 条后退出码 **75**。
 
-``WECATALOG_DETAIL_DELAY``（默认 ``5``）：未传命令行 ``--detail-delay`` 时的节流默认值；格式与 ``--detail-delay`` 相同（如 ``"3,8"`` 或 JSON 数组 ``[3, 8]``）。环境变量优先于 ``seven17.json``。
+``WECATALOG_DETAIL_DELAY``（默认 ``5``）：未传 ``--detail-delay`` 时的节流默认值。
 
-``WECATALOG_SCRAPE_SKIP_UNCATEGORIZED``（默认 ``true``）：仅爬取已在 ``data/wecatalog_category_pairs.json`` 中完成分类映射的商品，未映射的标签/分组下的商品将被跳过。分类映射请在 **05_查看商品库** 的「分类配对」中维护。设为 ``false`` / ``0`` 时也爬未映射商品。
-
-日志：与上架脚本同一套格式（**`event=`** + 短模块名 **`scrape:`**）；默认 **INFO** stderr；**`--log-file`** UTF-8；**`-v`** DEBUG。**`--headed`** 有界面浏览器。
+日志：``event=`` + ``scrape:``；``--log-file`` UTF-8；``-v`` DEBUG；``--headed`` 有界面浏览器。
 """
 
 from __future__ import annotations
@@ -55,22 +50,16 @@ from product_feed_kr.common.seven17_config import (
     reload_seven17_config,
     restart_after_n,
 )
-from product_feed_kr.wecatalog.wecatalog_popups import (
-    POPUPS_ERR_COMMODITY_INVALID,
-    POPUPS_ERR_LOGIN_EXPIRED,
-    popups_errcode,
-    popups_errmsg,
-    popups_response_ready,
-    popups_scrape_skip_reason,
-)
 from product_feed_kr.wecatalog.wecatalog_scrape_fields import (
     attach_scrape_fields_to_record,
     fields_from_list_item,
-    fields_from_popups_response,
     list_item_scrape_ready,
     scrape_no_price_skip_needed,
 )
-from product_feed_kr.wecatalog.wecatalog_tag_mapping import resolve_category_path
+from product_feed_kr.wecatalog.wecatalog_tag_mapping import (
+    build_scrape_tag_targets,
+    scrape_targets_empty_diagnostic,
+)
 from product_feed_kr.common.pf_cli_loop import run_forever
 from product_feed_kr.common.pf_log import configure_scrape_logging, pf_kv, pf_store_row_id_kv
 from product_feed_kr.common.process_singleton import EXIT_SINGLETON_CONFLICT, single_instance_lock
@@ -141,15 +130,12 @@ class InterRequestGap:
         self._n += 1
 
 
-FETCH_LIST_JS = """
-async ({ albumId, pageTimestamp }) => {
-  let url;
-  if (pageTimestamp == null) {
-    url = `https://www.wecatalog.cn/album/personal/all?&albumId=${encodeURIComponent(albumId)}`
-      + `&startDate=&endDate=&requestDataType=`;
-  } else {
-    url = `https://www.wecatalog.cn/album/personal/all?&albumId=${encodeURIComponent(albumId)}`
-      + `&startDate=&endDate=&slipType=1&timestamp=${pageTimestamp}&requestDataType=`;
+FETCH_TAG_LIST_JS = """
+async ({ albumId, tagId, pageTimestamp }) => {
+  let url = `https://www.wecatalog.cn/album/personal/all?albumId=${encodeURIComponent(albumId)}`
+    + `&tagId=${encodeURIComponent(tagId)}&startDate=&endDate=&requestDataType=`;
+  if (pageTimestamp != null) {
+    url += `&slipType=1&timestamp=${pageTimestamp}`;
   }
   const r = await fetch(url, {
     method: "POST",
@@ -167,22 +153,6 @@ async ({ albumId, pageTimestamp }) => {
 FETCH_TAGS_JS = """
 async (apiUrl) => {
   const r = await fetch(apiUrl, { credentials: "include" });
-  return await r.json();
-}
-"""
-
-FETCH_POPUPS_JS = """
-async ({ sellerAlbumId, commodityId }) => {
-  const qs = new URLSearchParams({
-    sellerAlbumId,
-    commodityId,
-    popUpsType: "individualShopping",
-  });
-  const u = "https://www.wecatalog.cn/newOrder/api/v1/shoppingCart/popUpsInfoV2?" + qs.toString();
-  const r = await fetch(u, {
-    credentials: "include",
-    headers: { Accept: "application/json, text/plain, */*" },
-  });
   return await r.json();
 }
 """
@@ -205,17 +175,6 @@ def goods_page_url(album_id: str, goods_id: str) -> str:
     return f"https://www.wecatalog.cn/weshop/goods/{album_id}/{goods_id}"
 
 
-def _tag_ids_on_item(item: dict[str, Any]) -> set[int]:
-    out: set[int] = set()
-    for t in item.get("tags") or []:
-        if isinstance(t, dict) and t.get("tagId") is not None:
-            try:
-                out.add(int(t["tagId"]))
-            except (TypeError, ValueError):
-                continue
-    return out
-
-
 def normalize_max_list_pages(raw: int | None) -> int:
     """``<= 0``（含 ``-1``）不限页数；正数为最大翻页次数。"""
     if raw is None or raw <= 0:
@@ -223,22 +182,34 @@ def normalize_max_list_pages(raw: int | None) -> int:
     return int(raw)
 
 
-LIST_PAGE_NUM_KEY = "list_page_num"
-LIST_PAGE_NEXT_TS_KEY = "list_page_next_ts"
+TAG_PROGRESS_KEY = "tag_progress"
+TAG_PAGE_NUM_KEY = "page_num"
+TAG_PAGE_NEXT_TS_KEY = "page_next_ts"
+TAG_DONE_KEY = "done"
 
 
-def list_progress_from_stats(stats: dict[str, Any] | None) -> tuple[int, int | None]:
-    """从 ``pf_store_info.stats_json`` 读取列表翻页断点（已完成的页码、下一页 timestamp）。"""
+def _tag_progress_map(stats: dict[str, Any] | None) -> dict[str, Any]:
     if not isinstance(stats, dict):
-        return 0, None
+        return {}
+    raw = stats.get(TAG_PROGRESS_KEY)
+    return raw if isinstance(raw, dict) else {}
+
+
+def tag_progress_entry(stats: dict[str, Any] | None, tag_id: int) -> dict[str, Any]:
+    entry = _tag_progress_map(stats).get(str(tag_id))
+    return entry if isinstance(entry, dict) else {}
+
+
+def tag_progress_from_stats(stats: dict[str, Any] | None, tag_id: int) -> tuple[int, int | None]:
+    entry = tag_progress_entry(stats, tag_id)
     page_num = 0
-    raw_num = stats.get(LIST_PAGE_NUM_KEY)
+    raw_num = entry.get(TAG_PAGE_NUM_KEY)
     if raw_num is not None:
         try:
             page_num = max(0, int(raw_num))
         except (TypeError, ValueError):
             page_num = 0
-    raw_ts = stats.get(LIST_PAGE_NEXT_TS_KEY)
+    raw_ts = entry.get(TAG_PAGE_NEXT_TS_KEY)
     if raw_ts is None:
         return page_num, None
     try:
@@ -247,40 +218,50 @@ def list_progress_from_stats(stats: dict[str, Any] | None) -> tuple[int, int | N
         return page_num, None
 
 
-def update_list_progress_in_stats(stats: dict[str, Any], *, page_num: int, raw_page: dict[str, Any]) -> None:
-    """本页处理完后更新断点；列表正常结束时清除 ``list_page_next_ts``。"""
-    stats[LIST_PAGE_NUM_KEY] = int(page_num)
+def tag_is_done(stats: dict[str, Any] | None, tag_id: int) -> bool:
+    return bool(tag_progress_entry(stats, tag_id).get(TAG_DONE_KEY))
+
+
+def update_tag_progress_in_stats(
+    stats: dict[str, Any],
+    *,
+    tag_id: int,
+    page_num: int,
+    raw_page: dict[str, Any],
+) -> None:
+    tp = stats.setdefault(TAG_PROGRESS_KEY, {})
+    entry: dict[str, Any] = dict(tp.get(str(tag_id)) or {})
+    entry[TAG_PAGE_NUM_KEY] = int(page_num)
     result = raw_page.get("result") if isinstance(raw_page.get("result"), dict) else {}
     pag = result.get("pagination") if isinstance(result.get("pagination"), dict) else {}
     next_ts = pag.get("pageTimestamp")
     if pag.get("isLoadMore") and next_ts is not None:
         try:
-            stats[LIST_PAGE_NEXT_TS_KEY] = int(next_ts)
+            entry[TAG_PAGE_NEXT_TS_KEY] = int(next_ts)
         except (TypeError, ValueError):
-            stats.pop(LIST_PAGE_NEXT_TS_KEY, None)
+            entry.pop(TAG_PAGE_NEXT_TS_KEY, None)
+        entry.pop(TAG_DONE_KEY, None)
     else:
-        stats.pop(LIST_PAGE_NEXT_TS_KEY, None)
+        entry[TAG_DONE_KEY] = True
+        entry.pop(TAG_PAGE_NEXT_TS_KEY, None)
+    tp[str(tag_id)] = entry
 
 
-def clear_list_progress_in_stats(stats: dict[str, Any]) -> None:
-    stats.pop(LIST_PAGE_NUM_KEY, None)
-    stats.pop(LIST_PAGE_NEXT_TS_KEY, None)
+def clear_all_tag_progress(stats: dict[str, Any]) -> None:
+    stats.pop(TAG_PROGRESS_KEY, None)
 
 
-def iter_album_list_pages(
+def iter_tag_list_pages(
     page,
     album_id: str,
+    tag_id: int,
     *,
     max_pages: int,
     gap: InterRequestGap,
     resume_page_ts: int | None = None,
     resume_pages: int = 0,
 ):
-    """逐页请求 album/personal/all；每页 yield (本页新增去重 items, 原始响应, 当前页码 1-based)。
-
-    ``max_pages <= 0`` 时不限页数，直到 ``isLoadMore=false`` 或列表为空/异常。
-    ``resume_page_ts`` 非空时从该 ``pageTimestamp`` 继续（断点续拉）。
-    """
+    """逐页请求 ``album/personal/all?tagId=``；每页 yield (items, 原始响应, 页码 1-based)。"""
     seen: set[str] = set()
     ts: int | None = resume_page_ts
     pages = max(0, int(resume_pages))
@@ -290,11 +271,12 @@ def iter_album_list_pages(
             "%s",
             pf_kv(
                 [
-                    ("event", "scrape.list.resume"),
-                    ("list_page_num", pages),
-                    ("list_page_next_ts", resume_page_ts),
+                    ("event", "scrape.tag_list.resume"),
+                    ("tag_id", tag_id),
+                    ("page_num", pages),
+                    ("page_next_ts", resume_page_ts),
                 ],
-                zh=f"从列表翻页断点继续（已完成 {pages} 页，下一请求 timestamp={resume_page_ts}）",
+                zh=f"标签 {tag_id} 从翻页断点继续（已完成 {pages} 页）",
             ),
         )
     while True:
@@ -303,27 +285,32 @@ def iter_album_list_pages(
                 "%s",
                 pf_kv(
                     [
-                        ("event", "scrape.list.page_limit"),
+                        ("event", "scrape.tag_list.page_limit"),
+                        ("tag_id", tag_id),
                         ("page", pages),
                         ("max_pages", max_pages),
                     ],
-                    zh=f"已达列表翻页上限 {max_pages} 页，停止继续请求",
+                    zh=f"标签 {tag_id} 已达翻页上限 {max_pages} 页",
                 ),
             )
             break
-        gap.before(f"album/personal/all 列表第 {pages + 1} 页")
-        raw = page.evaluate(FETCH_LIST_JS, {"albumId": album_id, "pageTimestamp": ts})
+        gap.before(f"tagId={tag_id} 列表第 {pages + 1} 页")
+        raw = page.evaluate(
+            FETCH_TAG_LIST_JS,
+            {"albumId": album_id, "tagId": tag_id, "pageTimestamp": ts},
+        )
         pages += 1
         if not isinstance(raw, dict) or raw.get("errcode") not in (0, None):
             logger.warning(
                 "%s",
                 pf_kv(
                     [
-                        ("event", "scrape.list.bad_response"),
+                        ("event", "scrape.tag_list.bad_response"),
+                        ("tag_id", tag_id),
                         ("page", pages),
                         ("errcode", raw.get("errcode") if isinstance(raw, dict) else None),
                     ],
-                    zh="店铺列表接口返回异常或非成功 errcode，停止翻页",
+                    zh=f"标签 {tag_id} 列表接口异常，停止翻页",
                 ),
             )
             break
@@ -332,8 +319,8 @@ def iter_album_list_pages(
             logger.warning(
                 "%s",
                 pf_kv(
-                    [("event", "scrape.list.no_result"), ("page", pages)],
-                    zh="列表响应里没有 result 对象",
+                    [("event", "scrape.tag_list.no_result"), ("tag_id", tag_id), ("page", pages)],
+                    zh=f"标签 {tag_id} 响应缺少 result",
                 ),
             )
             break
@@ -342,13 +329,13 @@ def iter_album_list_pages(
             logger.info(
                 "%s",
                 pf_kv(
-                    [("event", "scrape.list.empty_items"), ("page", pages)],
-                    zh="本页商品列表为空，列表遍历结束",
+                    [("event", "scrape.tag_list.empty"), ("tag_id", tag_id), ("page", pages)],
+                    zh=f"标签 {tag_id} 本页无商品，列表结束",
                 ),
             )
             break
 
-        page_new_items: list[dict[str, Any]] = []
+        page_items: list[dict[str, Any]] = []
         page_new = 0
         for it in items:
             if not isinstance(it, dict):
@@ -361,7 +348,7 @@ def iter_album_list_pages(
             )
             if isinstance(gid, str) and gid and gid not in seen:
                 seen.add(gid)
-                page_new_items.append(it)
+                page_items.append(it)
                 page_new += 1
 
         pag = result.get("pagination") if isinstance(result.get("pagination"), dict) else {}
@@ -369,7 +356,8 @@ def iter_album_list_pages(
             "%s",
             pf_kv(
                 [
-                    ("event", "scrape.list.page"),
+                    ("event", "scrape.tag_list.page"),
+                    ("tag_id", tag_id),
                     ("page", pages),
                     ("max_pages", max_pages if not unlimited else -1),
                     ("items", len(items)),
@@ -377,16 +365,19 @@ def iter_album_list_pages(
                     ("seen", len(seen)),
                     ("isLoadMore", pag.get("isLoadMore")),
                 ],
-                zh="已拉取一页店铺列表并统计本页新增/累计去重",
+                zh=f"标签 {tag_id} 已拉取第 {pages} 页",
             ),
         )
 
-        yield page_new_items, raw, pages
+        yield page_items, raw, pages
 
         if not pag.get("isLoadMore"):
             logger.info(
                 "%s",
-                pf_kv([("event", "scrape.list.no_more"), ("isLoadMore", 0)], zh="分页标记无更多页，列表结束"),
+                pf_kv(
+                    [("event", "scrape.tag_list.no_more"), ("tag_id", tag_id)],
+                    zh=f"标签 {tag_id} 无更多页",
+                ),
             )
             break
         next_ts = pag.get("pageTimestamp")
@@ -405,10 +396,8 @@ def scrape_store(
     detail_delay_range: tuple[float, float] = (5.0, 5.0),
     max_list_pages: int = -1,
     skip_detail: bool = False,
-    skip_uncategorized: bool = False,
-    use_list_only: bool = True,
-    list_resume: bool = True,
-    list_from_start: bool = False,
+    tag_resume: bool = True,
+    tags_from_start: bool = False,
     checkpoint_every: int = 0,
     max_records: int = 0,
     headed: bool = False,
@@ -449,22 +438,17 @@ def scrape_store(
                 ("seed", seed),
                 ("sqlite", str(sqlite_db_path())),
                 ("throttle_delay_sec_range", [delay_lo, delay_hi]),
-                ("skip_uncategorized", skip_uncategorized),
-                ("use_list_only", use_list_only),
             ],
-            zh="开始抓取微猫店铺：打开种子页并准备写 SQLite"
-            + ("（列表直解析，不请求 popUps）" if use_list_only else "（逐条 popUpsInfoV2）")
-            + ("（跳过无分类商品）" if skip_uncategorized else ""),
+            zh="开始抓取微猫店铺：按已配对标签拉列表",
         ),
     )
 
     stats = {
         "album_id": album_id,
-        "list_pages": 0,
+        "tags_total": 0,
+        "tags_done": 0,
+        "tag_list_pages": 0,
         "list_items_unique": 0,
-        "popups_ok": 0,
-        "popups_err": 0,
-        "popups_expired": 0,
         "list_ok": 0,
         "list_incomplete": 0,
         "list_no_price": 0,
@@ -476,7 +460,6 @@ def scrape_store(
         "listed_at_backfilled": 0,
         "restart_fresh": False,
         "throttle_delay_sec_range": [delay_lo, delay_hi],
-        "use_list_only": use_list_only,
     }
     restart_after_new = restart_after_n("WECATALOG_SCRAPE_RESTART_AFTER_ITEMS", 1000)
 
@@ -508,21 +491,14 @@ def scrape_store(
 
         stats["records_prior"] = rows_prior
 
-        resume_page_ts: int | None = None
-        resume_pages = 0
-        if list_resume and not list_from_start:
+        if tag_resume and not tags_from_start:
             snap = sqlite_load_store_snapshot(conn_db, album_id)
-            prior_stats = snap.get("stats") if isinstance(snap, dict) else None
-            done_pages, next_ts = list_progress_from_stats(
-                prior_stats if isinstance(prior_stats, dict) else None,
-            )
-            if next_ts is not None:
-                resume_page_ts = next_ts
-                resume_pages = done_pages
-                stats[LIST_PAGE_NUM_KEY] = done_pages
-                stats[LIST_PAGE_NEXT_TS_KEY] = next_ts
-            elif isinstance(prior_stats, dict) and LIST_PAGE_NUM_KEY in prior_stats:
-                stats[LIST_PAGE_NUM_KEY] = prior_stats.get(LIST_PAGE_NUM_KEY)
+            raw_stats = snap.get("stats") if isinstance(snap, dict) else None
+            if isinstance(raw_stats, dict):
+                stats[TAG_PROGRESS_KEY] = dict(_tag_progress_map(raw_stats))
+
+        if tags_from_start:
+            clear_all_tag_progress(stats)
 
         p = sync_playwright().start()
         browser = _launch_browser(p, headless=not headed)
@@ -546,27 +522,30 @@ def scrape_store(
             if not isinstance(result, dict):
                 raise RuntimeError("tags 响应缺少 result")
             groups = build_group_tree(result)
+            targets = build_scrape_tag_targets(groups)
+            if not targets:
+                raise RuntimeError(scrape_targets_empty_diagnostic(groups))
+            stats["tags_total"] = len(targets)
             logger.info(
                 "%s",
-                pf_kv([("event", "scrape.tags_ok"), ("groups", len(groups))], zh="分类/标签树拉取成功"),
+                pf_kv(
+                    [("event", "scrape.tags_ok"), ("groups", len(groups)), ("targets", len(targets))],
+                    zh=f"分类树已拉取，将按 {len(targets)} 个已配对标签逐类翻页",
+                ),
             )
 
             logger.info(
                 "%s",
                 pf_kv(
                     [
-                        ("event", "scrape.list.begin"),
+                        ("event", "scrape.tag_list.begin"),
+                        ("targets", len(targets)),
                         ("max_list_pages", max_list_pages),
-                        ("list_resume", list_resume and not list_from_start),
-                        ("list_page_num", resume_pages or None),
-                        ("list_page_next_ts", resume_page_ts),
+                        ("tag_resume", tag_resume and not tags_from_start),
                     ],
-                    zh="开始按页遍历店铺商品列表"
-                    + ("（从断点续拉）" if resume_page_ts is not None else ""),
+                    zh="开始按标签遍历商品列表",
                 ),
             )
-            seen_popups: dict[str, dict[str, Any] | None] = {}
-
             def write_checkpoint(*, meta_only: bool = False) -> None:
                 meta_extra = {
                     "saved_at": now_cst8_iso(),
@@ -611,7 +590,7 @@ def scrape_store(
                     "写库：店铺元信息（尚无新商品）"
                     if meta_only
                     else (
-                        "写库：店铺进度 + 本 run 已抓到 popUps 的商品"
+                        "写库：店铺进度 + 本 run 新商品"
                         if written > 0 and not_ready == 0
                         else (
                             f"写库：内存 {len(records)} 条，"
@@ -637,7 +616,6 @@ def scrape_store(
             )
 
             new_appended = 0
-            popups_fetch_n = 0
             log_every = 50
             krw_per_cny_page: float | None = None
 
@@ -649,7 +627,7 @@ def scrape_store(
                 shop_path: tuple[str, ...] | None,
             ) -> bool:
                 """写入一条分组×标签×商品；返回 False 表示已达 max_records 应停止整次抓取。"""
-                nonlocal new_appended, popups_fetch_n
+                nonlocal new_appended
                 gid = (
                     it.get("goods_id")
                     or it.get("selfGoodsId")
@@ -670,7 +648,7 @@ def scrape_store(
                                     ("total", stats["skipped_blacklist"]),
                                     ("goods_id", gid),
                                 ],
-                                zh="跳过 pf_scrape_skip 中已失效 goods_id（不请求 popUps）",
+                                zh="跳过 pf_scrape_skip 中已失效 goods_id",
                             ),
                         )
                     return True
@@ -685,7 +663,7 @@ def scrape_store(
                                     ("event", "scrape.skip_existing"),
                                     ("total", stats["skipped_existing"]),
                                 ],
-                                zh="跳过库内已有 goods_id（不抓 popUps、不写库）",
+                                zh="跳过库内已有 goods_id",
                             ),
                         )
                     return True
@@ -693,151 +671,32 @@ def scrape_store(
                 if skip_detail:
                     return True
 
-                scrape_fields: dict[str, Any] | None = None
-                pop_resp: dict[str, Any] | None = None
-
-                if use_list_only:
-                    scrape_fields = fields_from_list_item(it)
-                    if not list_item_scrape_ready(it, scrape_fields):
-                        stats["list_incomplete"] += 1
-                        skip_ids_prior.add(gid)
-                        skip_ids_blacklist.add(gid)
-                        g_url = goods_page_url(album_id, gid)
-                        if conn_db is not None:
-                            sqlite_record_scrape_skip(
-                                conn_db,
-                                album_id,
-                                gid,
-                                reason="list_incomplete",
-                                goods_url=g_url,
-                            )
-                        if stats["list_incomplete"] in (1, 50, 200) or stats["list_incomplete"] % 1000 == 0:
-                            logger.info(
-                                "%s",
-                                pf_kv(
-                                    [
-                                        ("event", "scrape.list.skip_incomplete"),
-                                        ("total", stats["list_incomplete"]),
-                                        ("goods_id", gid),
-                                    ],
-                                    zh="列表项缺 title/图，已记入 pf_scrape_skip（不请求 popUps）",
-                                ),
-                            )
-                        return True
-                elif gid in seen_popups:
-                    cached_pop = seen_popups[gid]
-                    if isinstance(cached_pop, dict):
-                        pop_resp = cached_pop
-                        if popups_response_ready(cached_pop):
-                            scrape_fields = fields_from_popups_response(cached_pop)
-                            logger.debug(
-                                "%s",
-                                pf_kv(
-                                    [("event", "scrape.popups.cache"), ("goods_id", gid)],
-                                    zh="popUpsInfoV2：复用本 run 已拉过的缓存",
-                                ),
-                            )
-                else:
-                    popups_fetch_n += 1
-                    gap.before(
-                        f"popUpsInfoV2 #{popups_fetch_n} goods_id={gid}",
-                    )
-                    logger.debug(
-                        "%s",
-                        pf_kv(
-                            [
-                                ("event", "scrape.popups.request"),
-                                ("n", popups_fetch_n),
-                                ("goods_id", gid),
-                            ],
-                            zh="正在请求 popUpsInfoV2",
-                        ),
-                    )
-                    p_raw = page.evaluate(
-                        FETCH_POPUPS_JS,
-                        {"sellerAlbumId": album_id, "commodityId": gid},
-                    )
-                    pop_resp = p_raw if isinstance(p_raw, dict) else {"error": str(p_raw)}
-                    seen_popups[gid] = pop_resp
-                    if popups_response_ready(pop_resp):
-                        scrape_fields = fields_from_popups_response(pop_resp)
-                        stats["popups_ok"] += 1
-                    else:
-                        stats["popups_err"] += 1
-
-                if not use_list_only and scrape_fields is None:
-                    ec = popups_errcode(pop_resp)
-                    em = popups_errmsg(pop_resp)
-                    if ec == POPUPS_ERR_COMMODITY_INVALID:
-                        stats["popups_expired"] += 1
-                        skip_ids_prior.add(gid)
-                        skip_ids_blacklist.add(gid)
-                        g_url = goods_page_url(album_id, gid)
-                        skip_reason = popups_scrape_skip_reason(pop_resp, errcode=ec)
-                        if skip_reason and conn_db is not None:
-                            sqlite_record_scrape_skip(
-                                conn_db,
-                                album_id,
-                                gid,
-                                reason=skip_reason,
-                                errcode=ec,
-                                errmsg=em,
-                                goods_url=g_url,
-                            )
+                scrape_fields = fields_from_list_item(it)
+                if not list_item_scrape_ready(it, scrape_fields):
+                    stats["list_incomplete"] += 1
+                    skip_ids_prior.add(gid)
+                    skip_ids_blacklist.add(gid)
+                    g_url = goods_page_url(album_id, gid)
+                    if conn_db is not None:
+                        sqlite_record_scrape_skip(
+                            conn_db,
+                            album_id,
+                            gid,
+                            reason="list_incomplete",
+                            goods_url=g_url,
+                        )
+                    if stats["list_incomplete"] in (1, 50, 200) or stats["list_incomplete"] % 1000 == 0:
                         logger.info(
                             "%s",
                             pf_kv(
                                 [
-                                    ("event", "scrape.popups.skip_invalid"),
+                                    ("event", "scrape.list.skip_incomplete"),
+                                    ("total", stats["list_incomplete"]),
                                     ("goods_id", gid),
-                                    ("goods_url", g_url),
-                                    ("errcode", ec),
-                                    ("errmsg", em or None),
                                 ],
-                                zh=f"popUpsInfoV2：商品已失效，已记入 pf_scrape_skip goods_url={g_url}",
+                                zh="列表项缺 title/图，已记入 pf_scrape_skip",
                             ),
                         )
-                    elif ec == POPUPS_ERR_LOGIN_EXPIRED:
-                        logger.warning(
-                            "%s",
-                            pf_kv(
-                                [
-                                    ("event", "scrape.popups.login_expired"),
-                                    ("goods_id", gid),
-                                    ("errcode", ec),
-                                    ("errmsg", em or None),
-                                ],
-                                zh="popUpsInfoV2：登录已过期，请用 --headed 在浏览器内登录微猫后重试",
-                            ),
-                        )
-                    else:
-                        logger.warning(
-                            "%s",
-                            pf_kv(
-                                [
-                                    ("event", "scrape.popups.err"),
-                                    ("goods_id", gid),
-                                    ("errcode", ec),
-                                    ("errmsg", em or None),
-                                ],
-                                zh="popUpsInfoV2 未返回商品数据"
-                                + (f"：{em}" if em else ""),
-                            ),
-                        )
-                    return True
-
-                if not str(scrape_fields.get("commodity_title") or "").strip():
-                    logger.warning(
-                        "%s",
-                        pf_kv(
-                            [
-                                ("event", "scrape.popups.no_title"),
-                                ("goods_id", gid),
-                                ("goods_url", goods_page_url(album_id, gid)),
-                            ],
-                            zh="popUpsInfoV2 成功但无商品标题（commodityName/title 均为空），跳过入库",
-                        ),
-                    )
                     return True
 
                 if scrape_no_price_skip_needed(
@@ -873,8 +732,7 @@ def scrape_store(
                         )
                     return True
 
-                if use_list_only:
-                    stats["list_ok"] += 1
+                stats["list_ok"] += 1
 
                 rec = {
                     "wecatalog_group": gname,
@@ -947,158 +805,162 @@ def scrape_store(
                 return True
 
             stop_run = False
-            skipped_uncategorized = 0
-            for new_items, _raw_pg, page_num in iter_album_list_pages(
-                page,
-                album_id,
-                max_pages=max_list_pages,
-                gap=gap,
-                resume_page_ts=resume_page_ts,
-                resume_pages=resume_pages,
-            ):
-                resume_page_ts = None
-                stats["list_pages"] = page_num
-                stats["list_items_unique"] += len(new_items)
-                if isinstance(_raw_pg, dict):
-                    update_list_progress_in_stats(stats, page_num=page_num, raw_page=_raw_pg)
-                from product_feed_kr.common.cny_krw_rate import resolve_krw_per_cny
+            for target in targets:
+                if stop_run:
+                    break
+                if tag_resume and not tags_from_start and tag_is_done(stats, target.tag_id):
+                    stats["tags_done"] += 1
+                    continue
 
-                krw_per_cny_page = None
-                stats["fx_source"] = None
-                try:
-                    krw_per_cny_page, fx_src = resolve_krw_per_cny()
-                    stats["krw_per_cny"] = krw_per_cny_page
-                    stats["fx_source"] = fx_src
-                    logger.info(
-                        "%s",
-                        pf_kv(
-                            [
-                                ("event", "scrape.fx"),
-                                ("page", page_num),
-                                ("krw_per_cny", round(krw_per_cny_page, 4)),
-                                ("fx_source", fx_src),
-                            ],
-                            zh="本页抓取使用 CNY→KRW 汇率（韩元价在入库时按千韩元取整）",
-                        ),
-                    )
-                except Exception as e:
-                    logger.warning(
-                        "%s",
-                        pf_kv(
-                            [
-                                ("event", "scrape.fx.err"),
-                                ("page", page_num),
-                                ("err", str(e)[:300]),
-                            ],
-                            zh="本页无法获取汇率，商品仍将写入人民币价，韩元价留空",
-                        ),
-                    )
-
-                if need_backfill_listed_at and conn_db is not None:
-                    from product_feed_kr.wecatalog.wecatalog_listed_at import (
-                        wecatalog_listed_at_iso_from_list_item,
-                    )
-
-                    backfill_updates: dict[str, str] = {}
-                    for it in new_items:
-                        if not isinstance(it, dict):
-                            continue
-                        gid = (
-                            it.get("goods_id")
-                            or it.get("selfGoodsId")
-                            or it.get("parent_goods_id")
-                            or ""
-                        )
-                        if not isinstance(gid, str) or not gid or gid not in need_backfill_listed_at:
-                            continue
-                        listed_iso = wecatalog_listed_at_iso_from_list_item(it)
-                        if listed_iso:
-                            backfill_updates[gid] = listed_iso
-                    if backfill_updates:
-                        n_bf = sqlite_backfill_wecatalog_listed_at(
-                            conn_db,
-                            album_id,
-                            backfill_updates,
-                        )
-                        stats["listed_at_backfilled"] += n_bf
-                        for gid in backfill_updates:
-                            need_backfill_listed_at.discard(gid)
-                        if n_bf and (
-                            stats["listed_at_backfilled"] <= n_bf
-                            or stats["listed_at_backfilled"] % 500 == 0
-                        ):
-                            logger.info(
-                                "%s",
-                                pf_kv(
-                                    [
-                                        ("event", "scrape.listed_at.backfill"),
-                                        ("page", page_num),
-                                        ("goods_id", len(backfill_updates)),
-                                        ("rows", n_bf),
-                                        ("remaining", len(need_backfill_listed_at)),
-                                    ],
-                                    zh="列表翻页补全微猫上架时间",
-                                ),
-                            )
-
-                def _iter_groups_tags(*, categorized_only: bool) -> None:
-                    """遍历 groups×tags 处理 new_items；categorized_only=True 时只处理有分类的。"""
-                    nonlocal stop_run, skipped_uncategorized
-                    for g in groups:
-                        if stop_run:
-                            break
-                        gname = str(g.get("groupName") or "").strip()
-                        raw_tags = g.get("tags") or []
-                        if not isinstance(raw_tags, list):
-                            continue
-                        for t in raw_tags:
-                            if stop_run:
-                                break
-                            if not isinstance(t, dict):
-                                continue
-                            tid = t.get("tagId")
-                            tname = str(t.get("tagName") or "").strip()
-                            if tid is None or not tname:
-                                continue
-                            try:
-                                tid_int = int(tid)
-                            except (TypeError, ValueError):
-                                continue
-                            shop_path = resolve_category_path(gname, tname)
-                            has_category = shop_path is not None and all(
-                                "（待补全）" not in seg for seg in shop_path
-                            )
-                            if categorized_only and not has_category:
-                                continue
-                            if not categorized_only and has_category:
-                                continue
-                            for it in new_items:
-                                if tid_int not in _tag_ids_on_item(it):
-                                    continue
-                                if not has_category:
-                                    skipped_uncategorized += 1
-                                if not append_product_row(it, gname, tname, tid_int, shop_path):
-                                    stop_run = True
-                                    break
-                            if stop_run:
-                                break
-
-                _iter_groups_tags(categorized_only=True)
-                if not stop_run and not skip_uncategorized:
-                    _iter_groups_tags(categorized_only=False)
+                resume_pages, resume_page_ts = (0, None)
+                if tag_resume and not tags_from_start:
+                    resume_pages, resume_page_ts = tag_progress_from_stats(stats, target.tag_id)
 
                 logger.info(
                     "%s",
                     pf_kv(
                         [
-                            ("event", "scrape.list.page_done"),
-                            ("page", page_num),
-                            ("page_items", len(new_items)),
-                            ("list_unique", stats["list_items_unique"]),
-                            ("records", len(records)),
-                            ("uncategorized_items", skipped_uncategorized if skipped_uncategorized else None),
+                            ("event", "scrape.tag.begin"),
+                            ("tag_id", target.tag_id),
+                            ("group", target.group_name),
+                            ("tag", target.tag_name),
+                            ("page_num", resume_pages or None),
+                            ("page_next_ts", resume_page_ts),
                         ],
-                        zh="本列表页处理完并已 checkpoint",
+                        zh=f"开始爬取标签「{target.group_name} / {target.tag_name}」",
+                    ),
+                )
+
+                tag_had_pages = False
+                for new_items, _raw_pg, page_num in iter_tag_list_pages(
+                    page,
+                    album_id,
+                    target.tag_id,
+                    max_pages=max_list_pages,
+                    gap=gap,
+                    resume_page_ts=resume_page_ts,
+                    resume_pages=resume_pages,
+                ):
+                    tag_had_pages = True
+                    resume_page_ts = None
+                    stats["tag_list_pages"] += 1
+                    stats["list_items_unique"] += len(new_items)
+                    if isinstance(_raw_pg, dict):
+                        update_tag_progress_in_stats(
+                            stats,
+                            tag_id=target.tag_id,
+                            page_num=page_num,
+                            raw_page=_raw_pg,
+                        )
+                    from product_feed_kr.common.cny_krw_rate import resolve_krw_per_cny
+
+                    krw_per_cny_page = None
+                    stats["fx_source"] = None
+                    try:
+                        krw_per_cny_page, fx_src = resolve_krw_per_cny()
+                        stats["krw_per_cny"] = krw_per_cny_page
+                        stats["fx_source"] = fx_src
+                        logger.info(
+                            "%s",
+                            pf_kv(
+                                [
+                                    ("event", "scrape.fx"),
+                                    ("tag_id", target.tag_id),
+                                    ("page", page_num),
+                                    ("krw_per_cny", round(krw_per_cny_page, 4)),
+                                    ("fx_source", fx_src),
+                                ],
+                                zh="本页抓取使用 CNY→KRW 汇率",
+                            ),
+                        )
+                    except Exception as e:
+                        logger.warning(
+                            "%s",
+                            pf_kv(
+                                [
+                                    ("event", "scrape.fx.err"),
+                                    ("tag_id", target.tag_id),
+                                    ("page", page_num),
+                                    ("err", str(e)[:300]),
+                                ],
+                                zh="本页无法获取汇率，韩元价留空",
+                            ),
+                        )
+
+                    if need_backfill_listed_at and conn_db is not None:
+                        from product_feed_kr.wecatalog.wecatalog_listed_at import (
+                            wecatalog_listed_at_iso_from_list_item,
+                        )
+
+                        backfill_updates: dict[str, str] = {}
+                        for it in new_items:
+                            if not isinstance(it, dict):
+                                continue
+                            gid = (
+                                it.get("goods_id")
+                                or it.get("selfGoodsId")
+                                or it.get("parent_goods_id")
+                                or ""
+                            )
+                            if not isinstance(gid, str) or not gid or gid not in need_backfill_listed_at:
+                                continue
+                            listed_iso = wecatalog_listed_at_iso_from_list_item(it)
+                            if listed_iso:
+                                backfill_updates[gid] = listed_iso
+                        if backfill_updates:
+                            n_bf = sqlite_backfill_wecatalog_listed_at(
+                                conn_db,
+                                album_id,
+                                backfill_updates,
+                            )
+                            stats["listed_at_backfilled"] += n_bf
+                            for gid in backfill_updates:
+                                need_backfill_listed_at.discard(gid)
+
+                    for it in new_items:
+                        if not append_product_row(
+                            it,
+                            target.group_name,
+                            target.tag_name,
+                            target.tag_id,
+                            target.shop_path,
+                        ):
+                            stop_run = True
+                            break
+
+                    logger.info(
+                        "%s",
+                        pf_kv(
+                            [
+                                ("event", "scrape.tag_list.page_done"),
+                                ("tag_id", target.tag_id),
+                                ("page", page_num),
+                                ("page_items", len(new_items)),
+                                ("records", len(records)),
+                            ],
+                            zh=f"标签 {target.tag_id} 第 {page_num} 页处理完成",
+                        ),
+                    )
+                    write_checkpoint()
+                    if stop_run:
+                        break
+
+                if not stop_run and not tag_had_pages:
+                    tp = stats.setdefault(TAG_PROGRESS_KEY, {})
+                    tp[str(target.tag_id)] = {TAG_DONE_KEY: True, TAG_PAGE_NUM_KEY: 0}
+                if not stop_run and tag_is_done(stats, target.tag_id):
+                    stats["tags_done"] += 1
+                logger.info(
+                    "%s",
+                    pf_kv(
+                        [
+                            ("event", "scrape.tag.done"),
+                            ("tag_id", target.tag_id),
+                            ("group", target.group_name),
+                            ("tag", target.tag_name),
+                            ("done", tag_is_done(stats, target.tag_id)),
+                        ],
+                        zh=f"标签「{target.group_name} / {target.tag_name}」遍历结束",
                     ),
                 )
                 write_checkpoint()
@@ -1107,7 +969,6 @@ def scrape_store(
 
             stats["records"] = len(records)
             stats["records_new"] = new_appended
-            stats["skipped_uncategorized"] = skipped_uncategorized
             write_checkpoint()
             logger.info(
                 "%s",
@@ -1118,18 +979,14 @@ def scrape_store(
                         ("new", stats["records_new"]),
                         ("skipped", stats["skipped_existing"]),
                         ("skipped_blacklist", stats["skipped_blacklist"] or None),
-                        ("skipped_uncategorized", skipped_uncategorized),
-                        ("skip_uncategorized_enabled", skip_uncategorized),
-                        ("use_list_only", use_list_only),
+                        ("tags_total", stats["tags_total"]),
+                        ("tags_done", stats["tags_done"]),
                         ("list_ok", stats["list_ok"] or None),
                         ("list_incomplete", stats["list_incomplete"] or None),
                         ("list_no_price", stats["list_no_price"] or None),
-                        ("popups_ok", stats["popups_ok"] or None),
-                        ("popups_err", stats["popups_err"] or None),
-                        ("popups_expired", stats["popups_expired"] or None),
                         ("album_id", album_id),
                     ],
-                    zh="店铺抓取流程正常结束",
+                    zh="按标签抓取流程正常结束",
                 ),
             )
         finally:
@@ -1154,7 +1011,7 @@ def main() -> int:
             max_list_pages_default = normalize_max_list_pages(int(max_pages_cfg))
         except ValueError:
             pass
-    ap = argparse.ArgumentParser(description="wecatalog 店铺：tags + 列表 → SQLite（默认列表直解析）")
+    ap = argparse.ArgumentParser(description="wecatalog 店铺：按已配对标签拉列表 → SQLite")
     ap.add_argument(
         "--store-url",
         default="https://www.wecatalog.cn/weshop/store/_ddYqfVQW6mlRb5szWI5ni6txeRsQ5rZ3_QFVHeg",
@@ -1172,17 +1029,12 @@ def main() -> int:
         "--max-list-pages",
         type=int,
         default=max_list_pages_default,
-        help="列表翻页上限（每页约 32 条）；-1 或 0 不限，直到 isLoadMore=false",
+        help="每个标签列表翻页上限（每页约 32 条）；-1 或 0 不限，直到 isLoadMore=false",
     )
     ap.add_argument(
         "--skip-detail",
         action="store_true",
-        help="只拉列表匹配分类，不写入商品详情",
-    )
-    ap.add_argument(
-        "--use-popups",
-        action="store_true",
-        help="恢复旧逻辑：逐条请求 popUpsInfoV2（默认仅用 album/personal/all 列表字段）",
+        help="只拉列表，不写入商品",
     )
     ap.add_argument(
         "--checkpoint-every",
@@ -1197,15 +1049,9 @@ def main() -> int:
         help="本Run最多新增多少条「分组×标签×商品」记录（0 不限）；不含库内已有 goods_id",
     )
     ap.add_argument(
-        "--skip-uncategorized",
+        "--tags-from-start",
         action="store_true",
-        default=None,
-        help="跳过未映射分类的商品（仅爬有分类的）；未传时读 WECATALOG_SCRAPE_SKIP_UNCATEGORIZED 配置",
-    )
-    ap.add_argument(
-        "--list-from-start",
-        action="store_true",
-        help="忽略库内列表翻页断点，从第 1 页重新遍历",
+        help="忽略各标签翻页断点，从第一个已配对标签重新遍历",
     )
     ap.add_argument(
         "--log-file",
@@ -1235,11 +1081,9 @@ def main() -> int:
         log_file = REPO_ROOT / "data" / "wecatalog_scrape_store.log"
     configure_scrape_logging(log_file, verbose=args.verbose)
 
-    skip_uncat = args.skip_uncategorized if args.skip_uncategorized is not None else bool_env("WECATALOG_SCRAPE_SKIP_UNCATEGORIZED", True)
-    use_list_only = not args.use_popups and not bool_env("WECATALOG_SCRAPE_USE_POPUPS", False)
     max_list_pages = normalize_max_list_pages(args.max_list_pages)
-    list_resume = bool_env("WECATALOG_SCRAPE_LIST_RESUME", True)
-    list_from_start = args.list_from_start or bool_env("WECATALOG_SCRAPE_LIST_FROM_START", False)
+    tag_resume = bool_env("WECATALOG_SCRAPE_TAG_RESUME", True)
+    tags_from_start = args.tags_from_start or bool_env("WECATALOG_SCRAPE_TAGS_FROM_START", False)
 
     def _run_once() -> int:
         try:
@@ -1249,10 +1093,8 @@ def main() -> int:
                 detail_delay_range=(d_lo, d_hi),
                 max_list_pages=max_list_pages,
                 skip_detail=args.skip_detail,
-                skip_uncategorized=skip_uncat,
-                use_list_only=use_list_only,
-                list_resume=list_resume,
-                list_from_start=list_from_start,
+                tag_resume=tag_resume,
+                tags_from_start=tags_from_start,
                 checkpoint_every=max(0, args.checkpoint_every),
                 max_records=max(0, args.max_records),
                 headed=args.headed,

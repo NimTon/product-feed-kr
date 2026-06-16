@@ -16,11 +16,21 @@ import json
 import re
 from functools import lru_cache
 from pathlib import Path
-from typing import Any
+from typing import Any, NamedTuple
 
 _SEP = "\x00"
 _GROUP_PREFIX = re.compile(r"^\d+\s*,\s*(.+)$")
 _WS_COLLAPSE = re.compile(r"\s+")
+_PATH_PLACEHOLDER = "（待补全）"
+
+
+class ScrapeTagTarget(NamedTuple):
+    """已配对分类的爬取目标（按 commodity/tags 顺序）。"""
+
+    group_name: str
+    tag_name: str
+    tag_id: int
+    shop_path: tuple[str, ...]
 
 
 def _collapse_ws(text: str) -> str:
@@ -175,6 +185,169 @@ def leaf_mapping_rows() -> tuple[tuple[str, str, tuple[str, ...]], ...]:
 def leaf_match_specs() -> tuple[tuple[str, str, tuple[str, ...], int | None], ...]:
     """非锚点映射，供爬虫对齐列表标签：(group, tag, shop_path, tag_id_or_none)。"""
     return tuple((g, t, p, tid) for g, t, p, a, tid in _load_rows() if not a)
+
+
+def _path_mapping_complete(path: tuple[str, ...]) -> bool:
+    return bool(path) and all(_PATH_PLACEHOLDER not in str(seg) for seg in path)
+
+
+def _resolve_tag_id_for_pair(
+    group_name: str,
+    tag_name: str,
+    *,
+    meta_tag_id: int | None,
+    groups: list[dict[str, Any]] | None,
+) -> int | None:
+    if meta_tag_id is not None:
+        return meta_tag_id
+    if not groups:
+        return None
+    t_fold = _tag_loose_key(tag_name)
+    query_g_loose = _group_loose_key(group_name)
+    for g in groups:
+        if not isinstance(g, dict):
+            continue
+        gname = str(g.get("groupName") or "").strip()
+        if _group_loose_key(gname) != query_g_loose and not any(
+            _group_loose_key(gk) == query_g_loose for gk in _group_keys(group_name)
+        ):
+            continue
+        for t in g.get("tags") or []:
+            if not isinstance(t, dict):
+                continue
+            tname = str(t.get("tagName") or "").strip()
+            if _tag_loose_key(tname) != t_fold:
+                continue
+            tid = t.get("tagId")
+            if tid is None:
+                continue
+            try:
+                return int(tid)
+            except (TypeError, ValueError):
+                return None
+    return None
+
+
+def scrape_targets_empty_diagnostic(groups: list[dict[str, Any]] | None = None) -> str:
+    """``build_scrape_tag_targets`` 为空时的可操作说明。"""
+    path = _map_path()
+    if not path.is_file():
+        return (
+            f"配对文件不存在：{path}\n"
+            "请先运行 05_查看商品库.bat →「分类配对」，将微猫标签映射到韩文路径并保存。"
+        )
+
+    rows = leaf_match_specs()
+    if not rows:
+        return (
+            f"配对文件 {path} 中没有任何可爬取的映射行（可能仅有 anchor_only 或文件为空）。\n"
+            "请在 05 商品库「分类配对」中至少保存一条「分组 + 标签 → 韩文路径」。"
+        )
+
+    incomplete: list[str] = []
+    complete_rows: list[tuple[str, str, tuple[str, ...], int | None]] = []
+    for g, t, p, tid in rows:
+        if _path_mapping_complete(p):
+            complete_rows.append((g, t, p, tid))
+        else:
+            incomplete.append(f"{g}/{t}")
+
+    if not complete_rows:
+        sample = "、".join(incomplete[:5])
+        more = f" 等共 {len(incomplete)} 条" if len(incomplete) > 5 else ""
+        return (
+            f"配对文件 {path} 有 {len(rows)} 条映射，但韩文路径均含「{_PATH_PLACEHOLDER}」或未填全。\n"
+            f"待补全示例：{sample}{more}\n"
+            "请在 05 商品库补全韩文路径后再采集。"
+        )
+
+    unresolved: list[str] = []
+    for g, t, p, tid in complete_rows:
+        if _resolve_tag_id_for_pair(g, t, meta_tag_id=tid, groups=groups) is None:
+            unresolved.append(f"{g}/{t}")
+
+    if unresolved:
+        sample = "、".join(unresolved[:5])
+        more = f" 等共 {len(unresolved)} 条" if len(unresolved) > 5 else ""
+        api_tags = 0
+        if groups:
+            for g in groups:
+                if isinstance(g, dict):
+                    api_tags += len(g.get("tags") or [])
+        return (
+            f"配对文件 {path} 有 {len(complete_rows)} 条完整映射，但 {len(unresolved)} 条无法解析微猫 tagId。\n"
+            f"无法解析：{sample}{more}\n"
+            "请先在 05 启动一次（同步微猫分类），或检查分组/标签名是否与店铺一致。"
+            + (f"（当前 commodity/tags 共 {api_tags} 个标签）" if api_tags else "")
+        )
+
+    return (
+        f"配对文件 {path} 看似正常（{len(complete_rows)} 条完整映射），"
+        "但与 commodity/tags 分组树未能对齐。请确认 05 已同步微猫分类且分组名一致。"
+    )
+
+
+def build_scrape_tag_targets(groups: list[dict[str, Any]] | None = None) -> tuple[ScrapeTagTarget, ...]:
+    """已配对且路径完整的标签，顺序与 ``commodity/tags`` 分组树一致。"""
+    spec_by_pair: dict[tuple[str, str], tuple[str, str, tuple[str, ...], int | None]] = {}
+    spec_by_tag_id: dict[int, tuple[str, str, tuple[str, ...], int | None]] = {}
+    for g, t, path, tid in leaf_match_specs():
+        if not _path_mapping_complete(path):
+            continue
+        entry = (g, t, path, tid)
+        for gk in _group_keys(g):
+            spec_by_pair[(_group_loose_key(gk), _tag_loose_key(t))] = entry
+        if tid is not None:
+            spec_by_tag_id[int(tid)] = entry
+
+    if not spec_by_pair:
+        return ()
+
+    out: list[ScrapeTagTarget] = []
+    seen_ids: set[int] = set()
+
+    def _append(gname: str, tname: str, path: tuple[str, ...], tid_meta: int | None) -> None:
+        tid = _resolve_tag_id_for_pair(gname, tname, meta_tag_id=tid_meta, groups=groups)
+        if tid is None or tid in seen_ids:
+            return
+        seen_ids.add(tid)
+        out.append(ScrapeTagTarget(gname, tname, tid, path))
+
+    if groups:
+        for g in groups:
+            if not isinstance(g, dict):
+                continue
+            gname_raw = str(g.get("groupName") or "").strip()
+            g_loose = _group_loose_key(gname_raw)
+            raw_tags = g.get("tags") or []
+            if not isinstance(raw_tags, list):
+                continue
+            for t in raw_tags:
+                if not isinstance(t, dict):
+                    continue
+                tname_raw = str(t.get("tagName") or "").strip()
+                if not tname_raw:
+                    continue
+                spec = spec_by_pair.get((g_loose, _tag_loose_key(tname_raw)))
+                if spec is None:
+                    try:
+                        api_tid = int(t.get("tagId"))
+                    except (TypeError, ValueError):
+                        api_tid = None
+                    if api_tid is not None:
+                        spec = spec_by_tag_id.get(api_tid)
+                if spec is None:
+                    continue
+                g_disp, t_disp, path, tid_meta = spec
+                _append(g_disp, t_disp, path, tid_meta)
+        if out:
+            return tuple(out)
+
+    for g, t, path, tid in leaf_match_specs():
+        if not _path_mapping_complete(path):
+            continue
+        _append(g, t, path, tid)
+    return tuple(out)
 
 
 def invalidate_mapping_cache() -> None:

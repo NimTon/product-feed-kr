@@ -21,7 +21,7 @@ echo [parallel] Each window loops until you close it or press Ctrl+C.
 echo.
 
 rem First quoted arg to start is window title; /d sets child working directory
-start "wecatalog-scrape" /d "%~dp0\.." cmd /k call "%~dp0..\01_采集微猫店铺.bat" --resume
+start "wecatalog-scrape" /d "%~dp0\.." cmd /k call "%~dp0..\01_采集微猫店铺.bat"
 start "listing-llm" /d "%~dp0\.." cmd /k call "%~dp0..\02_LLM补全上架信息.bat"
 start "seven17-upload" /d "%~dp0\.." cmd /k call "%~dp0..\03_上传韩国站正式.bat"
 

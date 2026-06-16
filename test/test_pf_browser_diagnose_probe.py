@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 from product_feed_kr.pf_browser.diagnose_probe import analyze_live_scrape_blockers
+from product_feed_kr.wecatalog.wecatalog_tag_mapping import ScrapeTagTarget
 
 
 def _groups() -> list[dict]:
@@ -20,8 +21,10 @@ def _view_resp(com: dict) -> dict:
 
 def test_analyze_no_price_not_whitelist(monkeypatch) -> None:
     monkeypatch.setattr(
-        "product_feed_kr.pf_browser.diagnose_probe.bool_env",
-        lambda key, default=False: True if key == "WECATALOG_SCRAPE_SKIP_UNCATEGORIZED" else default,
+        "product_feed_kr.pf_browser.diagnose_probe.build_scrape_tag_targets",
+        lambda _groups: (
+            ScrapeTagTarget("1,男性服装", "톰브라운Thom Browne", 90066248, ("의류", "남성의류", "톰 브라운")),
+        ),
     )
     monkeypatch.setattr(
         "product_feed_kr.pf_browser.diagnose_probe.record_is_no_price_allowed_by_map_category",
@@ -70,8 +73,8 @@ def test_analyze_video_only() -> None:
 
 def test_analyze_unmapped_category(monkeypatch) -> None:
     monkeypatch.setattr(
-        "product_feed_kr.pf_browser.diagnose_probe.bool_env",
-        lambda key, default=False: key == "WECATALOG_SCRAPE_SKIP_UNCATEGORIZED",
+        "product_feed_kr.pf_browser.diagnose_probe.build_scrape_tag_targets",
+        lambda _groups: (),
     )
     monkeypatch.setattr(
         "product_feed_kr.pf_browser.diagnose_probe.resolve_category_path",

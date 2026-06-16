@@ -126,8 +126,8 @@ def _not_scraped_conclusion_zh(
 ) -> str:
     parts = [
         "该商品尚未写入商品库（pf_store_item）。",
-        "常见原因：① 所在微猫分类未在 data/wecatalog_category_pairs.json 中配对，且采集开启了 --skip-uncategorized；",
-        "② 列表翻页尚未遍历到该商品；③ 尚未对该店铺执行采集。",
+        "常见原因：① 所在微猫分类未在 data/wecatalog_category_pairs.json 中配对（未配对标签不会进入采集队列）；",
+        "② 该标签列表尚未爬完；③ 尚未对该店铺执行采集。",
     ]
     if album_id:
         parts.append(f"可确认店铺 album_id={album_id} 是否已运行 01_采集微猫店铺。")

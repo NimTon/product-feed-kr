@@ -1,17 +1,20 @@
-"""列表翻页断点（pf_store_info.stats_json）。"""
+"""按标签列表翻页断点（pf_store_info.stats_json.tag_progress）。"""
 
 from __future__ import annotations
 
 from product_feed_kr.wecatalog.wecatalog_scrape_store import (
-    LIST_PAGE_NEXT_TS_KEY,
-    LIST_PAGE_NUM_KEY,
-    clear_list_progress_in_stats,
-    list_progress_from_stats,
-    update_list_progress_in_stats,
+    TAG_DONE_KEY,
+    TAG_PAGE_NEXT_TS_KEY,
+    TAG_PAGE_NUM_KEY,
+    TAG_PROGRESS_KEY,
+    clear_all_tag_progress,
+    tag_is_done,
+    tag_progress_from_stats,
+    update_tag_progress_in_stats,
 )
 
 
-def test_list_progress_roundtrip():
+def test_tag_progress_roundtrip():
     stats: dict = {}
     raw = {
         "result": {
@@ -21,24 +24,29 @@ def test_list_progress_roundtrip():
             }
         }
     }
-    update_list_progress_in_stats(stats, page_num=42, raw_page=raw)
-    assert stats[LIST_PAGE_NUM_KEY] == 42
-    assert stats[LIST_PAGE_NEXT_TS_KEY] == 1779422753729
-    num, ts = list_progress_from_stats(stats)
-    assert num == 42
+    update_tag_progress_in_stats(stats, tag_id=90066248, page_num=3, raw_page=raw)
+    tp = stats[TAG_PROGRESS_KEY]["90066248"]
+    assert tp[TAG_PAGE_NUM_KEY] == 3
+    assert tp[TAG_PAGE_NEXT_TS_KEY] == 1779422753729
+    num, ts = tag_progress_from_stats(stats, 90066248)
+    assert num == 3
     assert ts == 1779422753729
+    assert not tag_is_done(stats, 90066248)
 
 
-def test_list_progress_clears_when_no_more():
-    stats = {LIST_PAGE_NUM_KEY: 100, LIST_PAGE_NEXT_TS_KEY: 999}
+def test_tag_progress_marks_done_when_no_more():
+    stats: dict = {}
     raw = {"result": {"pagination": {"isLoadMore": False, "pageTimestamp": 888}}}
-    update_list_progress_in_stats(stats, page_num=100, raw_page=raw)
-    assert stats[LIST_PAGE_NUM_KEY] == 100
-    assert LIST_PAGE_NEXT_TS_KEY not in stats
-    assert list_progress_from_stats(stats) == (100, None)
+    update_tag_progress_in_stats(stats, tag_id=123, page_num=10, raw_page=raw)
+    entry = stats[TAG_PROGRESS_KEY]["123"]
+    assert entry[TAG_PAGE_NUM_KEY] == 10
+    assert TAG_PAGE_NEXT_TS_KEY not in entry
+    assert entry[TAG_DONE_KEY] is True
+    assert tag_is_done(stats, 123)
+    assert tag_progress_from_stats(stats, 123) == (10, None)
 
 
-def test_clear_list_progress():
-    stats = {LIST_PAGE_NUM_KEY: 5, LIST_PAGE_NEXT_TS_KEY: 1}
-    clear_list_progress_in_stats(stats)
+def test_clear_all_tag_progress():
+    stats = {TAG_PROGRESS_KEY: {"1": {TAG_PAGE_NUM_KEY: 5}}}
+    clear_all_tag_progress(stats)
     assert stats == {}

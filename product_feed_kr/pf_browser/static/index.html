@@ -1330,8 +1330,9 @@
         for (const t of tags) {
           const label = `${t.wecatalog_group || "?"}/${t.wecatalog_tag || "?"}`;
           const bits = [];
-          if (t.has_category_mapping) bits.push("已映射");
-          else if (t.would_skip_uncategorized) bits.push("未映射→跳过");
+          if (t.in_scrape_queue) bits.push("在采集队列");
+          else if (!t.has_category_mapping) bits.push("未配对");
+          else bits.push("未入采集队列");
           if (t.no_price_skip) bits.push("无价非白名单→跳过");
           else if (t.no_price_whitelist) bits.push("无价白名单");
           const path = Array.isArray(t.shop_category_path) ? t.shop_category_path.join(" > ") : "";

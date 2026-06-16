@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 from product_feed_kr.wecatalog.wecatalog_tag_mapping import (
+    invalidate_mapping_cache,
     normalize_wecatalog_group_name,
     resolve_category_path,
+    scrape_targets_empty_diagnostic,
 )
 
 
@@ -29,3 +31,16 @@ def test_resolve_category_path_tag_extra_spaces() -> None:
 
 def test_normalize_wecatalog_group_name() -> None:
     assert normalize_wecatalog_group_name("14,NIKE 专区") == "NIKE 专区"
+
+
+def test_scrape_targets_empty_diagnostic_missing_file(tmp_path, monkeypatch) -> None:
+    missing = tmp_path / "pairs.json"
+    monkeypatch.setattr(
+        "product_feed_kr.wecatalog.wecatalog_tag_mapping._map_path",
+        lambda: missing,
+    )
+    invalidate_mapping_cache()
+    msg = scrape_targets_empty_diagnostic(None)
+    assert "不存在" in msg
+    assert str(missing) in msg
+    invalidate_mapping_cache()
