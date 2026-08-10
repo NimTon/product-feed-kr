@@ -241,7 +241,7 @@ _SYSTEM_LISTING_BASE = """你是电商上架信息翻译与纠错助手。只输
 - desc_zh：中文描述（2~5 句，可轻润色）
 - desc_ko：韩文描述（基于 desc_zh 翻译，不增信息）
 - **货号/款号/型号数字**：``name_zh``、``name_ko``、``desc_zh``、``desc_ko`` 中**不要**写入商品货号、款号、SKU、纯数字型号或「型号为 12345」「790038 款」等数字编号；只写款式/材质/用途等可读文案
-- size_spec_kind：有 ``attr_map.尺码`` 时**必填**：``footwear``（鞋靴/运动鞋等，中文尺码用欧码 32–50，系统将把韩文尺码转为毫米脚长）或 ``apparel``（服装等，中文尺码用 S/M/L/XL）
+- size_spec_kind：有 ``attr_map.尺码`` 时**必填**：``footwear``（鞋靴：成人欧码 32–50，或**儿童鞋**韩版 mm 160–225）或 ``apparel``（服装：S/M/L/XL 或童装身高 cm 区间）
 {attr_spec_lines}
 **禁止**输出 `attr_map_ko.사이즈`（韩文尺码由系统根据 ``size_spec_kind`` 与中文尺码自动生成）
 
@@ -249,10 +249,12 @@ _SYSTEM_LISTING_BASE = """你是电商上架信息翻译与纠错助手。只输
 
 | 类型 | 常见错误 | 应纠正为（仅 attr_map.尺码） |
 |------|----------|------------------------------|
+| 服装 | 童装身高序号 ``1``~``7`` 或 ``90~100`` 等 cm 区间 | 保留身高区间 ``90~100`` ``100~105`` … ``140~145``（勿展开为 S/M/L） |
 | 服装 | 数字档 ``0``~``4`` 未展开 | ``S`` ``M`` ``L`` ``XL`` ``XXL``（0=S,1=M,2=L,3=XL,4=XXL） |
 | 服装 | 连写 ``01234``、``1234`` | 拆成 ``["S","M","L","XL","XXL"]`` 等 |
 | 服装 | 区间 ``0-4``、``0~4`` | 展开为多个字母码，勿保留区间字符串 |
-| 鞋靴 | 写成 S/M/L 或数字档 ``0`` ``1`` | 改为欧码 ``35`` ``36`` ``40`` ``40.5`` 等（32–50） |
+| 鞋靴 | 儿童鞋韩版 mm ``160``~``225``（步长 5） | 原样保留 mm 数字，``size_spec_kind=footwear``；区间 ``160-200`` 展开为 ``160,165,…`` |
+| 鞋靴 | 写成 S/M/L 或数字档 ``0`` ``1`` | 改为欧码 ``35`` ``36`` ``40`` ``40.5`` 等（32–50，**成人鞋**） |
 | 鞋靴 | 区间 ``38-41`` | 展开为 ``38,39,40,41`` |
 | 通用 | 重复、乱序、与标题不符 | 去重、从小到大；不确定的删除 |
 
@@ -262,7 +264,7 @@ _SYSTEM_LISTING_BASE = """你是电商上架信息翻译与纠错助手。只输
 - 同一数字若既出现在现货段又出现在定做段，**以定做标注为准剔除**
 - 无法从原文高置信确认现货码时：**不要**输出 ``attr_map.尺码``，勿用定做码或连续脑补码凑全
 
-鞋靴中文尺码用**欧码数字**；服装用 **S/M/L/XL…**。不要输出毫米、不要改韩文 사이즈。
+鞋靴：**成人**用欧码 32–50（系统转 mm 脚长）；**儿童鞋**用韩版 mm ``160,165,170,…,225``（直接写数字，勿写成 S/M/L）。服装用 **S/M/L/XL…** 或童装**身高 cm 区间**（如 ``90~100``）。不要改韩文 사이즈。
 
 {color_policy_block}
 对已整理且合理的中文尺码优先保留；{size_fill_rule}"""
@@ -524,7 +526,7 @@ def apply_listing_size_fix_from_zh(
         zh_list = [str(x).strip() for x in zh_raw if str(x).strip()]
         if title:
             zh_list = filter_listing_sizes_for_title(zh_list, title)
-        zh_fixed = fix_scrape_sizes(zh_list)
+        zh_fixed = fix_scrape_sizes(zh_list, title=title)
         am["尺码"] = zh_fixed
         payload["attr_map"] = am
         if listing_llm_wants_shoe_size_mm(payload):
@@ -535,7 +537,7 @@ def apply_listing_size_fix_from_zh(
         if title:
             standard_only = filter_listing_sizes_for_title([], title)
             if standard_only:
-                zh_fixed = fix_scrape_sizes(standard_only)
+                zh_fixed = fix_scrape_sizes(standard_only, title=title)
                 am["尺码"] = zh_fixed
                 payload["attr_map"] = am
                 if listing_llm_wants_shoe_size_mm(payload):
@@ -740,10 +742,8 @@ def enrich_listing(
             {"role": "system", "content": _system_listing_prompt()},
             {"role": "user", "content": user_msg},
         ]
-        if want_vision:
-            log_kv.append(("vision", 0))
-        log_zh = "LLM 翻译与纠错"
-    _log.info("%s", pf_kv(log_kv, zh=log_zh))
+    if want_vision:
+        log_kv.append(("vision", 0))
 
     content, elapsed_ms, usage = _chat_once_json(
         client,
@@ -773,23 +773,6 @@ def enrich_listing(
     merged["model"] = model
     record["listing_llm"] = merged
     changes = listing_llm_field_changes(ll_before, merged)
-    _log.info(
-        "%s",
-        pf_kv(
-            [
-                ("event", "llm.response"),
-                *pf_store_row_id_kv(record),
-                ("elapsed_ms", elapsed_ms),
-                ("size_spec_kind", merged.get("size_spec_kind")),
-                ("shoe_size_mm", 1 if listing_llm_wants_shoe_size_mm(merged) else 0),
-                ("name_zh_len", len(merged.get("name_zh") or "")),
-                ("desc_ko_len", len(merged.get("desc_ko") or "")),
-                ("changes", changes),
-            ],
-            zh="LLM 翻译与纠错完成",
-            val_max=1200,
-        ),
-    )
     return True
 
 
@@ -1072,6 +1055,22 @@ def listing_llm_content_meets_upload_requirements(rec: dict[str, Any]) -> bool:
     if not listing_llm_name_ko_usable(ll):
         return False
     return bool(str(ll.get("desc_ko") or "").strip())
+
+
+def listing_llm_reprocess_reasons(rec: dict[str, Any]) -> list[str]:
+    """已 LLM 过的商品被再次处理的原因；空列表表示首次处理。"""
+    ll = rec.get("listing_llm")
+    if not isinstance(ll, dict) or not rec.get("llm_processed_at"):
+        return []
+    reasons: list[str] = []
+    if not listing_llm_name_ko_usable(ll):
+        reasons.append("name_ko 不可用（空或含价格/白名单）")
+    if not str(ll.get("desc_ko") or "").strip():
+        reasons.append("desc_ko 为空")
+    if not reasons:
+        # 理论上不会走到这里（needs_api 已判 False），但兜底
+        reasons.append("unknown（content_meets 已通过但仍被重处理）")
+    return reasons
 
 
 def listing_llm_meets_upload_requirements(rec: dict[str, Any]) -> bool:

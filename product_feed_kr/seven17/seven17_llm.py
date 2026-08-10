@@ -122,22 +122,85 @@ def _claim_next_llm_work_item(
 ) -> tuple[dict[str, Any], dict[str, Any]] | None:
     """按微猫上架时间早的优先取第一条待 LLM 且未占用的记录。"""
     from product_feed_kr.db.store_sqlite import sqlite_load_products_for_upload
+    from product_feed_kr.listing.listing_llm_enrich import (
+        listing_llm_attempts_exhausted,
+        listing_llm_is_gave_up,
+        listing_llm_reprocess_reasons,
+        record_llm_attempt_count,
+    )
 
     with claim_lock:
         items = sqlite_load_products_for_upload(conn, album_id, skip_uploaded=not include_uploaded)
+        skip_counts: dict[str, int] = {}
+        scanned = 0
         for rec in items:
             if not isinstance(rec, dict):
                 continue
+            scanned += 1
             key = _llm_row_key(rec)
             if key in in_flight:
+                skip_counts["in_flight"] = skip_counts.get("in_flight", 0) + 1
                 continue
             if not _record_needs_llm_api(rec):
+                skip_counts["not_needed"] = skip_counts.get("not_needed", 0) + 1
                 continue
             com = commodity_from_wecatalog_record(rec)
             if not isinstance(com, dict):
+                skip_counts["no_commodity"] = skip_counts.get("no_commodity", 0) + 1
                 continue
             in_flight.add(key)
+            reasons = listing_llm_reprocess_reasons(rec)
+            attempt = record_llm_attempt_count(rec)
+            skip_detail = ",".join(
+                f"{k}:{v}" for k, v in sorted(skip_counts.items())
+            ) if skip_counts else "—"
+            if reasons:
+                _log.info(
+                    "%s",
+                    pf_kv(
+                        [
+                            ("event", "llm.claim.reprocess"),
+                            ("goods_id", str(rec.get("goods_id") or "")),
+                            ("tag_id", int(rec.get("tag_id") or 0)),
+                            ("attempt", attempt + 1),
+                            ("reasons", "; ".join(reasons)),
+                            ("scanned", scanned),
+                            ("skipped", skip_detail),
+                        ],
+                        zh="LLM 重新处理已处理商品（内容不满足上架条件）",
+                    ),
+                )
+            else:
+                _log.info(
+                    "%s",
+                    pf_kv(
+                        [
+                            ("event", "llm.claim.found"),
+                            ("goods_id", str(rec.get("goods_id") or "")),
+                            ("tag_id", int(rec.get("tag_id") or 0)),
+                            ("attempt", attempt + 1),
+                            ("scanned", scanned),
+                            ("skipped", skip_detail),
+                        ],
+                        zh="LLM 选中待处理商品",
+                    ),
+                )
             return rec, com
+        skip_detail = ",".join(
+            f"{k}:{v}" for k, v in sorted(skip_counts.items())
+        ) if skip_counts else "—"
+        _log.info(
+            "%s",
+            pf_kv(
+                [
+                    ("event", "llm.claim.empty"),
+                    ("rows_loaded", len(items)),
+                    ("scanned", scanned),
+                    ("skip_summary", skip_detail),
+                ],
+                zh="LLM 读库扫描未找到待处理商品",
+            ),
+        )
     return None
 
 

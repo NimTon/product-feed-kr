@@ -149,6 +149,22 @@ def _write_lock(db_path: Path) -> FileLock:
     return FileLock(str(db_path) + ".lock", timeout=-1)
 
 
+def _sqlite_text_factory(value: bytes | str | None) -> str | None:
+    """TEXT 列解码：非法 UTF-8 用替换字符，避免读库整批失败。"""
+    if value is None:
+        return None
+    if isinstance(value, str):
+        return value
+    return value.decode("utf-8", errors="replace")
+
+
+def _sqlite_cell_value(value: Any) -> Any:
+    """行字段归一化：部分 SQLite/驱动对脏 TEXT 仍返回 bytes。"""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    return value
+
+
 def connect_sqlite() -> sqlite3.Connection:
     return connect_sqlite_path(sqlite_db_path())
 
@@ -156,7 +172,13 @@ def connect_sqlite() -> sqlite3.Connection:
 def connect_sqlite_path(db_path: Path | str) -> sqlite3.Connection:
     path = Path(db_path).expanduser().resolve()
     path.parent.mkdir(parents=True, exist_ok=True)
-    conn = sqlite3.connect(str(path), timeout=120.0, isolation_level="DEFERRED")
+    conn = sqlite3.connect(
+        str(path),
+        timeout=120.0,
+        isolation_level="DEFERRED",
+        check_same_thread=False,
+    )
+    conn.text_factory = _sqlite_text_factory
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys=ON")
     conn.execute("PRAGMA journal_mode=WAL")
@@ -854,7 +876,7 @@ def ensure_sqlite_schema(conn: sqlite3.Connection) -> None:
 
 
 def _row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
-    return {k: row[k] for k in row.keys()}
+    return {k: _sqlite_cell_value(row[k]) for k in row.keys()}
 
 
 def _extract_enriched_fields(rec: dict[str, Any]) -> dict[str, Any]:
@@ -1354,13 +1376,22 @@ def sqlite_load_existing_products(conn: sqlite3.Connection, album_id: str) -> tu
     return records, skip_ids
 
 
+def _load_upload_priority_rank() -> dict[tuple[str, str], int]:
+    try:
+        from product_feed_kr.pf_browser.upload_priority import upload_priority_rank_map
+
+        return upload_priority_rank_map()
+    except Exception:
+        return {}
+
+
 def sqlite_load_products_for_upload(
     conn: sqlite3.Connection,
     album_id: str,
     *,
     skip_uploaded: bool = True,
 ) -> list[dict[str, Any]]:
-    """载入商品行：``wecatalog_listed_at`` 早的优先（空上架时间排后），同时间按 ``id``。"""
+    """载入商品行：上架优先级优先，次按 ``wecatalog_listed_at`` 早的优先（空上架时间排后），同时间按 ``id``。"""
     order_sql = """
         CASE WHEN trim(COALESCE(wecatalog_listed_at, '')) = '' THEN 1 ELSE 0 END,
         wecatalog_listed_at ASC,
@@ -1385,6 +1416,14 @@ def sqlite_load_products_for_upload(
             (album_id,),
         )
     rows = [row_to_product_record(_row_to_dict(r)) for r in cur.fetchall()]
+    ranks = _load_upload_priority_rank()
+    if ranks:
+        max_rank = len(ranks)
+        rows.sort(key=lambda rec: ranks.get(
+            (str(rec.get("wecatalog_group") or "").strip(),
+             str(rec.get("wecatalog_tag") or "").strip()),
+            max_rank,
+        ))
     store_id = _lookup_store_info_id(conn, album_id)
     _log.info(
         "%s",
@@ -1395,8 +1434,9 @@ def sqlite_load_products_for_upload(
                 *pf_db_row_id_kv(row_id=store_id),
                 ("skip_uploaded", 1 if skip_uploaded else 0),
                 ("rows", len(rows)),
+                ("upload_priority_ranks", len(ranks) if ranks else 0),
             ],
-            zh="读库：载入待上架/处理商品列表（微猫上架时间早的优先）",
+            zh="读库：载入待上架/处理商品列表（上架优先，次按微猫上架时间）",
         ),
     )
     return rows
@@ -1718,17 +1758,6 @@ def sqlite_upsert_scrape_items(
                 (album_id, gid),
             )
             _sqlite_clear_scrape_skip_unlocked(conn, album_id, gid)
-            _log.info(
-                "%s",
-                pf_kv(
-                    [
-                        ("event", "db.write"),
-                        ("op", "upsert_item"),
-                        *pf_db_row_id_kv(rec, row_id=item_id),
-                    ],
-                    zh="写库：upsert 商品行",
-                ),
-            )
         reconciled = sqlite_reconcile_can_process_dup_hashes(conn, album_id=album_id)
         if reconciled:
             _log.info(

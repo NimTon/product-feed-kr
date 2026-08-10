@@ -15,15 +15,26 @@ from product_feed_kr.pf_browser.category_maps import (
     apply_pair_updates,
     get_category_maps_state,
     save_category_pairs,
-    start_background_sync,
     sync_all_category_maps,
 )
 from product_feed_kr.pf_browser.diagnose import diagnose_wecatalog_goods
-from product_feed_kr.pf_browser.queries import get_item, list_albums, list_items
-from product_feed_kr.common.seven17_config import getenv, reload_seven17_config
-from product_feed_kr.seven17.no_price_whitelist import get_no_price_whitelist_state, save_no_price_whitelist
+from product_feed_kr.pf_browser.queries import get_item, list_albums, list_items, scrape_category_summary
+from product_feed_kr.common.seven17_config import getenv
+from product_feed_kr.pf_browser.category_whitelists import (
+    get_category_whitelists_state,
+    save_category_whitelists,
+)
+from product_feed_kr.pf_browser.upload_settings import (
+    get_upload_settings_state,
+    save_upload_settings,
+)
+from product_feed_kr.pf_browser.upload_priority import (
+    get_upload_priority_state,
+    save_upload_priority_from_body,
+)
 from product_feed_kr.db.store_sqlite import (
     connect_sqlite,
+    ensure_sqlite_schema,
     sqlite_db_path,
     sqlite_reconcile_can_process_dup_hashes,
 )
@@ -115,6 +126,14 @@ def create_app() -> Flask:
             return jsonify(result), code
         return jsonify(result)
 
+    @app.get("/api/scrape-category-summary")
+    def scrape_category_summary_api() -> object:
+        try:
+            return jsonify(scrape_category_summary())
+        except Exception as e:
+            _log.exception("scrape_category_summary failed")
+            return jsonify({"ok": False, "error": str(e)}), 500
+
     @app.get("/api/category-maps")
     def category_maps_get() -> object:
         return jsonify(get_category_maps_state())
@@ -148,26 +167,61 @@ def create_app() -> Flask:
         except ValueError as e:
             return jsonify({"ok": False, "error": str(e)}), 400
 
-    @app.get("/api/no-price-whitelist")
-    def no_price_whitelist_get() -> object:
+    @app.get("/api/category-whitelists")
+    def category_whitelists_get() -> object:
         try:
-            return jsonify(get_no_price_whitelist_state())
+            return jsonify(get_category_whitelists_state())
         except Exception as e:
-            _log.exception("no_price_whitelist_get failed")
+            _log.exception("category_whitelists_get failed")
             return jsonify({"ok": False, "error": str(e)}), 500
 
-    @app.post("/api/no-price-whitelist")
-    def no_price_whitelist_save() -> object:
+    @app.post("/api/category-whitelists")
+    def category_whitelists_save() -> object:
         body = request.get_json(silent=True) or {}
-        pairs = body.get("pairs")
-        if not isinstance(pairs, list):
-            return jsonify({"ok": False, "error": "missing_pairs"}), 400
         try:
-            result = save_no_price_whitelist(pairs)
-            reload_seven17_config()
-            return jsonify(result)
+            return jsonify(save_category_whitelists(body))
+        except ValueError as e:
+            return jsonify({"ok": False, "error": str(e)}), 400
         except Exception as e:
-            _log.exception("no_price_whitelist_save failed")
+            _log.exception("category_whitelists_save failed")
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.get("/api/upload-settings")
+    def upload_settings_get() -> object:
+        try:
+            return jsonify(get_upload_settings_state())
+        except Exception as e:
+            _log.exception("upload_settings_get failed")
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.post("/api/upload-settings")
+    def upload_settings_save() -> object:
+        body = request.get_json(silent=True) or {}
+        try:
+            return jsonify(save_upload_settings(body))
+        except ValueError as e:
+            return jsonify({"ok": False, "error": str(e)}), 400
+        except Exception as e:
+            _log.exception("upload_settings_save failed")
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.get("/api/upload-priority")
+    def upload_priority_get() -> object:
+        try:
+            return jsonify(get_upload_priority_state())
+        except Exception as e:
+            _log.exception("upload_priority_get failed")
+            return jsonify({"ok": False, "error": str(e)}), 500
+
+    @app.post("/api/upload-priority")
+    def upload_priority_save() -> object:
+        body = request.get_json(silent=True) or {}
+        try:
+            return jsonify(save_upload_priority_from_body(body))
+        except ValueError as e:
+            return jsonify({"ok": False, "error": str(e)}), 400
+        except Exception as e:
+            _log.exception("upload_priority_save failed")
             return jsonify({"ok": False, "error": str(e)}), 500
 
     return app
@@ -178,6 +232,11 @@ def main(argv: list[str] | None = None) -> int:
     ap.add_argument("--host", default=getenv("PF_BROWSER_HOST", "127.0.0.1") or "127.0.0.1")
     ap.add_argument("--port", type=int, default=int(getenv("PF_BROWSER_PORT", "8765") or "8765"))
     ap.add_argument("-v", "--verbose", action="store_true")
+    ap.add_argument(
+        "--skip-category-sync",
+        action="store_true",
+        help="跳过启动时的微猫/韩文分类同步",
+    )
     args = ap.parse_args(argv)
 
     logging.basicConfig(
@@ -186,14 +245,36 @@ def main(argv: list[str] | None = None) -> int:
     )
 
     db = sqlite_db_path()
-    if not db.is_file():
-        _log.warning("数据库文件尚不存在: %s（页面将为空，采集后会写入）", db)
+    had_db = db.is_file()
+    conn = connect_sqlite()
+    try:
+        ensure_sqlite_schema(conn)
+    finally:
+        conn.close()
+    if not had_db:
+        print(f"已初始化空数据库: {db}")
 
     app = create_app()
     url = f"http://{args.host}:{args.port}/"
     print(f"商品库浏览: {url}")
     print(f"数据库: {db}")
-    print("启动时将后台同步微猫/韩文分类 JSON（可在页面「分类配对」「无价白名单」中维护）")
-    start_background_sync()
+    if args.skip_category_sync:
+        print("已跳过启动分类同步（--skip-category-sync）")
+    else:
+        print("正在同步微猫/韩文分类（commodity/tags + seven17 itemform）…")
+        sync_result = sync_all_category_maps()
+        if sync_result.get("ok"):
+            wc = sync_result.get("wecatalog") or {}
+            s17 = sync_result.get("seven17") or {}
+            print(
+                f"分类同步完成：微猫 {wc.get('group_count', '?')} 组 / "
+                f"{wc.get('tag_count', '?')} 标签；"
+                f"韩文 {s17.get('entry_count', '?')} 项"
+            )
+        else:
+            errs = sync_result.get("errors") or []
+            print("分类同步未全部成功（页面仍可使用已有 JSON）：")
+            for err in errs:
+                print(f"  - {err}")
     app.run(host=args.host, port=args.port, debug=False, threaded=True)
     return 0
