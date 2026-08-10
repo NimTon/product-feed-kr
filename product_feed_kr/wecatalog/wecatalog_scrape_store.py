@@ -1,7 +1,9 @@
-"""微猫 wecatalog 店铺：``commodity/tags`` + 按已配对标签 ``album/personal/all?tagId=`` 列表 → SQLite。
+"""微猫 wecatalog 店铺：``commodity/tags`` + 按**抓取白名单** ``album/personal/all``（POST ``tagList=[tagId]``）列表 → SQLite。
 
-仅爬取 ``data/wecatalog_category_pairs.json`` 中已完成韩文路径配对的标签（05 商品库「分类配对」维护），
-**不**再扫全店 ``album/personal/all``。每个标签独立翻页，断点按 ``tag_id`` 保存在 ``stats.tag_progress``。
+仅爬取 ``data/wecatalog_scrape_whitelist.json`` 中勾选的标签（05 商品库「分类白名单」维护，**与分类配对无关**）。
+白名单顺序即抓取优先级；单进程按标签顺序逐个抓完再换下一类（``01_采集微猫店铺.bat``）。
+多进程分片见 ``01_采集微猫店铺_并行.bat`` + ``--worker-index`` / ``--worker-count``（读取白名单 ``max_parallel``）。
+每个标签独立翻页，断点按 ``tag_id`` 保存在 ``stats.tag_progress``。
 
 列表项缺 title/图 → ``pf_scrape_skip``（``list_incomplete``）；无价且分类不在白名单 → ``list_no_price``；库内已有 ``goods_id`` 跳过。
 列表项已含 title / optimaPrice / formats / colors / imgsSrc，**不**请求 ``popUpsInfoV2``。
@@ -56,10 +58,12 @@ from product_feed_kr.wecatalog.wecatalog_scrape_fields import (
     list_item_scrape_ready,
     scrape_no_price_skip_needed,
 )
-from product_feed_kr.wecatalog.wecatalog_tag_mapping import (
-    build_scrape_tag_targets,
-    scrape_targets_empty_diagnostic,
+from product_feed_kr.pf_browser.category_whitelists import (
+    build_scrape_tag_targets_from_whitelist,
+    load_scrape_max_parallel,
+    scrape_whitelist_empty_diagnostic,
 )
+from product_feed_kr.wecatalog.wecatalog_tag_mapping import ScrapeTagTarget, lookup_group_tag_by_id
 from product_feed_kr.common.pf_cli_loop import run_forever
 from product_feed_kr.common.pf_log import configure_scrape_logging, pf_kv, pf_store_row_id_kv
 from product_feed_kr.common.process_singleton import EXIT_SINGLETON_CONFLICT, single_instance_lock
@@ -114,18 +118,19 @@ class InterRequestGap:
                 pass
             else:
                 sec = random.uniform(self._lo, self._hi) if self._hi > self._lo else self._lo
-                logger.info(
-                    "%s",
-                    pf_kv(
-                        [
-                            ("event", "scrape.throttle"),
-                            ("delay_sec", round(sec, 3)),
-                            ("delay_range", [self._lo, self._hi]),
-                            ("next", label),
-                        ],
-                        zh=f"请求节流：休眠 {sec:.3g}s 后发起「{label}」",
-                    ),
-                )
+                if self._n <= 3 or self._n % 50 == 0:
+                    logger.info(
+                        "%s",
+                        pf_kv(
+                            [
+                                ("event", "scrape.throttle"),
+                                ("delay_sec", round(sec, 3)),
+                                ("count", self._n),
+                                ("next", label),
+                            ],
+                            zh="请求节流（采样）",
+                        ),
+                    )
                 time.sleep(sec)
         self._n += 1
 
@@ -133,27 +138,35 @@ class InterRequestGap:
 FETCH_TAG_LIST_JS = """
 async ({ albumId, tagId, pageTimestamp }) => {
   let url = `https://www.wecatalog.cn/album/personal/all?albumId=${encodeURIComponent(albumId)}`
-    + `&tagId=${encodeURIComponent(tagId)}&startDate=&endDate=&requestDataType=`;
+    + `&searchValue=&searchImg=&startDate=&endDate=&requestDataType=&tagUnion=false`;
   if (pageTimestamp != null) {
     url += `&slipType=1&timestamp=${pageTimestamp}`;
+  } else {
+    url += `&slipType=0&timestamp=`;
   }
   const r = await fetch(url, {
     method: "POST",
     credentials: "include",
     headers: {
-      "Content-Type": "application/json",
+      "Content-Type": "application/x-www-form-urlencoded",
       "Accept": "application/json",
     },
-    body: "{}",
+    body: `tagList=[${tagId}]`,
   });
-  return await r.json();
+  if (!r.ok) {
+    return { errcode: -1, errmsg: `HTTP ${r.status} ${r.statusText} for ${url}` };
+  }
+  return await r.json().catch(() => ({ errcode: -2, errmsg: "响应非 JSON: " + url }));
 }
 """
 
 FETCH_TAGS_JS = """
 async (apiUrl) => {
   const r = await fetch(apiUrl, { credentials: "include" });
-  return await r.json();
+  if (!r.ok) {
+    return { errcode: -1, errmsg: `HTTP ${r.status} ${r.statusText} for ${apiUrl}` };
+  }
+  return await r.json().catch(() => ({ errcode: -2, errmsg: "响应非 JSON: " + apiUrl }));
 }
 """
 
@@ -251,6 +264,57 @@ def clear_all_tag_progress(stats: dict[str, Any]) -> None:
     stats.pop(TAG_PROGRESS_KEY, None)
 
 
+_CHECKPOINT_ADDITIVE_KEYS = (
+    "tag_list_pages",
+    "list_items_unique",
+    "records_new",
+    "skipped_existing",
+    "skipped_blacklist",
+    "list_ok",
+    "list_incomplete",
+    "list_no_price",
+    "listed_at_backfilled",
+)
+
+
+def filter_targets_for_worker(
+    targets: tuple[ScrapeTagTarget, ...] | list[ScrapeTagTarget],
+    *,
+    worker_index: int,
+    worker_count: int,
+) -> list[ScrapeTagTarget]:
+    if worker_count <= 1:
+        return list(targets)
+    if worker_index < 0 or worker_index >= worker_count:
+        raise ValueError(f"worker_index 须在 [0, {worker_count}) 内，收到 {worker_index}")
+    return [t for i, t in enumerate(targets) if i % worker_count == worker_index]
+
+
+def merge_checkpoint_stats(
+    local_stats: dict[str, Any],
+    *,
+    remote_stats: dict[str, Any] | None,
+    pending_records: int,
+) -> dict[str, Any]:
+    """多 worker 写 checkpoint 时合并 tag_progress 与累计计数，避免互相覆盖。"""
+    remote = remote_stats if isinstance(remote_stats, dict) else {}
+    out = dict(local_stats)
+    merged_tp = {**_tag_progress_map(remote), **_tag_progress_map(local_stats)}
+    out[TAG_PROGRESS_KEY] = merged_tp
+    out["tags_total"] = max(int(remote.get("tags_total") or 0), int(local_stats.get("tags_total") or 0))
+    out["tags_done"] = sum(
+        1 for e in merged_tp.values() if isinstance(e, dict) and e.get(TAG_DONE_KEY)
+    )
+    for key in _CHECKPOINT_ADDITIVE_KEYS:
+        out[key] = int(remote.get(key) or 0) + int(local_stats.get(key) or 0)
+    if remote.get("records_prior") is not None:
+        out["records_prior"] = remote.get("records_prior")
+    out["records"] = int(remote.get("records") or 0) + pending_records
+    if remote.get("max_parallel") is not None and out.get("max_parallel") is None:
+        out["max_parallel"] = remote.get("max_parallel")
+    return out
+
+
 def iter_tag_list_pages(
     page,
     album_id: str,
@@ -261,7 +325,7 @@ def iter_tag_list_pages(
     resume_page_ts: int | None = None,
     resume_pages: int = 0,
 ):
-    """逐页请求 ``album/personal/all?tagId=``；每页 yield (items, 原始响应, 页码 1-based)。"""
+    """逐页请求 ``album/personal/all``（POST ``tagList=[tagId]``，与 goods_list 页一致）；每页 yield (items, 原始响应, 页码 1-based)。"""
     seen: set[str] = set()
     ts: int | None = resume_page_ts
     pages = max(0, int(resume_pages))
@@ -401,6 +465,8 @@ def scrape_store(
     checkpoint_every: int = 0,
     max_records: int = 0,
     headed: bool = False,
+    worker_index: int = 0,
+    worker_count: int = 1,
 ) -> dict[str, Any]:
     from product_feed_kr.db.store_sqlite import (
         connect_sqlite,
@@ -429,6 +495,11 @@ def scrape_store(
     delay_lo = max(0.0, delay_lo)
     delay_hi = max(delay_lo, delay_hi)
 
+    if worker_count < 1:
+        raise ValueError(f"worker_count 须 >= 1，收到 {worker_count}")
+    if worker_count > 1 and (worker_index < 0 or worker_index >= worker_count):
+        raise ValueError(f"worker_index 须在 [0, {worker_count}) 内，收到 {worker_index}")
+
     logger.info(
         "%s",
         pf_kv(
@@ -438,8 +509,10 @@ def scrape_store(
                 ("seed", seed),
                 ("sqlite", str(sqlite_db_path())),
                 ("throttle_delay_sec_range", [delay_lo, delay_hi]),
+                ("worker_index", worker_index if worker_count > 1 else None),
+                ("worker_count", worker_count if worker_count > 1 else None),
             ],
-            zh="开始抓取微猫店铺：按已配对标签拉列表",
+            zh="开始抓取微猫店铺：按抓取白名单拉列表",
         ),
     )
 
@@ -522,17 +595,56 @@ def scrape_store(
             if not isinstance(result, dict):
                 raise RuntimeError("tags 响应缺少 result")
             groups = build_group_tree(result)
-            targets = build_scrape_tag_targets(groups)
-            if not targets:
-                raise RuntimeError(scrape_targets_empty_diagnostic(groups))
-            stats["tags_total"] = len(targets)
+            all_targets = build_scrape_tag_targets_from_whitelist(groups)
+            if not all_targets:
+                raise RuntimeError(scrape_whitelist_empty_diagnostic(groups))
+            max_parallel = load_scrape_max_parallel()
+            targets = filter_targets_for_worker(
+                all_targets,
+                worker_index=worker_index,
+                worker_count=worker_count,
+            )
+            stats["tags_total"] = len(all_targets)
+            stats["tags_assigned"] = len(targets)
+            stats["max_parallel"] = max_parallel
+            if worker_count > 1:
+                stats["worker_index"] = worker_index
+                stats["worker_count"] = worker_count
             logger.info(
                 "%s",
                 pf_kv(
-                    [("event", "scrape.tags_ok"), ("groups", len(groups)), ("targets", len(targets))],
-                    zh=f"分类树已拉取，将按 {len(targets)} 个已配对标签逐类翻页",
+                    [
+                        ("event", "scrape.tags_ok"),
+                        ("groups", len(groups)),
+                        ("targets", len(all_targets)),
+                        ("assigned", len(targets)),
+                        ("max_parallel", max_parallel),
+                        ("worker_index", worker_index if worker_count > 1 else None),
+                        ("worker_count", worker_count if worker_count > 1 else None),
+                    ],
+                    zh=(
+                        f"分类树已拉取，白名单 {len(all_targets)} 个标签"
+                        + (
+                            f"；本 worker 负责 {len(targets)} 个"
+                            if worker_count > 1
+                            else ""
+                        )
+                    ),
                 ),
             )
+
+            if not targets:
+                logger.info(
+                    "%s",
+                    pf_kv(
+                        [
+                            ("event", "scrape.worker_idle"),
+                            ("worker_index", worker_index),
+                            ("worker_count", worker_count),
+                        ],
+                        zh="本 worker 无分配标签，直接结束",
+                    ),
+                )
 
             logger.info(
                 "%s",
@@ -546,12 +658,23 @@ def scrape_store(
                     zh="开始按标签遍历商品列表",
                 ),
             )
-            def write_checkpoint(*, meta_only: bool = False) -> None:
+            stop_flag = False
+
+            def _write_checkpoint_locked(*, meta_only: bool = False) -> None:
+                assert conn_db is not None
+                stats_to_write = stats
+                if worker_count > 1:
+                    snap = sqlite_load_store_snapshot(conn_db, album_id)
+                    remote_stats = snap.get("stats") if isinstance(snap, dict) else None
+                    stats_to_write = merge_checkpoint_stats(
+                        stats,
+                        remote_stats=remote_stats if isinstance(remote_stats, dict) else None,
+                        pending_records=len(records),
+                    )
                 meta_extra = {
                     "saved_at": now_cst8_iso(),
-                    "stats": stats,
+                    "stats": stats_to_write,
                 }
-                assert conn_db is not None
                 if meta_only:
                     sqlite_write_store_meta(
                         conn_db,
@@ -605,6 +728,9 @@ def scrape_store(
                 )
                 logger.info("%s", pf_kv(ck_kv, zh=zh_ck))
 
+            def write_checkpoint(*, meta_only: bool = False) -> None:
+                _write_checkpoint_locked(meta_only=meta_only)
+
             # 进入详情循环前只写店铺元信息，不把旧商品行载入内存写回
             write_checkpoint(meta_only=True)
             logger.info(
@@ -627,6 +753,15 @@ def scrape_store(
                 shop_path: tuple[str, ...] | None,
             ) -> bool:
                 """写入一条分组×标签×商品；返回 False 表示已达 max_records 应停止整次抓取。"""
+                return _append_product_row_locked(it, gname, tname, tid_int, shop_path)
+
+            def _append_product_row_locked(
+                it: dict[str, Any],
+                gname: str,
+                tname: str,
+                tid_int: int,
+                shop_path: tuple[str, ...] | None,
+            ) -> bool:
                 nonlocal new_appended
                 gid = (
                     it.get("goods_id")
@@ -672,6 +807,7 @@ def scrape_store(
                     return True
 
                 scrape_fields = fields_from_list_item(it)
+
                 if not list_item_scrape_ready(it, scrape_fields):
                     stats["list_incomplete"] += 1
                     skip_ids_prior.add(gid)
@@ -804,36 +940,61 @@ def scrape_store(
                     return False
                 return True
 
-            stop_run = False
-            for target in targets:
-                if stop_run:
-                    break
+            def process_target(target: ScrapeTagTarget, tag_page) -> None:
+                nonlocal stop_flag
+                if stop_flag:
+                    return
                 if tag_resume and not tags_from_start and tag_is_done(stats, target.tag_id):
                     stats["tags_done"] += 1
-                    continue
+                    return
 
                 resume_pages, resume_page_ts = (0, None)
                 if tag_resume and not tags_from_start:
                     resume_pages, resume_page_ts = tag_progress_from_stats(stats, target.tag_id)
 
+                tag_begin_kv: list[tuple[str, Any]] = [
+                    ("event", "scrape.tag.begin"),
+                    ("tag_id", target.tag_id),
+                    ("group", target.group_name),
+                    ("tag", target.tag_name),
+                    ("page_num", resume_pages or None),
+                    ("page_next_ts", resume_page_ts),
+                ]
+                api_gt = lookup_group_tag_by_id(groups, target.tag_id)
+                if api_gt is not None:
+                    api_g, api_t = api_gt
+                    tag_begin_kv.extend([("api_group", api_g), ("api_tag", api_t)])
                 logger.info(
                     "%s",
                     pf_kv(
-                        [
-                            ("event", "scrape.tag.begin"),
-                            ("tag_id", target.tag_id),
-                            ("group", target.group_name),
-                            ("tag", target.tag_name),
-                            ("page_num", resume_pages or None),
-                            ("page_next_ts", resume_page_ts),
-                        ],
-                        zh=f"开始爬取标签「{target.group_name} / {target.tag_name}」",
+                        tag_begin_kv,
+                        zh=(
+                            f"开始爬取 tagId={target.tag_id}「{target.group_name} / {target.tag_name}」"
+                            + (
+                                f"（commodity/tags 对应「{api_gt[0]} / {api_gt[1]}」）"
+                                if api_gt is not None
+                                else "（commodity/tags 未找到该 tagId）"
+                            )
+                        ),
                     ),
                 )
+                if api_gt is None:
+                    logger.warning(
+                        "%s",
+                        pf_kv(
+                            [
+                                ("event", "scrape.tag.id_unknown"),
+                                ("tag_id", target.tag_id),
+                                ("group", target.group_name),
+                                ("tag", target.tag_name),
+                            ],
+                            zh=f"tagId {target.tag_id} 不在本次 commodity/tags 树中，列表可能不对",
+                        ),
+                    )
 
                 tag_had_pages = False
                 for new_items, _raw_pg, page_num in iter_tag_list_pages(
-                    page,
+                    tag_page,
                     album_id,
                     target.tag_id,
                     max_pages=max_list_pages,
@@ -841,6 +1002,8 @@ def scrape_store(
                     resume_page_ts=resume_page_ts,
                     resume_pages=resume_pages,
                 ):
+                    if stop_flag:
+                        break
                     tag_had_pages = True
                     resume_page_ts = None
                     stats["tag_list_pages"] += 1
@@ -854,7 +1017,6 @@ def scrape_store(
                         )
                     from product_feed_kr.common.cny_krw_rate import resolve_krw_per_cny
 
-                    krw_per_cny_page = None
                     stats["fx_source"] = None
                     try:
                         krw_per_cny_page, fx_src = resolve_krw_per_cny()
@@ -902,7 +1064,9 @@ def scrape_store(
                                 or it.get("parent_goods_id")
                                 or ""
                             )
-                            if not isinstance(gid, str) or not gid or gid not in need_backfill_listed_at:
+                            if not isinstance(gid, str) or not gid:
+                                continue
+                            if gid not in need_backfill_listed_at:
                                 continue
                             listed_iso = wecatalog_listed_at_iso_from_list_item(it)
                             if listed_iso:
@@ -925,30 +1089,19 @@ def scrape_store(
                             target.tag_id,
                             target.shop_path,
                         ):
-                            stop_run = True
+                            stop_flag = True
                             break
 
-                    logger.info(
-                        "%s",
-                        pf_kv(
-                            [
-                                ("event", "scrape.tag_list.page_done"),
-                                ("tag_id", target.tag_id),
-                                ("page", page_num),
-                                ("page_items", len(new_items)),
-                                ("records", len(records)),
-                            ],
-                            zh=f"标签 {target.tag_id} 第 {page_num} 页处理完成",
-                        ),
-                    )
+                    rec_count = len(records)
                     write_checkpoint()
-                    if stop_run:
+                    if stop_flag:
                         break
 
-                if not stop_run and not tag_had_pages:
+                if not stop_flag and not tag_had_pages:
                     tp = stats.setdefault(TAG_PROGRESS_KEY, {})
                     tp[str(target.tag_id)] = {TAG_DONE_KEY: True, TAG_PAGE_NUM_KEY: 0}
-                if not stop_run and tag_is_done(stats, target.tag_id):
+                done_flag = tag_is_done(stats, target.tag_id)
+                if not stop_flag and done_flag:
                     stats["tags_done"] += 1
                 logger.info(
                     "%s",
@@ -958,14 +1111,17 @@ def scrape_store(
                             ("tag_id", target.tag_id),
                             ("group", target.group_name),
                             ("tag", target.tag_name),
-                            ("done", tag_is_done(stats, target.tag_id)),
+                            ("done", done_flag),
                         ],
                         zh=f"标签「{target.group_name} / {target.tag_name}」遍历结束",
                     ),
                 )
                 write_checkpoint()
-                if stop_run:
+
+            for target in targets:
+                if stop_flag:
                     break
+                process_target(target, page)
 
             stats["records"] = len(records)
             stats["records_new"] = new_appended
@@ -1066,14 +1222,38 @@ def main() -> int:
         action="store_true",
         help="有界面运行浏览器（默认无头 headless，看不到窗口）",
     )
+    ap.add_argument(
+        "--worker-index",
+        type=int,
+        default=None,
+        help="多进程 worker 编号（0 起，须与 --worker-count 同用；由 01 bat 启动）",
+    )
+    ap.add_argument(
+        "--worker-count",
+        type=int,
+        default=None,
+        help="多进程 worker 总数（通常等于抓取白名单 max_parallel）",
+    )
     args = ap.parse_args()
+
+    worker_mode = args.worker_index is not None or args.worker_count is not None
+    if worker_mode:
+        if args.worker_index is None or args.worker_count is None:
+            ap.error("--worker-index 与 --worker-count 须同时指定")
+        if args.worker_count < 1:
+            ap.error("--worker-count 须 >= 1")
+        if args.worker_index < 0 or args.worker_index >= args.worker_count:
+            ap.error(f"--worker-index 须在 [0, {args.worker_count}) 内")
+    else:
+        args.worker_index = 0
+        args.worker_count = 1
 
     try:
         d_lo, d_hi = parse_detail_delay_range(args.detail_delay)
     except ValueError as e:
         ap.error(f"无效 --detail-delay {args.detail_delay!r}: {e}")
 
-    repeat = not args.once
+    repeat = not args.once and not worker_mode
     log_file = args.log_file
     if repeat and log_file is None:
         from product_feed_kr._paths import REPO_ROOT
@@ -1098,6 +1278,8 @@ def main() -> int:
                 checkpoint_every=max(0, args.checkpoint_every),
                 max_records=max(0, args.max_records),
                 headed=args.headed,
+                worker_index=args.worker_index,
+                worker_count=args.worker_count,
             )
             print(json.dumps({"ok": True, **stats}, ensure_ascii=False))
             if stats.get("restart_fresh"):
@@ -1112,8 +1294,13 @@ def main() -> int:
             print(json.dumps({"ok": False, "error": str(e)}, ensure_ascii=False), file=sys.stderr)
             return 1
 
+    lock_name = (
+        f"wecatalog_scrape_store_w{args.worker_index}"
+        if worker_mode
+        else "wecatalog_scrape_store"
+    )
     try:
-        with single_instance_lock("wecatalog_scrape_store"):
+        with single_instance_lock(lock_name):
             if repeat:
                 return run_forever(
                     _run_once,
