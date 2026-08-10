@@ -33,6 +33,10 @@ def run_forever(
     fatal_codes: dict[int, float] | None = None,
 ) -> int:
     """``fatal_codes``：退出码 → 等待秒数后终止进程（不继续循环）。"""
+    from product_feed_kr.common.pf_log import cleanup_old_logs
+
+    cleanup_old_logs(max_age_days=7)
+
     round_n = 0
     while True:
         round_n += 1

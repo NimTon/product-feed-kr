@@ -20,6 +20,8 @@
 `SEVEN17_UPLOAD_THREADS`（默认 1：上架工作线程数，每线程独立 Playwright 登录）。
 `SEVEN17_UPLOAD_IMAGE_WORKERS`（默认 min(图片数, 8)：单条商品多图并行下载线程数）。
 `SEVEN17_UPLOAD_IMAGE_PREFETCH_QUEUE`（默认 8，仅单线程上架：后台预取下 N 条商品图；0 关闭）。
+`SEVEN17_UPLOAD_IMAGE_MAX_PX`（默认 0：上传前图片长边像素上限，0 表示不缩放；可在商品库「上架设置」修改）。
+上架临时图片落在仓库根目录 ``tmp/``（不写系统 Temp/C 盘），单条处理完后删除。
 检测到 ``login.php``（会话失效）时自动 ``login_admin`` 并重试当前商品一次。
 
 上传模块不再调用 LLM：只读取 SQLite 已有的 ``listing_llm``（``name_ko`` 标题、``desc_ko``、``price_krw``、``attr_map_ko`` 等）。LLM 写回请用 ``python -m product_feed_kr.seven17.seven17_llm``（``02_LLM补全上架信息.bat``）。
@@ -68,6 +70,7 @@ from urllib.parse import parse_qs, urlparse
 
 from playwright.sync_api import sync_playwright
 
+from product_feed_kr._paths import REPO_ROOT
 from product_feed_kr.common.playwright_path import chromium_executable
 from product_feed_kr.common.cny_krw_rate import cny_listing_amount_to_krw_won_str, fetch_krw_per_cny
 from product_feed_kr.seven17.seven17_adm import login_admin
@@ -84,6 +87,7 @@ from product_feed_kr.seven17.seven17_category_llm import (
     load_seven17_ca_catalog,
     resolve_ca_id_for_store_record,
 )
+from product_feed_kr.seven17.upload_image_settings import upload_image_max_px
 from product_feed_kr.wecatalog.wecatalog_tag_mapping import resolve_category_path, resolve_seven17_ca_id
 from product_feed_kr.wego.wego_commodity import DEFAULT_WEGO_DESC_TEMPLATE, parse_price_str, parse_wego_product
 from product_feed_kr.common.pf_log import (
@@ -411,6 +415,13 @@ def click_itemform_submit(page) -> None:
     raise RuntimeError(f"无法点击商品表单提交按钮（已尝试 {selectors}）：{last}")
 
 
+def upload_temp_dir() -> Path:
+    """上架临时图片目录：仓库根下 ``tmp/``（相对路径 ``./tmp``），避免写入系统 Temp/C 盘。"""
+    d = REPO_ROOT / "tmp"
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+
 def _download_image(url: str) -> Path:
     req = urllib.request.Request(
         url,
@@ -456,7 +467,7 @@ def _download_image(url: str) -> Path:
             is_webp = head[:4] == b"RIFF" and head[8:12] == b"WEBP"
             if not (is_jpg or is_png or is_gif or is_webp):
                 raise RuntimeError(f"下载内容不是可识别图片: ctype={ctype or '-'} url={url}")
-            fd, path = tempfile.mkstemp(suffix=suffix)
+            fd, path = tempfile.mkstemp(prefix="pf_up_", suffix=suffix, dir=str(upload_temp_dir()))
             os.close(fd)
             dest = Path(path)
             dest.write_bytes(data)
@@ -466,6 +477,31 @@ def _download_image(url: str) -> Path:
         raise
     if dest is None:
         raise RuntimeError(f"图片下载失败：未生成本地文件 url={url}")
+    return resize_upload_image_if_needed(dest, upload_image_max_px())
+
+
+def resize_upload_image_if_needed(path: Path, max_px: int) -> Path:
+    """若 ``max_px`` > 0 且图片长边超限，则等比缩放到 JPEG 并返回新路径。"""
+    if max_px <= 0:
+        return path
+    try:
+        from PIL import Image
+    except ImportError as e:
+        raise RuntimeError("图片缩放需 Pillow：pip install Pillow") from e
+
+    with Image.open(path) as im_src:
+        if getattr(im_src, "is_animated", False):
+            im_src.seek(0)
+        w, h = im_src.size
+        if max(w, h) <= max_px:
+            return path
+        im = im_src.convert("RGB")
+        im.thumbnail((max_px, max_px), Image.Resampling.LANCZOS)
+
+    dest = path.with_suffix(".jpg") if path.suffix.lower() != ".jpg" else path
+    if dest != path:
+        path.unlink(missing_ok=True)
+    im.save(dest, format="JPEG", quality=85, optimize=True)
     return dest
 
 
@@ -480,6 +516,71 @@ def upload_image_download_workers(url_count: int) -> int:
         except ValueError:
             pass
     return max(1, min(n_urls, 8))
+
+
+def _cleanup_upload_temp_images(
+    paths: list[Path] | None,
+    *,
+    thread_label: str = "",
+    rec: dict[str, Any] | None = None,
+) -> None:
+    """删除上架下载的本地临时图片。
+
+    Windows 上 Playwright ``set_input_files`` 后文件可能仍被占用，故短重试；
+    最终删不掉只打警告，避免把已成功上架打成失败。
+    """
+    if not paths:
+        return
+    left: list[Path] = []
+    for raw in paths:
+        try:
+            pth = Path(raw)
+        except TypeError:
+            continue
+        if pth.exists():
+            left.append(pth)
+    if not left:
+        return
+
+    total = len(left)
+    for delay in (0.0, 0.25, 0.75, 1.5):
+        if delay:
+            time.sleep(delay)
+        still: list[Path] = []
+        for pth in left:
+            try:
+                pth.unlink(missing_ok=True)
+            except OSError:
+                if pth.exists():
+                    still.append(pth)
+        left = still
+        if not left:
+            break
+
+    if left:
+        _log.warning(
+            "%s",
+            pf_kv(
+                [
+                    ("event", "upload.temp_images.cleanup_partial"),
+                    *([("thread", thread_label)] if thread_label else []),
+                    *(pf_store_row_id_kv(rec) if rec else []),
+                    ("left", len(left)),
+                    ("total", total),
+                    ("sample", left[0].name),
+                ],
+                zh="上架临时图片未能全部删除（可能仍被浏览器占用）",
+            ),
+        )
+        return
+
+    _upload_phase_log(
+        "upload.temp_images.cleaned",
+        "已删除上架临时图片",
+        thread_label=thread_label,
+        rec=rec,
+        extra=[("count", total)],
+    )
 
 
 def _download_images_for_upload(
@@ -510,15 +611,13 @@ def _download_images_for_upload(
 
     done_paths = [p for p in results if p is not None]
     if first_err is not None:
-        for pth in done_paths:
-            pth.unlink(missing_ok=True)
+        _cleanup_upload_temp_images(done_paths, thread_label=thread_label, rec=rec)
         if isinstance(first_err, (urllib.error.URLError, OSError)):
             raise first_err
         raise RuntimeError(str(first_err)) from first_err
 
     if len(done_paths) != len(urls):
-        for pth in done_paths:
-            pth.unlink(missing_ok=True)
+        _cleanup_upload_temp_images(done_paths, thread_label=thread_label, rec=rec)
         raise RuntimeError(f"图片下载未完成：期望 {len(urls)} 张，实际 {len(done_paths)} 张")
 
     return [p for p in results if p is not None]
@@ -599,8 +698,7 @@ class UploadImagePrefetchQueue:
             batches = list(self._ready.values())
             self._ready.clear()
         for batch in batches:
-            for pth in batch.paths:
-                pth.unlink(missing_ok=True)
+            _cleanup_upload_temp_images(list(batch.paths))
 
     def _occupied_keys(self) -> set[tuple[str, int]]:
         return set(self._ready) | set(self._in_progress) | set(self._active)
@@ -699,13 +797,11 @@ class UploadImagePrefetchQueue:
                 with self._cond:
                     self._in_progress.discard(key)
                     if key in self._active:
-                        for pth in batch.paths:
-                            pth.unlink(missing_ok=True)
+                        _cleanup_upload_temp_images(list(batch.paths), rec=rec)
                     elif len(self._ready) < self._queue_size:
                         self._ready[key] = batch
                     else:
-                        for pth in batch.paths:
-                            pth.unlink(missing_ok=True)
+                        _cleanup_upload_temp_images(list(batch.paths), rec=rec)
                     self._cond.notify_all()
         finally:
             conn.close()
@@ -736,6 +832,8 @@ class UploadImagePrefetchQueue:
                 self._cond.wait(timeout=min(2.0, remaining))
         if batch is not None and batch.paths and not batch.error:
             return list(batch.paths), "prefetch"
+        if batch is not None and batch.paths:
+            _cleanup_upload_temp_images(list(batch.paths), thread_label=thread_label, rec=rec)
         paths = _download_images_for_upload(urls, thread_label=thread_label, rec=rec)
         return paths, "sync"
 
@@ -1142,7 +1240,6 @@ def _fill_itemform(
 
     _configure_upload_stderr_logging()
     gid = (goods_id or "").strip() or "-"
-    img_slots = ", ".join(f"it_img{i}={p.name}" for i, p in enumerate(paths, start=1)) if paths else "（无主图文件）"
     if (
         price_src in ("price_cny", "listing_llm_cny", "title_parse")
         and fx_krw_per_cny is not None
@@ -1161,22 +1258,7 @@ def _fill_itemform(
             ),
         )
     # 说明字段是否写入（默认关闭，避免误覆盖历史运营文案）。
-    fill_it_explan = _bool_env("SEVEN17_FILL_IT_EXPLAN", False)
-
-    _log_itemform_field_preview(
-        gid=gid,
-        wecatalog_group=wecatalog_group,
-        wecatalog_tag=wecatalog_tag,
-        ca_id=ca_id,
-        ca_path_ko=ca_path_ko,
-        ca_path_zh=ca_path_zh,
-        title=title,
-        price=price,
-        stock_qty=stock_qty,
-        sc_type=sc_type,
-        desc_html=desc_html,
-        img_slots=img_slots,
-    )
+    fill_it_explan = _bool_env("SEVEN17_FILL_IT_EXPLAN", False        )
     if not fill_it_explan:
         _log.info(
             "%s",
@@ -1192,15 +1274,7 @@ def _fill_itemform(
         )
 
     # 必须等主表单 ready 后再填；否则 select/fill 会出现定位成功但值未落地的问题。
-    wait_t0 = time.perf_counter()
     page.wait_for_selector('form[name="fitemform"]', timeout=60_000)
-    _upload_phase_log(
-        "upload.fill.wait_form",
-        "等待 fitemform 表单出现在 DOM",
-        elapsed_ms=_ms_since(wait_t0),
-        thread_label=thread_label,
-        extra=[("goods_id", gid)],
-    )
 
     core_t0 = time.perf_counter()
     # 分类：必须来自 tag 映射后的 seven17 ca_id。
@@ -1260,39 +1334,6 @@ def _fill_itemform(
                 page.wait_for_timeout(800)
             except Exception:
                 pass
-        _log.info(
-            "%s",
-            pf_kv(
-                [
-                    ("event", "itemform.option"),
-                    ("goods_id", gid),
-                    ("source", "attr_map_ko"),
-                    ("opt_count", len(option_pairs)),
-                    ("opt_subjects", ",".join(x[0] for x in option_pairs)),
-                ],
-                zh="已填写商品选择选项（韩文）",
-            ),
-        )
-    else:
-        _log.info(
-            "%s",
-            pf_kv(
-                [
-                    ("event", "itemform.option"),
-                    ("goods_id", gid),
-                    ("reason", "no_korean_attr_map"),
-                ],
-                zh="跳过商品选择选项：无可用韩文选项",
-            ),
-        )
-
-    _upload_phase_log(
-        "upload.fill.core_fields",
-        "已填写分类/标题/价格/库存/选项",
-        elapsed_ms=_ms_since(core_t0),
-        thread_label=thread_label,
-        extra=[("goods_id", gid), ("opt_pairs", len(option_pairs))],
-    )
 
     if fill_it_explan:
         editor_t0 = time.perf_counter()
@@ -1568,6 +1609,7 @@ def _log_upload_pending(
     threads: int | None = None,
     last_goods_id: str | None = None,
     last_outcome: str | None = None,
+    stats: dict[str, Any] | None = None,
 ) -> None:
     t0 = time.perf_counter()
     pending_upload = _count_uploadable_pending(
@@ -1589,11 +1631,15 @@ def _log_upload_pending(
         kv.append(("threads", threads))
     if thread_label:
         kv.append(("thread", thread_label))
+    if stats is not None:
+        kv.append(("ok", stats.get("ok", 0)))
+        kv.append(("fail", stats.get("fail", 0)))
+        kv.append(("skip", stats.get("skip", 0)))
     if last_goods_id:
-        kv.append(("last_goods_id", pf_goods_id({"goods_id": last_goods_id})))
+        kv.append(("last_goods_id", last_goods_id))
     if last_outcome:
         kv.append(("last_outcome", last_outcome))
-    _log.info("%s", pf_kv(kv, zh="待上传商品数"))
+    _log.info("%s", pf_kv(kv, zh="待上传商品状态"))
 
 
 def _refresh_upload_runtime_caches() -> None:
@@ -1780,14 +1826,6 @@ def _process_upload_record(
     th_kv = [("thread", thread_label)] if thread_label else []
     record_t0 = time.perf_counter()
 
-    _upload_phase_log(
-        "upload.record.begin",
-        "开始处理单条上架（尚未打开/刷新表单）",
-        thread_label=thread_label,
-        rec=rec,
-        extra=[("max_img", ctx.max_img), ("dry_run", 1 if ctx.dry_run else 0)],
-    )
-
     prep_t0 = time.perf_counter()
     com = commodity_from_wecatalog_record(rec)
     if com is None:
@@ -1811,18 +1849,6 @@ def _process_upload_record(
                 "error": "无法解析 seven17 分类：请在 05 商品库浏览「分类配对」中配置韩文路径并同步 path_ca_map",
             },
         )
-    _log.info(
-        "%s",
-        pf_kv(
-            [
-                ("event", "upload.ca_id"),
-                *pf_store_row_id_kv(rec),
-                ("ca_id", ca_id),
-                ("source", ca_src),
-            ],
-            zh="本条上架分类来源",
-        ),
-    )
     upload_title = _upload_title_from_record(
         rec,
         prod,
@@ -1848,19 +1874,6 @@ def _process_upload_record(
         )
     desc_html = _desc_html_from_llm_ko(desc_ko)
     desc_src = "llm_desc_ko"
-    _log.info(
-        "%s",
-        pf_kv(
-            [
-                *th_kv,
-                ("event", "desc.source"),
-                *pf_store_row_id_kv(rec),
-                ("source", desc_src),
-                ("desc_len", len(desc_html)),
-            ],
-            zh="本条商品说明来源",
-        ),
-    )
 
     urls = prod["image_urls"][: ctx.max_img]
     if not urls:
@@ -1870,17 +1883,9 @@ def _process_upload_record(
             return "skip", {"goods_id": gid, "error": "商品媒体为视频，无上架静态图，已跳过"}
         return "fail", {"goods_id": gid, "error": "无主图/图片 URL（imgsSrc/imgs）"}
 
-    _upload_phase_log(
-        "upload.record.prep_done",
-        "本条上架字段/分类/标题/描述已就绪，开始取图片",
-        elapsed_ms=_ms_since(prep_t0),
-        thread_label=thread_label,
-        rec=rec,
-        extra=[("img_count", len(urls))],
-    )
-
     img_t0 = time.perf_counter()
     img_source = "sync"
+    tmp_files: list[Path] = []
     try:
         if image_prefetch is not None:
             tmp_files, img_source = image_prefetch.acquire_images(
@@ -1898,18 +1903,6 @@ def _process_upload_record(
         if image_prefetch is not None:
             image_prefetch.release_record(rec)
         return "fail", {"goods_id": gid, "error": f"图片下载失败: {e}"}
-
-    _upload_phase_log(
-        "upload.images_done",
-        "商品图片已就绪",
-        elapsed_ms=_ms_since(img_t0),
-        thread_label=thread_label,
-        rec=rec,
-        extra=[
-            ("count", len(tmp_files)),
-            ("source", img_source),
-        ],
-    )
 
     dialogs.clear()
     try:
@@ -1934,17 +1927,6 @@ def _process_upload_record(
         ):
             fx_t0 = time.perf_counter()
             krw_pc, fx_src = _resolve_krw_per_cny()
-            _upload_phase_log(
-                "upload.fx.resolve",
-                "解析 CNY→KRW 汇率",
-                elapsed_ms=_ms_since(fx_t0),
-                thread_label=thread_label,
-                rec=rec,
-                extra=[
-                    ("krw_per_cny", krw_pc),
-                    ("source", _fx_source_cn(fx_src or "")),
-                ],
-            )
             fx_rate = krw_pc
             listing_price, price_src = _resolve_upload_listing_price_krw(
                 rec,
@@ -1977,14 +1959,6 @@ def _process_upload_record(
         if skip_price_fill:
             listing_price = ""
             price_src = "whitelist_no_price"
-            _upload_phase_log(
-                "upload.price.resolve",
-                "无价白名单：不换算、不填售价",
-                elapsed_ms=_ms_since(price_t0),
-                thread_label=thread_label,
-                rec=rec,
-                extra=[("price_src", price_src)],
-            )
         elif not str(listing_price).strip():
             if fx_rate is None and ctx.convert_fx:
                 krw_pc, fx_src = _resolve_krw_per_cny()
@@ -1999,16 +1973,6 @@ def _process_upload_record(
         if not skip_price_fill and not str(listing_price).strip():
             return "skip", {"goods_id": gid, "error": "无法得到有效售价，已跳过"}
 
-        if not skip_price_fill:
-            _upload_phase_log(
-                "upload.price.resolve",
-                "韩元售价已确定",
-                elapsed_ms=_ms_since(price_t0),
-                thread_label=thread_label,
-                rec=rec,
-                extra=[("price_src", price_src), ("it_price", listing_price)],
-            )
-
         rec["price_krw"] = listing_price if listing_price else None
         fx_log_rate: float | None = fx_rate if price_src in (
             "price_cny",
@@ -2020,16 +1984,7 @@ def _process_upload_record(
             (_price_cny_usable(rec) or None) if fx_log_rate is not None else None
         )
         if ctx.write_back_after_llm and _upload_db_write_needed(price_src):
-            wb_t0 = time.perf_counter()
             sqlite_update_upload_fields(conn, aid, rec)
-            _upload_phase_log(
-                "upload.db.price_write",
-                "写回上架衍生字段到 SQLite（本次韩元价经换算或新得出）",
-                elapsed_ms=_ms_since(wb_t0),
-                thread_label=thread_label,
-                rec=rec,
-                extra=[("price_src", price_src)],
-            )
 
         ca_ko, ca_zh = _ca_id_log_paths(gname, tname)
         last_fail_reason: str | None = None
@@ -2054,21 +2009,13 @@ def _process_upload_record(
 
             goto_t0 = time.perf_counter()
             _upload_phase_log(
-                "upload.goto.itemform",
-                "打开后台新增商品表单页",
+                "upload.goto.form",
+                "打开并等待商品表单页就绪",
                 thread_label=thread_label,
                 rec=rec,
-                extra=[("attempt", upload_attempt + 1), ("url", ctx.itemform_url)],
+                extra=[("attempt", upload_attempt + 1)],
             )
             page.goto(ctx.itemform_url, wait_until="domcontentloaded", timeout=120_000)
-            _upload_phase_log(
-                "upload.goto.itemform.done",
-                "商品表单页 domcontentloaded",
-                elapsed_ms=_ms_since(goto_t0),
-                thread_label=thread_label,
-                rec=rec,
-                extra=[("page_url", _preview_text(page.url, 120))],
-            )
             if _page_is_login(page):
                 if upload_attempt == 0 and _relogin_upload_session(
                     page, ctx, thread_label=thread_label, rec=rec
@@ -2085,12 +2032,6 @@ def _process_upload_record(
                     )
 
             fill_t0 = time.perf_counter()
-            _upload_phase_log(
-                "upload.fill.begin",
-                "开始在浏览器中填写表单",
-                thread_label=thread_label,
-                rec=rec,
-            )
             _fill_itemform(
                 page,
                 goods_id=gid,
@@ -2116,7 +2057,7 @@ def _process_upload_record(
             )
             _upload_phase_log(
                 "upload.fill.done",
-                "浏览器表单填写完成",
+                "表单填写完成",
                 elapsed_ms=_ms_since(fill_t0),
                 thread_label=thread_label,
                 rec=rec,
@@ -2147,21 +2088,8 @@ def _process_upload_record(
                 return "ok", None
 
             submit_t0 = time.perf_counter()
-            _upload_phase_log(
-                "upload.submit.click",
-                "点击商品表单提交",
-                thread_label=thread_label,
-                rec=rec,
-            )
             click_itemform_submit(page)
             page.wait_for_load_state("load", timeout=120_000)
-            _upload_phase_log(
-                "upload.submit.wait_load",
-                "提交后等待页面 load",
-                elapsed_ms=_ms_since(submit_t0),
-                thread_label=thread_label,
-                rec=rec,
-            )
 
             ok_submit, it_id, fail_reason = _classify_after_submit(page, dialogs)
             if ok_submit:
@@ -2183,11 +2111,20 @@ def _process_upload_record(
                 print(json.dumps(row_out, ensure_ascii=False))
                 _upload_phase_log(
                     "upload.record.done",
-                    "本条上架成功",
+                    "上架成功",
                     elapsed_ms=_ms_since(record_t0),
                     thread_label=thread_label,
                     rec=rec,
-                    extra=[("it_id", it_id or "")],
+                    extra=[
+                        ("it_id", it_id or ""),
+                        ("ca_id", ca_id),
+                        ("price_src", price_src),
+                        ("it_price", listing_price),
+                        ("img_count", len(tmp_files)),
+                        ("img_source", img_source),
+                        ("desc_len", len(desc_html)),
+                        ("title", _preview_text(upload_title, 120)),
+                    ],
                 )
                 return "ok", None
 
@@ -2198,17 +2135,22 @@ def _process_upload_record(
 
         _upload_phase_log(
             "upload.record.fail",
-            "本条上架失败",
+            "上架失败",
             elapsed_ms=_ms_since(record_t0),
             thread_label=thread_label,
             rec=rec,
-            extra=[("error", last_fail_reason or "未知错误")],
+            extra=[
+                ("error", last_fail_reason or "未知错误"),
+                ("ca_id", ca_id),
+                ("price_src", price_src),
+                ("it_price", listing_price),
+            ],
         )
         return "fail", {"goods_id": gid, "error": last_fail_reason or "未知错误"}
     except Exception as e:
         _upload_phase_log(
             "upload.record.exception",
-            "本条上架异常",
+            "上架异常",
             elapsed_ms=_ms_since(record_t0),
             thread_label=thread_label,
             rec=rec,
@@ -2218,8 +2160,7 @@ def _process_upload_record(
     finally:
         if image_prefetch is not None:
             image_prefetch.release_record(rec)
-        for pth in tmp_files:
-            pth.unlink(missing_ok=True)
+        _cleanup_upload_temp_images(tmp_files, thread_label=thread_label, rec=rec)
 
 
 def _upload_claim_loop(
@@ -2277,11 +2218,6 @@ def _upload_claim_loop(
                 )
             break
 
-        _upload_phase_log(
-            "upload.claim.start",
-            "读库扫描下一条可上架商品",
-            thread_label=thread_label,
-        )
         rec = _claim_next_uploadable(
             conn,
             ctx.album_id,
@@ -2335,13 +2271,14 @@ def _upload_claim_loop(
             in_flight=in_flight,
         )
         gid_done = str(rec.get("goods_id") or "").strip() or "-"
-        _log_upload_pending(
-            conn,
-            ctx,
-            thread_label=thread_label,
-            last_goods_id=gid_done,
-            last_outcome=outcome,
-        )
+        running = (target.get("ok", 0) + target.get("fail", 0) + target.get("skip", 0))
+        if running % 10 == 0 or running <= 3:
+            _log_upload_pending(
+                conn,
+                ctx,
+                thread_label=thread_label,
+                stats=target,
+            )
 
 
 def _run_upload_multithread_claim_loop(
@@ -2538,8 +2475,7 @@ def _run_upload_multithread_claim_loop(
                                     conn,
                                     ctx,
                                     thread_label=label,
-                                    last_goods_id=gid_done,
-                                    last_outcome=outcome,
+                                    stats=stats,
                                 )
                                 work_q.task_done()
                     finally:

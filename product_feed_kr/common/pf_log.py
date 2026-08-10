@@ -3,7 +3,10 @@
 from __future__ import annotations
 
 import logging
+import os
 import sys
+import time
+from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any
 
@@ -239,3 +242,38 @@ def pf_kv(pairs: list[tuple[str, Any]], *, val_max: int = 220, zh: str | None = 
             continue
         out.append(f"{k}={sv}")
     return " ".join(out)
+
+
+def default_log_dir() -> Path:
+    from product_feed_kr._paths import REPO_ROOT
+
+    return REPO_ROOT / "data" / "logs"
+
+
+def cleanup_old_logs(
+    *,
+    max_age_days: int = 7,
+    log_dir: Path | None = None,
+    pattern: str = "*.log",
+) -> int:
+    """删除超过 ``max_age_days`` 天的日志文件，返回删除数。"""
+    if log_dir is None:
+        log_dir = default_log_dir()
+    if not log_dir.is_dir():
+        return 0
+    cutoff = time.time() - max_age_days * 86400
+    removed = 0
+    for f in log_dir.glob(pattern):
+        if f.is_file():
+            try:
+                if f.stat().st_mtime < cutoff:
+                    os.unlink(f)
+                    removed += 1
+            except OSError:
+                pass
+    return removed
+
+
+def log_older_than(log_dir: Path | None = None, max_age_days: int = 7) -> int:
+    """兼容旧名。"""
+    return cleanup_old_logs(max_age_days=max_age_days, log_dir=log_dir)
