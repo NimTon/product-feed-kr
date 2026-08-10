@@ -547,50 +547,6 @@
       min-height: 18px;
     }
     .pair-status.err { color: var(--err); }
-    dialog.whitelist-dlg {
-      max-width: min(920px, 94vw);
-      width: min(920px, 94vw);
-    }
-    .whitelist-list {
-      border: 1px solid var(--border);
-      border-radius: 8px;
-      background: var(--bg);
-      max-height: 58vh;
-      overflow: auto;
-      padding: 6px;
-    }
-    .whitelist-group {
-      margin-bottom: 8px;
-      padding-bottom: 6px;
-      border-bottom: 1px solid rgba(45, 58, 79, 0.45);
-    }
-    .whitelist-group:last-child { border-bottom: none; margin-bottom: 0; }
-    .whitelist-row {
-      display: flex;
-      align-items: flex-start;
-      gap: 8px;
-      padding: 5px 6px;
-      border-radius: 6px;
-      cursor: pointer;
-      font-size: 12px;
-      line-height: 1.35;
-    }
-    .whitelist-row:hover { background: rgba(61, 139, 253, 0.08); }
-    .whitelist-row.root {
-      font-weight: 600;
-      color: var(--text);
-      margin-bottom: 2px;
-    }
-    .whitelist-row.child {
-      padding-left: 22px;
-      color: var(--text);
-    }
-    .whitelist-row input[type="checkbox"] {
-      margin: 2px 0 0;
-      flex: 0 0 auto;
-      cursor: pointer;
-    }
-    .whitelist-row .wl-label { flex: 1; min-width: 0; word-break: break-word; }
     .whitelist-tools {
       display: flex;
       flex-wrap: wrap;
@@ -599,6 +555,151 @@
       align-items: center;
     }
     .whitelist-tools .pair-search { max-width: 360px; flex: 1 1 220px; }
+    dialog.cat-wl-dlg {
+      max-width: min(980px, 96vw);
+      width: min(980px, 96vw);
+    }
+    .cat-wl-toolbar {
+      display: flex;
+      flex-wrap: wrap;
+      gap: 10px 16px;
+      align-items: center;
+      margin-bottom: 10px;
+    }
+    .cat-wl-toolbar label { font-size: 12px; color: var(--muted); margin-right: 6px; }
+    .cat-wl-table-wrap {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--bg);
+      max-height: 46vh;
+      overflow: auto;
+    }
+    table.cat-wl-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+    table.cat-wl-table th,
+    table.cat-wl-table td {
+      padding: 6px 8px;
+      border-bottom: 1px solid rgba(45, 58, 79, 0.35);
+      vertical-align: middle;
+    }
+    table.cat-wl-table th {
+      position: sticky;
+      top: 0;
+      background: var(--panel);
+      z-index: 1;
+      font-weight: 600;
+      text-align: left;
+    }
+    table.cat-wl-table th.col-check { width: 56px; text-align: center; }
+    table.cat-wl-table td.col-check { text-align: center; }
+    table.cat-wl-table tr.group-row td {
+      background: rgba(61, 139, 253, 0.06);
+      font-weight: 600;
+    }
+    table.cat-wl-table tr.tag-row td:first-child { padding-left: 22px; }
+    dialog.scrape-priority-dlg {
+      max-width: min(640px, 92vw);
+      width: min(640px, 92vw);
+    }
+    dialog.scrape-summary-dlg {
+      max-width: min(900px, 96vw);
+      width: min(900px, 96vw);
+    }
+    .scrape-summary-table-wrap {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--bg);
+      max-height: 60vh;
+      overflow: auto;
+    }
+    table.scrape-summary-table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 12px;
+    }
+    table.scrape-summary-table th,
+    table.scrape-summary-table td {
+      padding: 6px 8px;
+      border-bottom: 1px solid rgba(45, 58, 79, 0.35);
+      vertical-align: middle;
+      white-space: nowrap;
+    }
+    table.scrape-summary-table th {
+      position: sticky;
+      top: 0;
+      background: var(--panel);
+      z-index: 1;
+      font-weight: 600;
+      text-align: right;
+    }
+    table.scrape-summary-table th.col-label {
+      text-align: left;
+    }
+    table.scrape-summary-table td.col-label {
+      text-align: left;
+      white-space: normal;
+      word-break: break-word;
+    }
+    table.scrape-summary-table td {
+      text-align: right;
+      font-family: ui-monospace, Consolas, monospace;
+    }
+    table.scrape-summary-table tr.totals-row td {
+      font-weight: 700;
+      background: rgba(61, 139, 253, 0.08);
+      border-top: 2px solid var(--border);
+    }
+    .scrape-summary-meta {
+      margin: 0 0 10px;
+      font-size: 11px;
+      color: var(--muted);
+    }
+    dialog.upload-settings-dlg {
+      max-width: min(480px, 92vw);
+      width: min(480px, 92vw);
+    }
+    .upload-settings-field {
+      display: flex;
+      flex-wrap: wrap;
+      align-items: center;
+      gap: 10px;
+      margin: 12px 0;
+    }
+    .upload-settings-field input[type="number"] {
+      width: 120px;
+    }
+    .scrape-priority-list {
+      border: 1px solid var(--border);
+      border-radius: 8px;
+      background: var(--bg);
+      max-height: 58vh;
+      overflow: auto;
+      padding: 4px;
+    }
+    .cat-wl-priority-item {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 5px 6px;
+      border-radius: 6px;
+      font-size: 12px;
+    }
+    .cat-wl-priority-item:hover { background: rgba(61, 139, 253, 0.08); }
+    .cat-wl-priority-item .ord {
+      width: 28px;
+      color: var(--muted);
+      text-align: right;
+      flex: 0 0 auto;
+    }
+    .cat-wl-priority-item .label { flex: 1; min-width: 0; word-break: break-word; }
+    .cat-wl-priority-item .ord-inp {
+      width: 72px;
+      text-align: center;
+      flex: 0 0 auto;
+    }
   </style>
 </head>
 <body>
@@ -637,7 +738,11 @@
         <button type="button" id="btnSearch">查询</button>
         <button type="button" class="secondary" id="btnReload">刷新</button>
         <button type="button" class="secondary" id="btnCategoryMap">分类配对</button>
-        <button type="button" class="secondary" id="btnNoPriceWhitelist">无价白名单</button>
+        <button type="button" class="secondary" id="btnCategoryWhitelist">分类白名单</button>
+        <button type="button" class="secondary" id="btnScrapePriority">抓取优先级</button>
+        <button type="button" class="secondary" id="btnUploadSettings">上架设置</button>
+        <button type="button" class="secondary" id="btnUploadPriority">上架优先级</button>
+        <button type="button" class="secondary" id="btnScrapeSummary">分类汇总</button>
         <button type="button" class="secondary" id="btnDiagnoseOpen">不上架诊断</button>
       </div>
     </div>
@@ -742,24 +847,125 @@
     </div>
   </dialog>
 
-  <dialog id="whitelistDlg" class="whitelist-dlg">
+  <dialog id="catWlDlg" class="cat-wl-dlg">
     <div class="modal-head">
-      <strong>无价白名单 · 微猫 (分组 / 标签)</strong>
+      <strong>分类白名单 · 微猫 (分组 / 标签)</strong>
       <div class="modal-actions">
-        <button type="button" id="btnWhitelistSave">保存</button>
-        <button type="button" class="secondary" id="btnWhitelistClose">关闭</button>
+        <button type="button" id="btnCatWlSave">保存</button>
+        <button type="button" class="secondary" id="btnCatWlClose">关闭</button>
       </div>
     </div>
     <div class="modal-body">
-      <p class="pair-map-hint">勾选允许「无价格仍采集/上架」的微猫分类。勾选分组（root）将自动勾选其下全部子标签；保存至 <span class="mono">config/seven17.json</span> 的 <span class="mono">SEVEN17_NO_PRICE_ALLOW_CATEGORIES</span>。</p>
-      <div class="pair-map-meta" id="whitelistMeta"></div>
-      <div class="whitelist-tools">
-        <input type="search" id="whitelistSearch" class="pair-search" placeholder="搜索分组 / 标签" autocomplete="off" />
-        <button type="button" class="secondary btn-xs" id="btnWhitelistAllVisible">全选当前显示</button>
-        <button type="button" class="secondary btn-xs" id="btnWhitelistNoneVisible">全不选当前显示</button>
+      <p class="pair-map-hint">左侧为微猫全部分类（与「分类配对」无关）。右侧两列可独立勾选：<strong>抓取</strong>决定 01 采集范围；<strong>无价</strong>允许无价格仍采集/上架。抓取顺序请在「抓取优先级」设置（01 单进程按序逐个分类抓完）。</p>
+      <div class="pair-map-meta" id="catWlMeta"></div>
+      <div class="cat-wl-toolbar">
+        <input type="search" id="catWlSearch" class="pair-search" placeholder="搜索分组 / 标签" autocomplete="off" />
+        <button type="button" class="secondary btn-xs" id="btnCatWlScrapeAllVisible">抓取·全选可见</button>
+        <button type="button" class="secondary btn-xs" id="btnCatWlScrapeNoneVisible">抓取·全不选可见</button>
       </div>
-      <div class="whitelist-list" id="whitelistList"></div>
-      <div class="pair-status" id="whitelistStatus"></div>
+      <div class="cat-wl-table-wrap">
+        <table class="cat-wl-table">
+          <thead>
+            <tr>
+              <th>微猫分类</th>
+              <th class="col-check">抓取</th>
+              <th class="col-check">无价</th>
+            </tr>
+          </thead>
+          <tbody id="catWlBody"></tbody>
+        </table>
+      </div>
+      <div class="pair-status" id="catWlStatus"></div>
+    </div>
+  </dialog>
+
+  <dialog id="scrapePriorityDlg" class="scrape-priority-dlg">
+    <div class="modal-head">
+      <strong>抓取优先级 · 子类顺序</strong>
+      <div class="modal-actions">
+        <button type="button" id="btnScrapePrioritySave">保存</button>
+        <button type="button" class="secondary" id="btnScrapePriorityClose">关闭</button>
+      </div>
+    </div>
+    <div class="modal-body">
+      <p class="pair-map-hint">仅包含「分类白名单」中已勾选<strong>抓取</strong>的子类（显示为「大类 / 子类」）。右侧填序号调整 01 采集顺序（1 最优先）。保存至 <span class="mono">data/wecatalog_scrape_whitelist.json</span>。<strong>最大并行</strong>供并行采集脚本使用，不得超过抓取项数。</p>
+      <div class="pair-map-meta" id="scrapePriorityMeta"></div>
+      <div class="cat-wl-toolbar">
+        <span>
+          <label for="scrapePriorityMaxParallel">最大并行</label>
+          <input type="number" id="scrapePriorityMaxParallel" min="1" max="16" step="1" value="1" style="width:64px" />
+        </span>
+      </div>
+      <div class="scrape-priority-list" id="scrapePriorityList"></div>
+      <div class="pair-status" id="scrapePriorityStatus"></div>
+    </div>
+  </dialog>
+
+  <dialog id="uploadSettingsDlg" class="upload-settings-dlg">
+    <div class="modal-head">
+      <strong>上架设置</strong>
+      <div class="modal-actions">
+        <button type="button" id="btnUploadSettingsSave">保存</button>
+        <button type="button" class="secondary" id="btnUploadSettingsClose">关闭</button>
+      </div>
+    </div>
+    <div class="modal-body">
+      <p class="pair-map-hint">上传至 seven17 前对商品图做等比缩放（长边不超过设定值）。填 <strong>0</strong> 表示保持原图尺寸。保存至 <span class="mono">config/seven17.json</span> 的 <span class="mono">SEVEN17_UPLOAD_IMAGE_MAX_PX</span>，下次上架生效。</p>
+      <div class="pair-map-meta" id="uploadSettingsMeta"></div>
+      <div class="upload-settings-field">
+        <label for="uploadImageMaxPx">上传图片最大边长（像素）</label>
+        <input type="number" id="uploadImageMaxPx" min="0" max="8192" step="1" value="0" />
+      </div>
+      <div class="pair-status" id="uploadSettingsStatus"></div>
+    </div>
+  </dialog>
+
+  <dialog id="uploadPriorityDlg" class="scrape-priority-dlg">
+    <div class="modal-head">
+      <strong>上架优先级 · 子类顺序</strong>
+      <div class="modal-actions">
+        <button type="button" id="btnUploadPrioritySave">保存</button>
+        <button type="button" class="secondary" id="btnUploadPriorityClose">关闭</button>
+      </div>
+    </div>
+    <div class="modal-body">
+      <p class="pair-map-hint">按微猫「分组 / 标签」设置上架优先级（1 最优先）。仅已填序号的子类参与优先排序；未填序号的按微猫上架时间排列。保存至 <span class="mono">data/wecatalog_upload_priority.json</span>。</p>
+      <div class="pair-map-meta" id="uploadPriorityMeta"></div>
+      <div class="cat-wl-toolbar">
+        <input type="search" id="uploadPrioritySearch" class="pair-search" placeholder="搜索分组 / 标签" autocomplete="off" />
+      </div>
+      <div class="scrape-priority-list" id="uploadPriorityList"></div>
+      <div class="pair-status" id="uploadPriorityStatus"></div>
+    </div>
+  </dialog>
+
+  <dialog id="scrapeSummaryDlg" class="scrape-summary-dlg">
+    <div class="modal-head">
+      <strong>爬取分类汇总</strong>
+      <div class="modal-actions">
+        <button type="button" class="secondary" id="btnScrapeSummaryRefresh">刷新</button>
+        <button type="button" class="secondary" id="btnScrapeSummaryClose">关闭</button>
+      </div>
+    </div>
+    <div class="modal-body">
+      <p class="scrape-summary-meta" id="scrapeSummaryMeta">加载中…</p>
+      <div class="scrape-summary-table-wrap">
+        <table class="scrape-summary-table">
+          <thead>
+            <tr>
+              <th class="col-label">分组 / 标签</th>
+              <th>总数</th>
+              <th>可处理</th>
+              <th>LLM已处理</th>
+              <th>可上传</th>
+              <th>已上传</th>
+              <th>待重爬</th>
+            </tr>
+          </thead>
+          <tbody id="scrapeSummaryBody"></tbody>
+        </table>
+      </div>
+      <div class="pair-status" id="scrapeSummaryStatus"></div>
     </div>
   </dialog>
 
@@ -801,11 +1007,25 @@
       dirty: false,
       meta: null,
     };
-    const whitelistState = {
+    const catWlState = {
       groups: [],
-      selected: new Set(),
-      configPath: "",
+      scrapeSelected: new Set(),
+      noPriceSelected: new Set(),
+      scrapeOrder: [],
+      maxParallel: 1,
+      paths: {},
       dirty: false,
+      priorityDirty: false,
+    };
+    const uploadSettingsState = {
+      configPath: "",
+      uploadImageMaxPx: 0,
+    };
+    const uploadPriorityState = {
+      pairs: [],
+      priorityPairs: [],
+      dirty: false,
+      path: "",
     };
 
     const $ = (id) => document.getElementById(id);
@@ -1893,8 +2113,15 @@
         if (!res.ok || data.ok === false) {
           throw new Error((data.errors && data.errors.join("; ")) || data.error || res.statusText);
         }
+        $("pairSearchWc").value = "";
+        $("pairSearchS17").value = "";
         await loadCategoryMaps();
-        setPairStatus("分类 JSON 已更新");
+        const wc = data.wecatalog || {};
+        const s17 = data.seven17 || {};
+        const wcGroups = wc.group_count != null ? wc.group_count : (wc.groups || []).length;
+        const wcTags = wc.tag_count != null ? wc.tag_count : (wc.groups || []).reduce((n, g) => n + ((g.tags || []).length), 0);
+        const s17N = (s17.categories || []).length;
+        setPairStatus(`分类已更新：微猫 ${wcGroups} 组 / ${wcTags} 标签 · 韩文 ${s17N} 条`);
       } catch (e) {
         setPairStatus("同步失败: " + e.message, true);
       } finally {
@@ -1973,192 +2200,675 @@
       }
     }
 
-    function setWhitelistStatus(msg, isErr) {
-      const el = $("whitelistStatus");
+    function setCatWlStatus(msg, isErr) {
+      const el = $("catWlStatus");
       el.textContent = msg || "";
       el.className = "pair-status" + (isErr ? " err" : "");
     }
 
-    function whitelistGroupTags(g) {
-      return (g.tags || []).map((t) => String(t.tagName || "").trim()).filter(Boolean);
-    }
-
-    function isGroupAllSelected(gname, tags) {
-      return tags.length > 0 && tags.every((t) => whitelistState.selected.has(pairKey(gname, t)));
-    }
-
-    function isGroupSomeSelected(gname, tags) {
-      return tags.some((t) => whitelistState.selected.has(pairKey(gname, t)));
-    }
-
-    function setGroupSelected(gname, tags, checked) {
-      for (const t of tags) {
-        const k = pairKey(gname, t);
-        if (checked) whitelistState.selected.add(k);
-        else whitelistState.selected.delete(k);
-      }
-      whitelistState.dirty = true;
-    }
-
-    function whitelistItemMatches(gname, tname, q) {
+    function catWlItemMatches(gname, tname, q) {
       if (!q) return true;
       if (pairTextMatches(gname, q)) return true;
       if (pairTextMatches(tname, q)) return true;
       if (pairTextMatches(`${gname} / ${tname}`, q)) return true;
-      if (pairTextMatches(`[${gname}] ${tname}`, q)) return true;
       return false;
     }
 
-    function renderWhitelistList() {
-      const root = $("whitelistList");
-      root.innerHTML = "";
-      const q = pairSearchNorm($("whitelistSearch") && $("whitelistSearch").value);
-      let visibleTags = 0;
-      let visibleGroups = 0;
+    function catWlGroupTags(g) {
+      return (g.tags || []).map((t) => String(t.tagName || "").trim()).filter(Boolean);
+    }
 
-      for (const g of whitelistState.groups) {
+    function setCatWlScrape(gname, tname, checked) {
+      const k = pairKey(gname, tname);
+      if (checked) {
+        catWlState.scrapeSelected.add(k);
+        if (!catWlState.scrapeOrder.some((p) => pairKey(p[0], p[1]) === k)) {
+          catWlState.scrapeOrder.push([gname, tname]);
+        }
+      } else {
+        catWlState.scrapeSelected.delete(k);
+        catWlState.scrapeOrder = catWlState.scrapeOrder.filter((p) => pairKey(p[0], p[1]) !== k);
+      }
+      catWlState.dirty = true;
+    }
+
+    function setCatWlNoPrice(gname, tname, checked) {
+      const k = pairKey(gname, tname);
+      if (checked) catWlState.noPriceSelected.add(k);
+      else catWlState.noPriceSelected.delete(k);
+      catWlState.dirty = true;
+    }
+
+    function syncScrapeOrderFromSelection() {
+      const ordered = catWlState.scrapeOrder.filter((p) =>
+        catWlState.scrapeSelected.has(pairKey(p[0], p[1])),
+      );
+      const seen = new Set(ordered.map((p) => pairKey(p[0], p[1])));
+      for (const k of catWlState.scrapeSelected) {
+        if (seen.has(k)) continue;
+        const i = k.indexOf("\0");
+        ordered.push([k.slice(0, i), k.slice(i + 1)]);
+      }
+      catWlState.scrapeOrder = ordered;
+    }
+
+    function buildScrapePairsPayload() {
+      syncScrapeOrderFromSelection();
+      return catWlState.scrapeOrder.filter((p) =>
+        catWlState.scrapeSelected.has(pairKey(p[0], p[1])),
+      );
+    }
+
+    function clampMaxParallel(n, scrapeCount) {
+      const v = Math.max(1, parseInt(n, 10) || 1);
+      if (scrapeCount > 0) return Math.min(v, scrapeCount);
+      return v;
+    }
+
+    function syncScrapeParallelUi() {
+      syncScrapeOrderFromSelection();
+      const n = catWlState.scrapeOrder.length;
+      const inp = $("scrapePriorityMaxParallel");
+      if (!inp) return;
+      const cap = Math.max(1, n || 1);
+      inp.max = String(cap);
+      catWlState.maxParallel = clampMaxParallel(catWlState.maxParallel, n);
+      inp.value = String(catWlState.maxParallel);
+    }
+
+    function buildNoPricePairsPayload() {
+      return [...catWlState.noPriceSelected].map((k) => {
+        const i = k.indexOf("\0");
+        return [k.slice(0, i), k.slice(i + 1)];
+      });
+    }
+
+    function setScrapePriorityStatus(msg, isErr) {
+      const el = $("scrapePriorityStatus");
+      el.textContent = msg || "";
+      el.className = "pair-status" + (isErr ? " err" : "");
+    }
+
+    function applyScrapeOrderInput(fromIdx, rawValue) {
+      const n = catWlState.scrapeOrder.length;
+      if (!n) return false;
+      const parsed = parseInt(String(rawValue).trim(), 10);
+      if (!Number.isFinite(parsed)) return false;
+      const targetIdx = Math.max(0, Math.min(n - 1, parsed - 1));
+      if (targetIdx === fromIdx) return false;
+      const arr = [...catWlState.scrapeOrder];
+      const [item] = arr.splice(fromIdx, 1);
+      arr.splice(targetIdx, 0, item);
+      catWlState.scrapeOrder = arr;
+      catWlState.priorityDirty = true;
+      return true;
+    }
+
+    function renderScrapePriorityMeta() {
+      const paths = catWlState.paths || {};
+      const cap = catWlState.scrapeOrder.length;
+      $("scrapePriorityMeta").textContent =
+        `共 ${cap} 个子类 · 并行 ${catWlState.maxParallel}` +
+        (cap > 0 ? `（最大 ${cap}）` : "") +
+        ` · 配置: ${paths.scrape_whitelist || "—"}` +
+        (catWlState.priorityDirty ? " · 有未保存更改" : "");
+    }
+
+    function renderScrapePriorityList() {
+      const root = $("scrapePriorityList");
+      root.innerHTML = "";
+      syncScrapeOrderFromSelection();
+      if (!catWlState.scrapeOrder.length) {
+        root.innerHTML =
+          '<div class="muted" style="padding:8px">尚无抓取子类，请先在「分类白名单」勾选抓取列</div>';
+        renderScrapePriorityMeta();
+        syncScrapeParallelUi();
+        return;
+      }
+      const total = catWlState.scrapeOrder.length;
+      catWlState.scrapeOrder.forEach((p, idx) => {
+        const g = p[0];
+        const t = p[1];
+        const row = document.createElement("div");
+        row.className = "cat-wl-priority-item";
+        row.innerHTML =
+          `<span class="label">${esc(g)} / ${esc(t)}</span>` +
+          `<input type="number" class="ord-inp" min="1" max="${total}" step="1" value="${idx + 1}" title="序号，1 最优先" />`;
+        const inp = row.querySelector(".ord-inp");
+        const commit = () => {
+          const changed = applyScrapeOrderInput(idx, inp.value);
+          if (changed) renderScrapePriorityList();
+          else inp.value = String(idx + 1);
+        };
+        inp.addEventListener("change", commit);
+        inp.addEventListener("keydown", (e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            commit();
+            inp.blur();
+          }
+        });
+        root.appendChild(row);
+      });
+      renderScrapePriorityMeta();
+      syncScrapeParallelUi();
+    }
+
+    function renderCatWlMeta() {
+      const total = catWlState.groups.reduce((n, g) => n + catWlGroupTags(g).length, 0);
+      const paths = catWlState.paths || {};
+      $("catWlMeta").textContent =
+        `抓取 ${catWlState.scrapeSelected.size} · 无价 ${catWlState.noPriceSelected.size} / 共 ${total} 标签 · ` +
+        `抓取 JSON: ${paths.scrape_whitelist || "—"} · 无价: ${paths.no_price_config || "—"}` +
+        (catWlState.dirty ? " · 有未保存更改" : "");
+    }
+
+    function renderCatWlTable() {
+      const body = $("catWlBody");
+      body.innerHTML = "";
+      const q = pairSearchNorm($("catWlSearch") && $("catWlSearch").value);
+      let visible = 0;
+
+      for (const g of catWlState.groups) {
         const gname = String(g.groupName || "").trim();
         if (!gname) continue;
-        const allTags = whitelistGroupTags(g);
-        const visible = allTags.filter((t) => whitelistItemMatches(gname, t, q));
-        const groupMatch = pairTextMatches(gname, q);
-        if (!visible.length && !groupMatch) continue;
-        visibleGroups += 1;
-        visibleTags += visible.length;
+        const allTags = catWlGroupTags(g);
+        const tagRows = allTags.filter((t) => catWlItemMatches(gname, t, q));
+        if (!tagRows.length && !pairTextMatches(gname, q)) continue;
 
-        const block = document.createElement("div");
-        block.className = "whitelist-group";
+        const gtr = document.createElement("tr");
+        gtr.className = "group-row";
+        const scrapeAll = tagRows.length > 0 && tagRows.every((t) => catWlState.scrapeSelected.has(pairKey(gname, t)));
+        const scrapeSome = tagRows.some((t) => catWlState.scrapeSelected.has(pairKey(gname, t)));
+        const npAll = tagRows.length > 0 && tagRows.every((t) => catWlState.noPriceSelected.has(pairKey(gname, t)));
+        const npSome = tagRows.some((t) => catWlState.noPriceSelected.has(pairKey(gname, t)));
 
-        const rootRow = document.createElement("label");
-        rootRow.className = "whitelist-row root";
-        const rootCb = document.createElement("input");
-        rootCb.type = "checkbox";
-        const allSel = isGroupAllSelected(gname, allTags);
-        const someSel = isGroupSomeSelected(gname, allTags);
-        rootCb.checked = allSel;
-        rootCb.indeterminate = !allSel && someSel;
-        rootRow.appendChild(rootCb);
-        const rootLab = document.createElement("span");
-        rootLab.className = "wl-label";
-        rootLab.textContent = `[${gname}] 全组（${allTags.length} 项）`;
-        rootRow.appendChild(rootLab);
-        rootCb.addEventListener("change", () => {
-          setGroupSelected(gname, allTags, rootCb.checked);
-          renderWhitelistList();
-          setWhitelistStatus(rootCb.checked ? `已勾选分组「${gname}」全部子类` : `已取消分组「${gname}」全部子类（保存后生效）`);
+        gtr.innerHTML =
+          `<td>${esc(gname)} <span class="muted">(${allTags.length})</span></td>` +
+          `<td class="col-check"><input type="checkbox" data-grp-scrape="1" /></td>` +
+          `<td class="col-check"><input type="checkbox" data-grp-np="1" /></td>`;
+        const gScrapeCb = gtr.querySelector("[data-grp-scrape]");
+        const gNpCb = gtr.querySelector("[data-grp-np]");
+        gScrapeCb.checked = scrapeAll;
+        gScrapeCb.indeterminate = !scrapeAll && scrapeSome;
+        gNpCb.checked = npAll;
+        gNpCb.indeterminate = !npAll && npSome;
+        gScrapeCb.addEventListener("change", () => {
+          for (const t of allTags) setCatWlScrape(gname, t, gScrapeCb.checked);
+          renderCatWlTable();
         });
-        block.appendChild(rootRow);
+        gNpCb.addEventListener("change", () => {
+          for (const t of allTags) setCatWlNoPrice(gname, t, gNpCb.checked);
+          renderCatWlTable();
+          renderCatWlMeta();
+        });
+        body.appendChild(gtr);
 
-        const tagsToShow = visible.length ? visible : (groupMatch ? allTags : []);
+        const tagsToShow = tagRows.length ? tagRows : (pairTextMatches(gname, q) ? allTags : []);
         for (const tname of tagsToShow) {
-          const row = document.createElement("label");
-          row.className = "whitelist-row child";
-          const cb = document.createElement("input");
-          cb.type = "checkbox";
-          cb.checked = whitelistState.selected.has(pairKey(gname, tname));
-          row.appendChild(cb);
-          const lab = document.createElement("span");
-          lab.className = "wl-label";
-          lab.textContent = tname;
-          row.appendChild(lab);
-          cb.addEventListener("change", () => {
-            const k = pairKey(gname, tname);
-            if (cb.checked) whitelistState.selected.add(k);
-            else whitelistState.selected.delete(k);
-            whitelistState.dirty = true;
-            renderWhitelistList();
+          visible += 1;
+          const tr = document.createElement("tr");
+          tr.className = "tag-row";
+          tr.innerHTML =
+            `<td>${esc(tname)}</td>` +
+            `<td class="col-check"><input type="checkbox" data-scrape="1" /></td>` +
+            `<td class="col-check"><input type="checkbox" data-np="1" /></td>`;
+          const sCb = tr.querySelector("[data-scrape]");
+          const nCb = tr.querySelector("[data-np]");
+          sCb.checked = catWlState.scrapeSelected.has(pairKey(gname, tname));
+          nCb.checked = catWlState.noPriceSelected.has(pairKey(gname, tname));
+          sCb.addEventListener("change", () => {
+            setCatWlScrape(gname, tname, sCb.checked);
+            renderCatWlTable();
           });
-          block.appendChild(row);
+          nCb.addEventListener("change", () => {
+            setCatWlNoPrice(gname, tname, nCb.checked);
+            renderCatWlTable();
+            renderCatWlMeta();
+          });
+          body.appendChild(tr);
         }
-        root.appendChild(block);
       }
 
-      if (visibleGroups === 0) {
-        root.innerHTML = `<div class="pair-empty">${q ? "无匹配分类" : "暂无分类"}</div>`;
+      if (!body.children.length) {
+        body.innerHTML = `<tr><td colspan="3" class="pair-empty">${q ? "无匹配分类" : "暂无分类（请先同步微猫分类）"}</td></tr>`;
       }
-
-      const sel = whitelistState.selected.size;
-      const total = whitelistState.groups.reduce((n, g) => n + whitelistGroupTags(g).length, 0);
-      $("whitelistMeta").textContent =
-        `配置: ${whitelistState.configPath || "—"} · 已勾选 ${sel} / ${total} · 当前显示 ${visibleTags} 项` +
-        (whitelistState.dirty ? " · 有未保存更改" : "");
+      renderCatWlMeta();
     }
 
-    function ingestWhitelistData(data) {
-      whitelistState.groups = data.groups || [];
-      whitelistState.configPath = data.config_path || "";
-      whitelistState.selected = new Set();
-      for (const p of (data.selected || [])) {
+    function ingestCatWlData(data) {
+      catWlState.groups = data.groups || [];
+      catWlState.paths = data.paths || {};
+      catWlState.maxParallel = Math.max(1, parseInt(data.max_parallel, 10) || 1);
+      if ($("scrapePriorityMaxParallel")) {
+        $("scrapePriorityMaxParallel").value = String(catWlState.maxParallel);
+      }
+      catWlState.scrapeSelected = new Set();
+      catWlState.noPriceSelected = new Set();
+      catWlState.scrapeOrder = [];
+      for (const p of (data.scrape_pairs || [])) {
         if (!Array.isArray(p) || p.length < 2) continue;
-        whitelistState.selected.add(pairKey(p[0], p[1]));
+        catWlState.scrapeSelected.add(pairKey(p[0], p[1]));
+        catWlState.scrapeOrder.push([String(p[0]), String(p[1])]);
       }
-      whitelistState.dirty = false;
+      for (const p of (data.no_price_pairs || [])) {
+        if (!Array.isArray(p) || p.length < 2) continue;
+        catWlState.noPriceSelected.add(pairKey(p[0], p[1]));
+      }
+      catWlState.dirty = false;
+      catWlState.priorityDirty = false;
+      syncScrapeParallelUi();
     }
 
-    async function loadNoPriceWhitelist() {
-      setWhitelistStatus("加载中…");
-      const res = await fetch("/api/no-price-whitelist");
+    async function loadCategoryWhitelists() {
+      setCatWlStatus("加载中…");
+      const res = await fetch("/api/category-whitelists");
       if (!res.ok) throw new Error(res.status + " " + res.statusText);
       const data = await res.json();
       if (!data.ok) throw new Error(data.error || "load failed");
-      ingestWhitelistData(data);
-      renderWhitelistList();
-      setWhitelistStatus("");
+      ingestCatWlData(data);
+      renderCatWlTable();
+      setCatWlStatus("");
     }
 
-    async function openNoPriceWhitelistDialog() {
-      $("whitelistSearch").value = "";
-      $("whitelistDlg").showModal();
+    async function openCategoryWhitelistDialog() {
+      $("catWlSearch").value = "";
+      $("catWlDlg").showModal();
       try {
-        await loadNoPriceWhitelist();
+        await loadCategoryWhitelists();
       } catch (e) {
-        setWhitelistStatus("加载失败: " + e.message, true);
+        setCatWlStatus("加载失败: " + e.message, true);
       }
     }
 
-    function setWhitelistVisible(checked) {
-      const q = pairSearchNorm($("whitelistSearch").value);
-      for (const g of whitelistState.groups) {
-        const gname = String(g.groupName || "").trim();
-        if (!gname) continue;
-        const allTags = whitelistGroupTags(g);
-        for (const t of allTags) {
-          if (!whitelistItemMatches(gname, t, q) && !pairTextMatches(gname, q)) continue;
-          const k = pairKey(gname, t);
-          if (checked) whitelistState.selected.add(k);
-          else whitelistState.selected.delete(k);
-        }
-      }
-      whitelistState.dirty = true;
-      renderWhitelistList();
-    }
-
-    async function saveNoPriceWhitelistFromUi() {
-      $("btnWhitelistSave").disabled = true;
-      setWhitelistStatus("保存中…");
+    async function openScrapePriorityDialog() {
+      $("scrapePriorityDlg").showModal();
       try {
-        const pairs = [...whitelistState.selected].map((k) => {
-          const i = k.indexOf("\0");
-          return [k.slice(0, i), k.slice(i + 1)];
-        });
-        const res = await fetch("/api/no-price-whitelist", {
+        if (!catWlState.groups.length) await loadCategoryWhitelists();
+        else syncScrapeOrderFromSelection();
+        renderScrapePriorityList();
+        syncScrapeParallelUi();
+        setScrapePriorityStatus("");
+      } catch (e) {
+        setScrapePriorityStatus("加载失败: " + e.message, true);
+      }
+    }
+
+    async function saveScrapePriorityFromUi() {
+      $("btnScrapePrioritySave").disabled = true;
+      setScrapePriorityStatus("保存中…");
+      try {
+        syncScrapeParallelUi();
+        catWlState.maxParallel = clampMaxParallel(
+          $("scrapePriorityMaxParallel").value,
+          catWlState.scrapeOrder.length,
+        );
+        const res = await fetch("/api/category-whitelists", {
           method: "POST",
           headers: { "Content-Type": "application/json" },
-          body: JSON.stringify({ pairs }),
+          body: JSON.stringify({
+            scrape_pairs: buildScrapePairsPayload(),
+            no_price_pairs: buildNoPricePairsPayload(),
+            max_parallel: catWlState.maxParallel,
+          }),
         });
         const data = await res.json();
         if (!res.ok || !data.ok) throw new Error(data.error || res.statusText);
-        whitelistState.dirty = false;
-        await loadNoPriceWhitelist();
-        setWhitelistStatus(`已保存 ${data.selected_count} 项到 seven17.json`);
+        catWlState.priorityDirty = false;
+        await loadCategoryWhitelists();
+        renderScrapePriorityList();
+        setScrapePriorityStatus(`已保存 ${data.scrape_count} 个子类 · 并行 ${data.max_parallel}`);
       } catch (e) {
-        setWhitelistStatus("保存失败: " + e.message, true);
+        setScrapePriorityStatus("保存失败: " + e.message, true);
       } finally {
-        $("btnWhitelistSave").disabled = false;
+        $("btnScrapePrioritySave").disabled = false;
+      }
+    }
+
+    function setCatWlScrapeVisible(checked) {
+      const q = pairSearchNorm($("catWlSearch").value);
+      for (const g of catWlState.groups) {
+        const gname = String(g.groupName || "").trim();
+        if (!gname) continue;
+        for (const t of catWlGroupTags(g)) {
+          if (!catWlItemMatches(gname, t, q) && !pairTextMatches(gname, q)) continue;
+          setCatWlScrape(gname, t, checked);
+        }
+      }
+      renderCatWlTable();
+    }
+
+    async function saveCategoryWhitelistsFromUi() {
+      $("btnCatWlSave").disabled = true;
+      setCatWlStatus("保存中…");
+      try {
+        const res = await fetch("/api/category-whitelists", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            scrape_pairs: buildScrapePairsPayload(),
+            no_price_pairs: buildNoPricePairsPayload(),
+            max_parallel: catWlState.maxParallel,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) throw new Error(data.error || res.statusText);
+        catWlState.dirty = false;
+        await loadCategoryWhitelists();
+        setCatWlStatus(`已保存：抓取 ${data.scrape_count} · 无价 ${data.no_price_count}`);
+      } catch (e) {
+        setCatWlStatus("保存失败: " + e.message, true);
+      } finally {
+        $("btnCatWlSave").disabled = false;
+      }
+    }
+
+    function clampUploadImageMaxPx(raw, fallback = 0) {
+      const n = parseInt(String(raw ?? fallback), 10);
+      if (!Number.isFinite(n)) return 0;
+      return Math.max(0, Math.min(n, 8192));
+    }
+
+    function setUploadSettingsStatus(msg, isErr) {
+      const el = $("uploadSettingsStatus");
+      el.textContent = msg || "";
+      el.style.color = isErr ? "var(--err)" : "var(--muted)";
+    }
+
+    function renderUploadSettingsMeta() {
+      const px = clampUploadImageMaxPx($("uploadImageMaxPx").value, uploadSettingsState.uploadImageMaxPx);
+      const mode = px > 0 ? `长边 ≤ ${px}px（超出则缩为 JPEG）` : "不缩放（原图）";
+      $("uploadSettingsMeta").textContent =
+        `当前：${mode}` +
+        (uploadSettingsState.configPath ? ` · 配置: ${uploadSettingsState.configPath}` : "");
+    }
+
+    async function loadUploadSettings() {
+      setUploadSettingsStatus("加载中…");
+      const res = await fetch("/api/upload-settings");
+      if (!res.ok) throw new Error(res.status + " " + res.statusText);
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error || "load failed");
+      uploadSettingsState.configPath = data.config_path || "";
+      uploadSettingsState.uploadImageMaxPx = clampUploadImageMaxPx(data.upload_image_max_px);
+      $("uploadImageMaxPx").value = String(uploadSettingsState.uploadImageMaxPx);
+      renderUploadSettingsMeta();
+      setUploadSettingsStatus("");
+    }
+
+    async function openUploadSettingsDialog() {
+      $("uploadSettingsDlg").showModal();
+      try {
+        await loadUploadSettings();
+      } catch (e) {
+        setUploadSettingsStatus("加载失败: " + e.message, true);
+      }
+    }
+
+    async function saveUploadSettingsFromUi() {
+      $("btnUploadSettingsSave").disabled = true;
+      setUploadSettingsStatus("保存中…");
+      try {
+        const maxPx = clampUploadImageMaxPx($("uploadImageMaxPx").value);
+        $("uploadImageMaxPx").value = String(maxPx);
+        const res = await fetch("/api/upload-settings", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ upload_image_max_px: maxPx }),
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) throw new Error(data.error || res.statusText);
+        uploadSettingsState.uploadImageMaxPx = clampUploadImageMaxPx(data.upload_image_max_px);
+        uploadSettingsState.configPath = data.config_path || uploadSettingsState.configPath;
+        $("uploadImageMaxPx").value = String(uploadSettingsState.uploadImageMaxPx);
+        renderUploadSettingsMeta();
+        setUploadSettingsStatus(
+          uploadSettingsState.uploadImageMaxPx > 0
+            ? `已保存：上传图长边 ≤ ${uploadSettingsState.uploadImageMaxPx}px`
+            : "已保存：不缩放原图",
+        );
+      } catch (e) {
+        setUploadSettingsStatus("保存失败: " + e.message, true);
+      } finally {
+        $("btnUploadSettingsSave").disabled = false;
+      }
+    }
+
+    // ---------- 上架优先级 ----------
+    function ingestUploadPriorityData(data) {
+      uploadPriorityState.pairs = data.pairs || [];
+      uploadPriorityState.path = data.path || "";
+      uploadPriorityState.priorityPairs = (data.priority_pairs || []).map(
+        (p) => [String(p[0]), String(p[1])],
+      );
+      uploadPriorityState.dirty = false;
+      if ($("uploadPrioritySearch")) $("uploadPrioritySearch").value = "";
+      renderUploadPriorityMeta();
+      renderUploadPriorityList();
+    }
+
+    function upPairKey(g, t) {
+      return String(g) + "\0" + String(t);
+    }
+
+    function renderUploadPriorityMeta() {
+      const total = uploadPriorityState.pairs.length;
+      const n = uploadPriorityState.priorityPairs.length;
+      $("uploadPriorityMeta").textContent =
+        `已优先 ${n} / 共 ${total} 个子类` +
+        (uploadPriorityState.path ? ` · 配置: ${uploadPriorityState.path}` : "") +
+        (uploadPriorityState.dirty ? " · 有未保存更改" : "");
+    }
+
+    function applyUploadPriorityOrderInput(pairKey, fromIdx, rawValue) {
+      const arr = uploadPriorityState.priorityPairs;
+      const n = arr.length;
+      if (!n) return false;
+      const parsed = parseInt(String(rawValue).trim(), 10);
+      if (!Number.isFinite(parsed) || parsed < 1) {
+        if (rawValue === "" || String(rawValue).trim() === "") {
+          const existIdx = arr.findIndex((p) => upPairKey(p[0], p[1]) === pairKey);
+          if (existIdx >= 0) {
+            arr.splice(existIdx, 1);
+            uploadPriorityState.dirty = true;
+            return true;
+          }
+        }
+        return false;
+      }
+      const targetIdx = Math.max(0, Math.min(n - 1, parsed - 1));
+      const existIdx = arr.findIndex((p) => upPairKey(p[0], p[1]) === pairKey);
+      if (existIdx >= 0) {
+        if (targetIdx === existIdx) return false;
+        const [item] = arr.splice(existIdx, 1);
+        arr.splice(targetIdx, 0, item);
+      } else {
+        const pair = uploadPriorityState.pairs.find((p) => upPairKey(p.group, p.tag) === pairKey);
+        if (!pair) return false;
+        arr.splice(targetIdx, 0, [pair.group, pair.tag]);
+      }
+      uploadPriorityState.dirty = true;
+      return true;
+    }
+
+    function renderUploadPriorityList() {
+      const root = $("uploadPriorityList");
+      root.innerHTML = "";
+      const q = pairSearchNorm($("uploadPrioritySearch") && $("uploadPrioritySearch").value);
+      const prioritySet = new Set(
+        uploadPriorityState.priorityPairs.map((p) => upPairKey(p[0], p[1])),
+      );
+      const rankMap = {};
+      uploadPriorityState.priorityPairs.forEach((p, i) => {
+        rankMap[upPairKey(p[0], p[1])] = i;
+      });
+
+      let visible = uploadPriorityState.pairs.filter((p) => {
+        if (!q) return true;
+        return pairTextMatches(String(p.group), q) || pairTextMatches(String(p.tag), q);
+      });
+
+      // 排序：已在优先列表的按优先级排前面，未设置的按 group/tag 排后面
+      visible.sort((a, b) => {
+        const ak = upPairKey(a.group, a.tag);
+        const bk = upPairKey(b.group, b.tag);
+        const ai = rankMap[ak];
+        const bi = rankMap[bk];
+        if (ai != null && bi != null) return ai - bi;
+        if (ai != null && bi == null) return -1;
+        if (ai == null && bi != null) return 1;
+        const g = String(a.group).localeCompare(String(b.group));
+        if (g !== 0) return g;
+        return String(a.tag).localeCompare(String(b.tag));
+      });
+
+      if (!visible.length) {
+        root.innerHTML =
+          '<div class="muted" style="padding:8px">' +
+          (q ? "无匹配子类" : "暂无子类（数据库无商品记录或加载失败）") +
+          "</div>";
+        renderUploadPriorityMeta();
+        return;
+      }
+
+      const total = visible.length;
+      visible.forEach((p, idx) => {
+        const key = upPairKey(p.group, p.tag);
+        const inPriority = prioritySet.has(key);
+        const row = document.createElement("div");
+        row.className = "cat-wl-priority-item";
+        row.dataset.pairKey = key;
+        const ordVal = inPriority ? rankMap[key] + 1 : "";
+        row.innerHTML =
+          `<span class="label">${esc(p.group)} / ${esc(p.tag)} <span class="muted">(${p.item_count} 条)</span></span>` +
+          `<input type="number" class="ord-inp" min="0" max="999" step="1" value="${ordVal}" placeholder="未设置" title="序号，1 最优先；留空则不参与优先排序" />`;
+        const inp = row.querySelector(".ord-inp");
+        const commit = (keepIdx) => {
+          const changed = applyUploadPriorityOrderInput(key, keepIdx, inp.value);
+          if (changed) renderUploadPriorityList();
+          else inp.value = String(ordVal);
+        };
+        inp.addEventListener("change", () => commit(idx));
+        inp.addEventListener("keydown", (e) => {
+          if (e.key === "Enter") {
+            e.preventDefault();
+            commit(idx);
+            inp.blur();
+          }
+        });
+        root.appendChild(row);
+      });
+      renderUploadPriorityMeta();
+    }
+
+    function setUploadPriorityStatus(msg, isErr) {
+      const el = $("uploadPriorityStatus");
+      el.textContent = msg || "";
+      el.className = "pair-status" + (isErr ? " err" : "");
+    }
+
+    async function loadUploadPriority() {
+      setUploadPriorityStatus("加载中…");
+      const res = await fetch("/api/upload-priority");
+      if (!res.ok) throw new Error(res.status + " " + res.statusText);
+      const data = await res.json();
+      if (!data.ok) throw new Error(data.error || "load failed");
+      ingestUploadPriorityData(data);
+      setUploadPriorityStatus("");
+    }
+
+    async function openUploadPriorityDialog() {
+      $("uploadPriorityDlg").showModal();
+      try {
+        await loadUploadPriority();
+      } catch (e) {
+        setUploadPriorityStatus("加载失败: " + e.message, true);
+      }
+    }
+
+    async function saveUploadPriorityFromUi() {
+      $("btnUploadPrioritySave").disabled = true;
+      setUploadPriorityStatus("保存中…");
+      try {
+        const res = await fetch("/api/upload-priority", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({
+            priority_pairs: uploadPriorityState.priorityPairs,
+          }),
+        });
+        const data = await res.json();
+        if (!res.ok || !data.ok) throw new Error(data.error || res.statusText);
+        await loadUploadPriority();
+        setUploadPriorityStatus(`已保存 ${data.priority_count} 个子类`);
+      } catch (e) {
+        setUploadPriorityStatus("保存失败: " + e.message, true);
+      } finally {
+        $("btnUploadPrioritySave").disabled = false;
       }
     }
 
     $("btnSearch").addEventListener("click", () => { state.page = 1; loadItems(); });
+
+    function setScrapeSummaryStatus(msg, isErr) {
+      const el = $("scrapeSummaryStatus");
+      el.textContent = msg || "";
+      el.className = "pair-status" + (isErr ? " err" : "");
+    }
+
+    function renderScrapeSummaryTable(data) {
+      const body = $("scrapeSummaryBody");
+      body.innerHTML = "";
+      const rows = data.rows || [];
+      const totals = data.totals || {};
+      for (const r of rows) {
+        const tr = document.createElement("tr");
+        const label = (r.wecatalog_group || "—") + " / " + (r.wecatalog_tag || "—");
+        tr.innerHTML =
+          `<td class="col-label">${esc(label)}</td>` +
+          `<td>${r.total}</td>` +
+          `<td>${r.can_process}</td>` +
+          `<td>${r.llm_done}</td>` +
+          `<td>${r.can_upload}</td>` +
+          `<td>${r.uploaded}</td>` +
+          `<td>${r.rescrape_pending || 0}</td>`;
+        body.appendChild(tr);
+      }
+      // 合计行
+      const trTotals = document.createElement("tr");
+      trTotals.className = "totals-row";
+      trTotals.innerHTML =
+        `<td class="col-label">${esc(totals.wecatalog_tag || "合计")}</td>` +
+        `<td>${totals.total}</td>` +
+        `<td>${totals.can_process}</td>` +
+        `<td>${totals.llm_done}</td>` +
+        `<td>${totals.can_upload}</td>` +
+        `<td>${totals.uploaded}</td>` +
+        `<td>${totals.rescrape_pending || 0}</td>`;
+      body.appendChild(trTotals);
+      $("scrapeSummaryMeta").textContent =
+        `共 ${rows.length} 个分类 · 合计 ${totals.total} 条` +
+        ` · LLM已处理 ${totals.llm_done} · 已上传 ${totals.uploaded}`;
+    }
+
+    async function loadScrapeSummary() {
+      setScrapeSummaryStatus("加载中…");
+      try {
+        const res = await fetch("/api/scrape-category-summary");
+        if (!res.ok) throw new Error(res.status + " " + res.statusText);
+        const data = await res.json();
+        if (!data.ok) throw new Error(data.error || "加载失败");
+        renderScrapeSummaryTable(data);
+        setScrapeSummaryStatus("");
+      } catch (e) {
+        setScrapeSummaryStatus("加载失败: " + e.message, true);
+      }
+    }
+
+    async function openScrapeSummaryDialog() {
+      $("scrapeSummaryDlg").showModal();
+      await loadScrapeSummary();
+    }
     $("btnReload").addEventListener("click", () => { loadAlbums(); loadItems(); });
     $("btnPrev").addEventListener("click", () => { if (state.page > 1) { state.page--; loadItems(); } });
     $("btnNext").addEventListener("click", () => { if (state.page < state.pages) { state.page++; loadItems(); } });
@@ -2167,6 +2877,9 @@
     $("btnDiagnoseRun").addEventListener("click", () => runDiagnose());
     $("btnDiagClose").addEventListener("click", () => $("diagDlg").close());
     $("diagInput").addEventListener("keydown", (e) => { if (e.key === "Enter") runDiagnose(); });
+    $("btnScrapeSummary").addEventListener("click", () => openScrapeSummaryDialog());
+    $("btnScrapeSummaryClose").addEventListener("click", () => $("scrapeSummaryDlg").close());
+    $("btnScrapeSummaryRefresh").addEventListener("click", () => loadScrapeSummary());
     $("btnCloseDlg").addEventListener("click", () => {
       state.detailRow = null;
       $("btnCopyDetail").disabled = true;
@@ -2180,24 +2893,47 @@
     $("btnPairSave").addEventListener("click", () => savePairMapsFromUi());
     $("pairSearchWc").addEventListener("input", () => renderPairMapLists());
     $("pairSearchS17").addEventListener("input", () => renderPairMapLists());
-    $("btnNoPriceWhitelist").addEventListener("click", () => openNoPriceWhitelistDialog());
-    $("btnWhitelistClose").addEventListener("click", () => $("whitelistDlg").close());
-    $("btnWhitelistSave").addEventListener("click", () => saveNoPriceWhitelistFromUi());
-    $("whitelistSearch").addEventListener("input", () => renderWhitelistList());
-    $("btnWhitelistAllVisible").addEventListener("click", () => {
-      setWhitelistVisible(true);
-      setWhitelistStatus("已全选当前显示项（保存后生效）");
+    $("btnCategoryWhitelist").addEventListener("click", () => openCategoryWhitelistDialog());
+    $("btnScrapePriority").addEventListener("click", () => openScrapePriorityDialog());
+    $("btnUploadSettings").addEventListener("click", () => openUploadSettingsDialog());
+    $("btnUploadSettingsClose").addEventListener("click", () => $("uploadSettingsDlg").close());
+    $("btnUploadSettingsSave").addEventListener("click", () => saveUploadSettingsFromUi());
+    $("uploadImageMaxPx").addEventListener("input", () => renderUploadSettingsMeta());
+    $("btnUploadPriority").addEventListener("click", () => openUploadPriorityDialog());
+    $("btnUploadPriorityClose").addEventListener("click", () => $("uploadPriorityDlg").close());
+    $("btnUploadPrioritySave").addEventListener("click", () => saveUploadPriorityFromUi());
+    $("uploadPrioritySearch").addEventListener("input", () => renderUploadPriorityList());
+    $("btnCatWlClose").addEventListener("click", () => $("catWlDlg").close());
+    $("btnScrapePriorityClose").addEventListener("click", () => $("scrapePriorityDlg").close());
+    $("btnScrapePrioritySave").addEventListener("click", () => saveScrapePriorityFromUi());
+    $("scrapePriorityMaxParallel").addEventListener("change", () => {
+      syncScrapeOrderFromSelection();
+      catWlState.maxParallel = clampMaxParallel(
+        $("scrapePriorityMaxParallel").value,
+        catWlState.scrapeOrder.length,
+      );
+      $("scrapePriorityMaxParallel").value = String(catWlState.maxParallel);
+      catWlState.priorityDirty = true;
+      renderScrapePriorityMeta();
     });
-    $("btnWhitelistNoneVisible").addEventListener("click", () => {
-      setWhitelistVisible(false);
-      setWhitelistStatus("已取消当前显示项（保存后生效）");
+    $("btnCatWlSave").addEventListener("click", () => saveCategoryWhitelistsFromUi());
+    $("catWlSearch").addEventListener("input", () => renderCatWlTable());
+    $("btnCatWlScrapeAllVisible").addEventListener("click", () => {
+      setCatWlScrapeVisible(true);
+      setCatWlStatus("已勾选当前可见项的抓取（保存后生效）");
+    });
+    $("btnCatWlScrapeNoneVisible").addEventListener("click", () => {
+      setCatWlScrapeVisible(false);
+      setCatWlStatus("已取消当前可见项的抓取（保存后生效）");
     });
 
     (async () => {
       bindTableDragScroll($("tableWrap"));
       await loadAlbums();
       await loadItems();
-      if (location.hash === "#no-price-whitelist") openNoPriceWhitelistDialog();
+      if (location.hash === "#category-whitelist") openCategoryWhitelistDialog();
+      if (location.hash === "#scrape-priority") openScrapePriorityDialog();
+      if (location.hash === "#upload-priority") openUploadPriorityDialog();
     })();
   </script>
 </body>
